@@ -1,0 +1,102 @@
+# DealFinder Configuration - v7.0 (Claude Edition + Detail Scraping)
+# ===================================================================
+
+general:
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+  request_timeout_sec: 18
+  max_pages_list: 1
+  max_listings_per_query: 8
+  exclude_terms: ["defekt", "kaputt", "ersatzteil", "bastler", "für bastler"]
+  autoclean_days: 30
+  car_model: "VW Touran"
+
+  # v7.0: Detail Page Scraping
+  # --------------------------
+  # Scrapes additional data (seller rating, shipping cost, pickup)
+  # from detail pages of top deals.
+  # NO AI COSTS - only browser scraping!
+  detail_pages_enabled: true
+  max_detail_pages_per_run: 5 # Top 5 by expected_profit
+
+postgres:
+  host: "localhost"
+  port: 5432
+  db: "dealfinder"
+  user: "dealuser"
+  password: "dealsecret"
+
+db:
+  clear_on_start: true
+
+cache:
+  enabled: true
+  clear_on_start: true
+  variant_cache_days: 30
+  component_cache_days: 30
+  cluster_cache_days: 7
+  web_price_cache_days: 60
+
+profit:
+  ricardo_fee_percent: 0.10
+  shipping_cost_chf: 0.0
+  min_profit_threshold: 20.0
+
+bundle:
+  enabled: true
+  discount_percent: 0.10
+  min_component_value: 10.0
+  use_vision_for_unclear: true
+
+search:
+  queries:
+    - "Tommy Hilfiger"
+    - "Garmin smartwatch"
+    - "Hantelscheiben"
+
+# =================================================
+# AI Configuration - v7.0 CLAUDE
+# =================================================
+ai:
+  # Provider selection: "claude" or "openai"
+  provider: "claude"
+
+  # Claude models
+  claude_model_fast: "claude-3-5-haiku-20241022" # Für schnelle Tasks (clustering, evaluation)
+  claude_model_web: "claude-sonnet-4-20250514" # Für Web-Search (Neupreise)
+
+  # OpenAI fallback (falls Claude nicht verfügbar)
+  openai_model: "gpt-4o-mini"
+
+  # General settings
+  use_ai_text: true
+  use_ai_vision: true
+  temperature: 0.2
+  adaptive_vision_rate: 0.10
+
+  # v7.0: Web Search Settings
+  web_search:
+    enabled: true
+    preferred_shops:
+      - "digitec.ch"
+      - "galaxus.ch"
+      - "brack.ch"
+      - "interdiscount.ch"
+    # Für Kleidung
+    clothing_shops:
+      - "zalando.ch"
+      - "aboutyou.ch"
+      - "manor.ch"
+
+  # Pricing (USD pro Call)
+  pricing:
+    claude_haiku_usd: 0.001 # Haiku: $0.80/1M input, $4/1M output
+    claude_sonnet_usd: 0.003 # Sonnet: $3/1M input, $15/1M output
+    claude_web_search_usd: 0.01 # Sonnet + Web Search
+    openai_text_usd: 0.001 # GPT-4o-mini fallback
+    vision_usd: 0.007
+
+  # Budget limits
+  budget:
+    daily_cost_usd_max: 1.50
+    daily_vision_calls_max: 100
+    daily_web_search_max: 50

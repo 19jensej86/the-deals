@@ -1,0 +1,24 @@
+# DealFinder v7.0 - Requirements
+# ==============================
+
+# Web scraping
+playwright
+
+# AI - Claude (PRIMARY)
+anthropic
+
+# AI - OpenAI (LEGACY/FALLBACK - kann entfernt werden wenn alles läuft)
+openai
+
+# Database
+psycopg2-binary
+
+# Config
+PyYAML
+python-dotenv
+
+# Text matching
+rapidfuzz
+
+# Timezone support
+tzdata
