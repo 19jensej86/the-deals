@@ -1,10 +1,12 @@
 """
-DealFinder Main Pipeline - v7.1 (Accessory Filter Fix)
-======================================================
-Changes from v7.0:
-- FIX: Added accessory keyword filtering (was missing!)
-- Accessories like armbands, cases, chargers are now filtered out
-- Uses AI-generated accessory_keywords from query_analyzer
+DealFinder Main Pipeline - v7.2 (Improved Accessory Filter)
+============================================================
+Changes from v7.1:
+- HARDCODED accessory pre-filter BEFORE AI-generated keywords
+- Query-aware: "Armband" query won't filter armbands
+- Category-aware: Fitness "Set" = bundle, not accessory!
+- Position-aware: "Armband für Garmin" vs "Garmin mit Armband"
+- Better statistics: shows how many filtered by each method
 
 Pipeline Steps:
 1. Load config
@@ -14,20 +16,25 @@ Pipeline Steps:
 5. Start browser
 6. For each query:
    a. Scrape Ricardo SERP
-   b. Filter: exclude terms, defects, AND accessories (v7.1!)
-   c. Cluster listings into variants
-   d. Calculate market resale from auctions with bids
-   e. Fetch variant info (new prices, transport)
-   f. Evaluate each listing (with global sanity checks!)
-   g. Save to database
+   b. PRE-FILTER 1: Hardcoded accessory detection (v7.2!)
+   c. PRE-FILTER 2: AI-generated accessory keywords
+   d. PRE-FILTER 3: Defect keywords
+   e. Cluster listings into variants
+   f. Calculate market resale from auctions with bids
+   g. Fetch variant info (new prices, transport)
+   h. Evaluate each listing (with global sanity checks!)
+   i. Save to database
 7. Scrape detail pages for top deals
 8. Generate HTML report
 9. Show AI cost summary
 """
 
 import traceback
+import sys
+import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from io import StringIO
 
 from playwright.sync_api import sync_playwright
 
@@ -51,7 +58,13 @@ from scrapers.browser_ctx import (
 )
 from scrapers.ricardo import search_ricardo
 from utils_time import parse_ricardo_end_time
-from utils_text import contains_excluded_terms, normalize_whitespace
+from utils_text import (
+    contains_excluded_terms, 
+    normalize_whitespace,
+    is_accessory_title,      # v7.2: Now query/category-aware!
+    is_defect_title,         # v7.2: For hardcoded defect check
+    detect_category,         # v7.2: Auto-detect category from query
+)
 
 from query_analyzer import (
     analyze_queries,
@@ -59,7 +72,8 @@ from query_analyzer import (
     get_min_realistic_price,
     get_auction_multiplier,
     get_defect_keywords,
-    get_accessory_keywords,  # v7.1: Added for accessory filtering!
+    get_accessory_keywords,
+    get_category,
 )
 
 from ai_filter import (
@@ -79,8 +93,25 @@ from ai_filter import (
 
 
 # ==============================================================================
-# DEBUG HELPERS
+# DEBUG HELPERS & LOGGING
 # ==============================================================================
+
+class TeeOutput:
+    """Captures stdout to both console and string buffer."""
+    def __init__(self):
+        self.terminal = sys.stdout
+        self.log = StringIO()
+    
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+    
+    def flush(self):
+        self.terminal.flush()
+    
+    def get_log(self):
+        return self.log.getvalue()
+
 
 def log_section(title: str):
     print("\n" + "=" * 90)
@@ -92,12 +123,84 @@ def log_debug(label: str, data: Any):
     print(f"[DEBUG] {label}: {data}")
 
 
+def save_log_to_file(log_content: str, filename: str = "last_run.log"):
+    """Save captured log to file."""
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(log_content)
+        print(f"\n📝 Log saved to: {filename}")
+    except Exception as e:
+        print(f"\n⚠️ Failed to save log: {e}")
+
+
+def export_listings_to_file(conn, filename: str = "last_run_listings.json"):
+    """Export all listings from database to JSON file."""
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 
+                id, platform, listing_id, title, description,
+                location, postal_code, shipping, transport_car,
+                end_time, image_url, url, detected_product,
+                ai_notes, buy_now_price, current_price_ricardo,
+                bids_count, new_price, resale_price_est,
+                expected_profit, deal_score, created_at, updated_at,
+                variant_key, predicted_final_price, prediction_confidence,
+                is_bundle, bundle_components, resale_price_bundle,
+                recommended_strategy, strategy_reason,
+                market_based_resale, market_sample_size,
+                market_value, price_source, buy_now_ceiling,
+                hours_remaining, seller_rating, shipping_cost,
+                pickup_available
+            FROM listings
+            ORDER BY expected_profit DESC NULLS LAST
+        """)
+        
+        columns = [desc[0] for desc in cur.description]
+        rows = cur.fetchall()
+        
+        # Convert to list of dicts
+        listings = []
+        for row in rows:
+            listing = {}
+            for i, col in enumerate(columns):
+                value = row[i]
+                # Convert datetime to string
+                if hasattr(value, 'isoformat'):
+                    value = value.isoformat()
+                # Convert Decimal to float
+                elif hasattr(value, '__float__'):
+                    value = float(value)
+                listing[col] = value
+            listings.append(listing)
+        
+        # Save to JSON
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump({
+                'export_time': datetime.now().isoformat(),
+                'total_listings': len(listings),
+                'listings': listings
+            }, f, indent=2, ensure_ascii=False)
+        
+        print(f"📊 Exported {len(listings)} listings to: {filename}")
+        cur.close()
+        
+    except Exception as e:
+        print(f"⚠️ Failed to export listings: {e}")
+        traceback.print_exc()
+
+
 # ==============================================================================
 # MAIN PIPELINE
 # ==============================================================================
 
 def run_once():
-    log_section("Starting DealFinder Pipeline v7.1 (Accessory Filter Fix)")
+    # Start capturing output
+    tee = TeeOutput()
+    original_stdout = sys.stdout
+    sys.stdout = tee
+    
+    log_section("Starting DealFinder Pipeline v7.2 (Improved Accessory Filter)")
 
     # --------------------------------------------------------------------------
     # 1) LOAD CONFIG
@@ -181,6 +284,16 @@ def run_once():
 
     # v7.0: Collect all deals for detail scraping at the end
     all_deals_for_detail: List[Dict[str, Any]] = []
+    
+    # v7.2: Global statistics
+    global_stats = {
+        "total_scraped": 0,
+        "skipped_hardcoded_accessory": 0,
+        "skipped_ai_accessory": 0,
+        "skipped_defect": 0,
+        "skipped_exclude": 0,
+        "sent_to_ai": 0,
+    }
 
     try:
         with sync_playwright() as p:
@@ -200,22 +313,33 @@ def run_once():
                 log_section(f"Search: {query}")
                 
                 query_analysis = query_analyses.get(query)
+                
+                # v7.2: Get category (from AI analysis or auto-detect)
                 if query_analysis:
-                    print(f"📊 Category: {query_analysis.get('category')}")
+                    category = get_category(query_analysis)
+                else:
+                    category = detect_category(query)
+                
+                if query_analysis:
+                    print(f"📊 Category: {category}")
                     print(f"📊 Reference price: ~{query_analysis.get('new_price_estimate', 'N/A')} CHF")
                     print(f"📊 Resale rate: {query_analysis.get('resale_rate', 0.4)*100:.0f}% (fallback)")
                     print(f"📊 Min realistic: {query_analysis.get('min_realistic_price', 10)} CHF")
                     
-                    # v7.1: Show filter keywords
+                    # v7.2: Show both filter keyword sources
                     defect_kw = get_defect_keywords(query_analysis)
-                    accessory_kw = get_accessory_keywords(query_analysis)
+                    ai_accessory_kw = get_accessory_keywords(query_analysis)
+                    
                     if defect_kw:
-                        print(f"📊 Defect keywords: {defect_kw[:5]}{'...' if len(defect_kw) > 5 else ''}")
-                    if accessory_kw:
-                        print(f"📊 Accessory keywords: {accessory_kw[:5]}{'...' if len(accessory_kw) > 5 else ''}")
+                        print(f"📊 Defect keywords (AI): {defect_kw[:5]}{'...' if len(defect_kw) > 5 else ''}")
+                    if ai_accessory_kw:
+                        print(f"📊 Accessory keywords (AI): {ai_accessory_kw[:5]}{'...' if len(ai_accessory_kw) > 5 else ''}")
+                    
+                    print(f"📊 Hardcoded accessory filter: ENABLED (query-aware, category={category})")
                 
                 processed_for_query = 0
-                skipped_accessories = 0
+                skipped_hardcoded_acc = 0
+                skipped_ai_acc = 0
                 skipped_defects = 0
                 all_listings = []
                 all_titles = []
@@ -231,31 +355,62 @@ def run_once():
                         timeout_sec=cfg.general.request_timeout_sec,
                         max_pages=cfg.general.max_pages_list,
                     ):
+                        global_stats["total_scraped"] += 1
+                        
                         title = listing.get("title") or ""
                         normalized_title = normalize_whitespace(title)
                         title_lower = normalized_title.lower()
 
-                        # Skip excluded terms (from config)
+                        # PRE-FILTER 0: Skip excluded terms (from config)
                         if contains_excluded_terms(title_lower, cfg.general.exclude_terms):
                             print(f"⚪ Skip (exclude): {title[:50]}")
+                            global_stats["skipped_exclude"] += 1
                             continue
 
-                        # Skip defect keywords from query analysis
+                        # ------------------------------------------------------
+                        # v7.2 PRE-FILTER 1: HARDCODED accessory detection
+                        # This catches things AI might miss (armband, silikon, etc.)
+                        # Query-aware: won't filter if user searches FOR accessories
+                        # Category-aware: fitness "set" = bundle, not accessory!
+                        # ------------------------------------------------------
+                        if is_accessory_title(normalized_title, query=query, category=category):
+                            print(f"🎯 Skip (hardcoded accessory): {title[:50]}")
+                            skipped_hardcoded_acc += 1
+                            global_stats["skipped_hardcoded_accessory"] += 1
+                            continue
+
+                        # ------------------------------------------------------
+                        # PRE-FILTER 2: AI-generated accessory keywords
+                        # This catches product-specific accessories AI identified
+                        # v7.2 FIX: Category-aware - don't filter fitness bundles!
+                        # ------------------------------------------------------
+                        ai_accessory_kw = get_accessory_keywords(query_analysis)
+                        if ai_accessory_kw:
+                            # Filter out bundle keywords for fitness category
+                            if category.lower() in ["fitness", "sport"]:
+                                # Don't filter "set", "stange", "scheibe" for fitness
+                                ai_accessory_kw = [kw for kw in ai_accessory_kw 
+                                                   if kw.lower() not in ["set", "stange", "scheibe", "halterung"]]
+                            
+                            if ai_accessory_kw and contains_excluded_terms(title_lower, ai_accessory_kw):
+                                print(f"🤖 Skip (AI accessory): {title[:50]}")
+                                skipped_ai_acc += 1
+                                global_stats["skipped_ai_accessory"] += 1
+                                continue
+
+                        # ------------------------------------------------------
+                        # PRE-FILTER 3: Defect keywords
+                        # ------------------------------------------------------
                         defect_kw = get_defect_keywords(query_analysis)
                         if defect_kw and contains_excluded_terms(title_lower, defect_kw):
-                            print(f"⚪ Skip (defect): {title[:50]}")
+                            print(f"🔧 Skip (defect): {title[:50]}")
                             skipped_defects += 1
-                            continue
-
-                        # v7.1 FIX: Skip accessory keywords from query analysis!
-                        accessory_kw = get_accessory_keywords(query_analysis)
-                        if accessory_kw and contains_excluded_terms(title_lower, accessory_kw):
-                            print(f"⚪ Skip (accessory): {title[:50]}")
-                            skipped_accessories += 1
+                            global_stats["skipped_defect"] += 1
                             continue
 
                         all_listings.append(listing)
                         all_titles.append(title)
+                        global_stats["sent_to_ai"] += 1
 
                         # Limit check
                         if max_listings_per_query and len(all_listings) >= max_listings_per_query:
@@ -271,12 +426,14 @@ def run_once():
                     print(f"⚠️ No listings found for '{query}'")
                     continue
 
-                # v7.1: Show filter stats
+                # v7.2: Show filter stats per query
                 print(f"\n📦 Found {len(all_listings)} listings to process")
+                if skipped_hardcoded_acc > 0:
+                    print(f"   🎯 Filtered {skipped_hardcoded_acc} by hardcoded accessory detection")
+                if skipped_ai_acc > 0:
+                    print(f"   🤖 Filtered {skipped_ai_acc} by AI accessory keywords")
                 if skipped_defects > 0:
-                    print(f"   🗑️ Filtered {skipped_defects} defect listings")
-                if skipped_accessories > 0:
-                    print(f"   🗑️ Filtered {skipped_accessories} accessory listings")
+                    print(f"   🔧 Filtered {skipped_defects} defect listings")
 
                 # --------------------------------------------------------------
                 # 7b) CLUSTER INTO VARIANTS
@@ -525,7 +682,30 @@ def run_once():
                 print(f"\n⚠️ Report generation failed: {e}")
 
             # ------------------------------------------------------------------
-            # 10) AI COST SUMMARY
+            # 10) v7.2: GLOBAL STATISTICS
+            # ------------------------------------------------------------------
+            log_section("v7.2: Pipeline Statistics")
+            
+            print(f"📊 Total scraped:              {global_stats['total_scraped']}")
+            print(f"🎯 Hardcoded accessory filter: {global_stats['skipped_hardcoded_accessory']}")
+            print(f"🤖 AI accessory filter:        {global_stats['skipped_ai_accessory']}")
+            print(f"🔧 Defect filter:              {global_stats['skipped_defect']}")
+            print(f"⚪ Exclude terms filter:       {global_stats['skipped_exclude']}")
+            print(f"🧠 Sent to AI evaluation:      {global_stats['sent_to_ai']}")
+            
+            total_filtered = (
+                global_stats['skipped_hardcoded_accessory'] + 
+                global_stats['skipped_ai_accessory'] + 
+                global_stats['skipped_defect'] + 
+                global_stats['skipped_exclude']
+            )
+            
+            if global_stats['total_scraped'] > 0:
+                filter_rate = (total_filtered / global_stats['total_scraped']) * 100
+                print(f"\n💰 Pre-filter efficiency: {filter_rate:.1f}% filtered (saves AI costs!)")
+
+            # ------------------------------------------------------------------
+            # 11) AI COST SUMMARY
             # ------------------------------------------------------------------
             run_cost, day = get_run_cost_summary()
             day_total = get_day_cost_summary()
@@ -536,8 +716,23 @@ def run_once():
             print(f"📅 Date:        {day}")
             print(f"🔍 Detail pages scraped: {len([d for d in all_deals_for_detail if d.get('detail_scraped')])} (no AI cost)")
 
+            # ------------------------------------------------------------------
+            # 12) EXPORT DATA FOR ANALYSIS
+            # ------------------------------------------------------------------
+            log_section("Exporting Data for Analysis")
+            
+            # Export listings to JSON
+            export_listings_to_file(conn, "last_run_listings.json")
+            
+            print("\n✅ Pipeline completed successfully!")
+
     finally:
         cleanup_profile(tmp_profile)
+        
+        # Restore stdout and save log
+        sys.stdout = original_stdout
+        log_content = tee.get_log()
+        save_log_to_file(log_content, "last_run.log")
 
 
 # ==============================================================================

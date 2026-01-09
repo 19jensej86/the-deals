@@ -39,7 +39,7 @@ cache:
 profit:
   ricardo_fee_percent: 0.10
   shipping_cost_chf: 0.0
-  min_profit_threshold: 20.0
+  min_profit_threshold: 10.0 # v7.2.1: Lowered from 20.0 to capture more deals
 
 bundle:
   enabled: true

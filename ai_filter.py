@@ -1278,7 +1278,7 @@ def looks_like_bundle(title: str, description: str = "") -> bool:
 
 
 def detect_bundle_with_ai(title: str, description: str, query: str, image_url: Optional[str] = None, use_vision: bool = False, query_analysis: Optional[Dict] = None) -> Dict[str, Any]:
-    """v7.0: Bundle detection using Claude."""
+    """v7.2.1: Bundle detection using Claude with weight-based validation."""
     if is_budget_exceeded():
         return {"is_bundle": False, "contains_main_product": True, "components": [], "reasoning": "Budget exceeded"}
 
@@ -1299,12 +1299,13 @@ REGELN:
 - Bundle = MEHRERE separat verkaufbare Produkte
 - KEIN Bundle: Hauptprodukt + Kabel/Hülle/Originalzubehör
 - Bei Gewichten: Gusseisen = 1.5-2.0 CHF/kg, Bumper = 2.5-3.5 CHF/kg
+- WICHTIG: Gib GEWICHT in kg im Namen an! (z.B. "Hantelscheibe 25kg", nicht "Hantelscheibe")
 
 Antworte NUR als JSON:
 {{
   "is_bundle": true/false,
   "contains_main_product": true/false,
-  "components": [{{"name": "Produkt", "qty": 1, "estimated_value": XX}}],
+  "components": [{{"name": "Produkt MIT GEWICHT", "qty": 1, "estimated_value": XX}}],
   "reasoning": "Kurz"
 }}"""
 
@@ -1326,9 +1327,32 @@ Antworte NUR als JSON:
                 parsed.setdefault("components", [])
                 parsed.setdefault("reasoning", "")
                 
+                # v7.2.1: Validate component estimates with weight-based pricing
                 if parsed["components"]:
-                    parsed["components"] = [c for c in parsed["components"] 
-                                           if c.get("estimated_value", 0) >= max(BUNDLE_MIN_COMPONENT_VALUE, min_price * 0.5)]
+                    validated_components = []
+                    for c in parsed["components"]:
+                        name = c.get("name", "")
+                        ai_estimate = c.get("estimated_value", 0)
+                        
+                        # Weight-based validation for fitness equipment
+                        if is_weight_plate(name):
+                            weight_kg = extract_weight_kg(name)
+                            if weight_kg:
+                                weight_type = detect_weight_type(name)
+                                realistic_resale = calculate_weight_based_price(weight_kg, weight_type, is_resale=True)
+                                # Cap AI estimate at realistic price
+                                if ai_estimate > realistic_resale * 2:
+                                    print(f"   Capping {name}: AI={ai_estimate} → realistic={realistic_resale}")
+                                    c["estimated_value"] = realistic_resale
+                        
+                        # Filter out components below minimum
+                        estimated_val = c.get("estimated_value", 0)
+                        min_threshold = max(BUNDLE_MIN_COMPONENT_VALUE, min_price * 0.5) if min_price else BUNDLE_MIN_COMPONENT_VALUE
+                        if estimated_val and estimated_val >= min_threshold:
+                            validated_components.append(c)
+                    
+                    parsed["components"] = validated_components
+                
                 if not parsed["components"]:
                     parsed["is_bundle"] = False
                 return parsed
@@ -1368,15 +1392,27 @@ def calculate_bundle_new_price(components: List[Dict]) -> float:
 
 
 def calculate_bundle_resale(components: List[Dict], bundle_new_price: Optional[float] = None) -> float:
+    """Calculate bundle resale price from components with discount."""
     if not components:
         return 0.0
-    total = sum(c.get("market_price", 0) * c.get("qty", 1) for c in components 
-                if c.get("price_source") != "ai_estimate" or c.get("qty", 1) == 1)
+    
+    # Sum all component values (market_price or estimated_value)
+    total = 0.0
+    for c in components:
+        qty = c.get("qty", 1)
+        # Prefer market_price, fallback to estimated_value
+        price = c.get("market_price", 0) or c.get("estimated_value", 0)
+        total += price * qty
+    
+    # Apply bundle discount
     discounted = total * (1 - BUNDLE_DISCOUNT_PERCENT)
+    
+    # Cap at max % of new price if available
     if bundle_new_price and bundle_new_price > 0:
         max_bundle = bundle_new_price * MAX_BUNDLE_RESALE_PERCENT_OF_NEW
         if discounted > max_bundle:
             discounted = max_bundle
+    
     return round(discounted, 2)
 
 
@@ -1471,8 +1507,15 @@ LISTINGS:
 
 REGELN:
 - Variant-Key Format: "{base_product}|[Variante]"
-- Nur preis-relevante Unterschiede (Speicher, Grösse, Modell)
+- WICHTIG: Modellnummern sind PREIS-RELEVANT! (z.B. Fenix 7 ≠ Fenix 8, iPhone 13 ≠ iPhone 14)
+- Auch relevant: Speicher (64GB/256GB), Grösse (S/M/L), Material (Eisen/Gummi)
+- NICHT relevant: Farbe, Zustand, Verkäufer-Beschreibungen
 - Unklare Listings → null
+
+BEISPIELE:
+- "Garmin Fenix 7 Solar" → "{base_product}|Fenix 7"
+- "Garmin Fenix 8 Amoled" → "{base_product}|Fenix 8"
+- "Tommy Hilfiger Jacke XL" → "{base_product}|Jacke XL"
 
 Antworte NUR als JSON:
 {{
@@ -1763,17 +1806,26 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
             search_terms = clean_result.get("search_terms", [clean_name])
             
             # Try web search first (THE GAME CHANGER!)
+            # Add delay to prevent rate limiting
+            import time
+            if vk != need_new_price[0]:  # Skip delay for first request
+                time.sleep(5.0)  # 5.0s between requests to avoid 429 errors (v7.2.1: increased from 2.5s)
+            
             web_result = search_web_for_new_price(vk, search_terms, category)
             
             if web_result and web_result.get("new_price"):
                 new_price = web_result["new_price"]
                 price_source = web_result.get("price_source", "web_search")
                 
-                # Calculate resale
+                # Calculate resale with sanity checks
                 resale_price = new_price * resale_rate
                 max_resale = new_price * MAX_RESALE_PERCENT_OF_NEW
                 if resale_price > max_resale:
                     resale_price = max_resale
+                
+                # CRITICAL: Resale can never exceed new price
+                if resale_price > new_price * 0.95:
+                    resale_price = new_price * 0.85
                 
                 if vk in results:
                     # Already has market data, just add new_price
@@ -1989,7 +2041,7 @@ def calculate_deal_score(expected_profit: float, purchase_price: float, resale_p
     
     # Auction timing
     if is_auction:
-        hours = hours_remaining or 999
+        hours = hours_remaining if hours_remaining is not None else 999
         bids = bids_count or 0
         
         if hours > 48: score -= 1.5
@@ -2072,6 +2124,12 @@ def evaluate_listing_with_ai(
         
         if variant_info.get("resale_price"):
             result["resale_price_est"] = variant_info["resale_price"]
+    
+    # v7.2.1: Fallback new_price to buy_now_price if web search failed
+    if not result["new_price"] and buy_now_price and buy_now_price > 0:
+        result["new_price"] = buy_now_price * 1.1  # Conservative estimate: assume 10% markup
+        result["price_source"] = "buy_now_fallback"
+        print(f"   Using buy_now_price as new_price fallback: {result['new_price']:.2f} CHF")
     
     # Determine effective purchase price
     is_auction = current_price is not None and buy_now_price is None

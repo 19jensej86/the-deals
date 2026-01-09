@@ -231,6 +231,10 @@ variant_cache.json
 variant_cluster_cache.json
 web_price_cache.json
 
+# v7.2: Auto-generated run logs and exports
+last_run.log
+last_run_listings.json
+
 cache/
 output/
 tmp/

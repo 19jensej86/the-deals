@@ -1,13 +1,18 @@
 """
-Text Utilities for DealFinder - v5.0
+Text Utilities for DealFinder - v7.2
 ====================================
 - Whitespace normalization
 - Variant extraction (storage, year, color, size)
-- Accessory detection (no AI needed!)
+- Accessory detection (HARDCODED + query-aware + category-aware)
 - Defect detection (no AI needed!)
 - PLZ extraction
 
-v5.0: Added bundle keywords for pre-filtering
+v7.2 CHANGES:
+- is_accessory_title() now accepts query and category parameters
+- Query-aware: If user searches for "Armband", don't filter armbands!
+- Category-aware: For fitness, "set" is NOT an accessory (bundles!)
+- Position-aware: "Armband für Garmin" vs "Garmin mit Armband"
+- Added get_accessory_keywords() and get_defect_keywords() exports
 """
 
 import re
@@ -40,10 +45,7 @@ def extract_plz(location_text: str) -> Optional[str]:
 # ==============================================================================
 
 def extract_storage_gb(title: str) -> Optional[int]:
-    """
-    Extracts storage size in GB from title.
-    Examples: "iPhone 12 mini 128GB" → 128
-    """
+    """Extracts storage size in GB from title."""
     if not title:
         return None
     match = re.search(r'(\d+)\s*GB', title, re.IGNORECASE)
@@ -51,10 +53,7 @@ def extract_storage_gb(title: str) -> Optional[int]:
 
 
 def extract_year(title: str) -> Optional[int]:
-    """
-    Extracts year from title.
-    Examples: "VW Golf 2015" → 2015
-    """
+    """Extracts year from title."""
     if not title:
         return None
     match = re.search(r'\b(19|20)\d{2}\b', title)
@@ -66,19 +65,14 @@ def extract_year(title: str) -> Optional[int]:
 
 
 def extract_size(title: str) -> Optional[str]:
-    """
-    Extracts size from title.
-    Examples: "Grösse 42" → "42", "Size M" → "M"
-    """
+    """Extracts size from title."""
     if not title:
         return None
     
-    # Numeric sizes
     match = re.search(r'(?:gr[öo]sse|size|gr\.?)\s*(\d+)', title, re.IGNORECASE)
     if match:
         return match.group(1)
     
-    # Letter sizes
     match = re.search(r'\b(XXS|XS|S|M|L|XL|XXL|XXXL)\b', title, re.IGNORECASE)
     if match:
         return match.group(1).upper()
@@ -87,14 +81,10 @@ def extract_size(title: str) -> Optional[str]:
 
 
 def extract_weight_kg(title: str) -> Optional[float]:
-    """
-    v5.0: Extracts weight in kg from title.
-    Examples: "Hantel 20kg" → 20, "10 kg Scheibe" → 10
-    """
+    """Extracts weight in kg from title."""
     if not title:
         return None
     
-    # Match patterns like "20kg", "20 kg", "20KG"
     match = re.search(r'(\d+(?:[.,]\d+)?)\s*kg', title, re.IGNORECASE)
     if match:
         try:
@@ -105,9 +95,7 @@ def extract_weight_kg(title: str) -> Optional[float]:
 
 
 def extract_variant_attributes(title: str, critical_attributes: List[str]) -> Dict[str, any]:
-    """
-    Extracts variant attributes from title based on what's critical.
-    """
+    """Extracts variant attributes from title based on what's critical."""
     result = {}
     
     for attr in critical_attributes:
@@ -141,27 +129,18 @@ def extract_variant_attributes(title: str, critical_attributes: List[str]) -> Di
 
 
 def build_variant_key(base_product: str, variant_attrs: Dict[str, any]) -> Optional[str]:
-    """
-    Builds variant key from extracted attributes.
-    
-    Examples:
-        "iPhone 12 Mini", {"storage_gb": 128} → "iPhone 12 Mini|128GB"
-        "VW Golf", {"year": 2015} → "VW Golf|2015"
-        "iPhone 12 Mini", {"storage_gb": None} → "iPhone 12 Mini"
-    """
+    """Builds variant key from extracted attributes."""
     if not base_product:
         return None
     
     if not variant_attrs:
         return base_product
     
-    # Filter out None values
     present_attrs = {k: v for k, v in variant_attrs.items() if v is not None}
     
     if len(present_attrs) == 0:
         return base_product
     
-    # Build key with present attributes
     parts = [base_product]
     for key, value in sorted(present_attrs.items()):
         if key == "storage_gb":
@@ -179,62 +158,194 @@ def build_variant_key(base_product: str, variant_attrs: Dict[str, any]) -> Optio
 
 
 # ==============================================================================
-# ACCESSORY DETECTION
+# ACCESSORY DETECTION - v7.2 HARDCODED + SMART LOGIC
 # ==============================================================================
 
+# Base hardcoded accessory keywords - apply to most product categories
 ACCESSORY_KEYWORDS = [
-    "panzerglas", "schutzglas", "displayschutz", "glas",
+    # Hüllen & Schutz
     "hülle", "case", "cover", "bumper", "etui", "tasche",
+    "folie", "schutzfolie", "schutzhülle", "skin",
+    "panzerglas", "schutzglas", "displayschutz",
+    
+    # Kabel & Ladegeräte
     "kabel", "ladekabel", "usb-c", "lightning",
     "ladegerät", "charger", "netzteil", "adapter", "ladestation",
-    "halterung", "ständer", "halter", "dock",
-    "folie", "schutzfolie", "schutzhülle", "skin",
-    "armband", "band", "strap",
-    "kopfhörer", "earbuds",  # Note: AirPods can be main product
-    "ersatzakku", "powerbank",
+    
+    # Halterungen
+    "halterung", "halter", "ständer", "stand", "dock",
+    "wandhalterung",
+    
+    # Uhren/Smartwatch-Zubehör (KRITISCH für Garmin!)
+    "armband", "ersatzarmband", "uhrenarmband",
+    "band", "strap", "bracelet",
+    "silikon",  # "Silikon Band" etc.
+    
+    # Sonstiges Zubehör
+    "ersatzteil", "ersatzteile",
+    "zubehör", "accessoire",
+    "powerbank", "ersatzakku",
+    "speicherkarte", "sd-karte",
     "stylus", "stift", "pen",
     "tastatur", "keyboard",
     "maus", "mouse",
+    "kopfhörer", "earbuds",  # Note: AirPods can be main product
 ]
 
+# Keywords that should NEVER be treated as accessory for FITNESS category
+FITNESS_NOT_ACCESSORY = [
+    "set",      # Hantelscheiben-Sets sind wertvoll!
+    "stange",   # Langhantelstangen sind Hauptprodukte
+    "scheibe",  # Hantelscheiben = Hauptprodukt
+    "plate",    # Weight plates = Hauptprodukt
+    "hantel",   # Hanteln = Hauptprodukt
+    "gewicht",  # Gewichte = Hauptprodukt
+]
+
+# Main product keywords - if present, need position check
 MAIN_PRODUCT_KEYWORDS = [
+    # Smartphones
     "iphone", "samsung", "galaxy", "pixel", "huawei", "xiaomi", "oneplus",
     "handy", "smartphone", "telefon", "mobile",
+    # Tablets
     "tablet", "ipad",
+    # Laptops
     "laptop", "notebook", "macbook", "thinkpad",
-    "watch", "uhr", "smartwatch", "apple watch", "garmin",
+    # Watches
+    "watch", "uhr", "smartwatch", "apple watch",
+    "garmin", "fenix", "forerunner", "vivoactive", "venu", "instinct",
+    "fitbit", "polar", "suunto", "coros",
+    # Vehicles
     "auto", "car", "pkw", "fahrzeug",
     "bike", "fahrrad", "velo", "e-bike",
+    # Gaming
     "konsole", "playstation", "xbox", "nintendo", "switch",
+    # Camera
     "kamera", "camera", "dslr", "spiegelreflex",
+    # TV/Monitor
     "tv", "fernseher", "monitor", "bildschirm",
+    # Printer
     "drucker", "printer",
+    # Fitness (so bundles aren't filtered)
+    "hantelscheiben", "langhantel", "kurzhantel",
+]
+
+# Fitness category indicators
+FITNESS_INDICATORS = [
+    "hantel", "gewicht", "fitness", "gym", "training",
+    "langhantel", "kurzhantel", "scheibe", "plate",
+    "kettlebell", "dumbbell", "barbell",
 ]
 
 
-def is_accessory_title(title: str) -> bool:
+def get_accessory_keywords() -> List[str]:
+    """Returns the hardcoded accessory keywords list."""
+    return ACCESSORY_KEYWORDS.copy()
+
+
+def get_defect_keywords() -> List[str]:
+    """Returns combined defect keywords list."""
+    return DEFECT_KEYWORDS_STRONG + DEFECT_KEYWORDS_WEAK
+
+
+def detect_category(query: str) -> str:
+    """
+    Detects product category from query.
+    Used to apply category-specific filtering rules.
+    """
+    query_lower = (query or "").lower()
+    
+    if any(ind in query_lower for ind in FITNESS_INDICATORS):
+        return "fitness"
+    
+    if any(kw in query_lower for kw in ["garmin", "smartwatch", "fitbit", "polar", "apple watch"]):
+        return "smartwatch"
+    
+    if any(kw in query_lower for kw in ["iphone", "samsung", "handy", "smartphone", "pixel"]):
+        return "smartphone"
+    
+    return "general"
+
+
+def is_accessory_title(title: str, query: str = "", category: str = "") -> bool:
     """
     Detects if title is clearly an accessory (not the main product).
+    
+    v7.2 LOGIC:
+    1. If query itself contains accessory keyword → DON'T filter (user wants accessories!)
+    2. If fitness category and "set/stange/scheibe" → DON'T filter (bundles!)
+    3. If accessory keyword found but no main product → Filter
+    4. If accessory keyword + main product → Check position:
+       - "Armband für Garmin" → Filter (accessory first)
+       - "Garmin mit Armband" → DON'T filter (bundle!)
+    
+    Args:
+        title: The listing title to check
+        query: The search query (optional, for query-aware filtering)
+        category: The product category (optional, for category-specific rules)
+    
+    Returns:
+        True if listing should be SKIPPED (is accessory)
     """
     if not title:
         return False
     
     title_lower = title.lower()
+    query_lower = (query or "").lower()
     
-    has_accessory = any(kw in title_lower for kw in ACCESSORY_KEYWORDS)
-    if not has_accessory:
-        return False
+    # Auto-detect category if not provided
+    if not category and query:
+        category = detect_category(query)
+    category_lower = (category or "").lower()
     
+    # Build effective accessory keywords list
+    effective_keywords = ACCESSORY_KEYWORDS.copy()
+    
+    # RULE 1: If query contains accessory keyword → user WANTS accessories!
+    for kw in effective_keywords:
+        if kw in query_lower:
+            return False  # Don't filter - user is searching for this!
+    
+    # RULE 2: Fitness category exception for bundles
+    if category_lower in ["fitness", "sport"]:
+        # Remove bundle-related keywords for fitness
+        effective_keywords = [kw for kw in effective_keywords 
+                             if kw not in FITNESS_NOT_ACCESSORY]
+    
+    # Check if title contains any accessory keyword
+    found_accessory_kw = None
+    for kw in effective_keywords:
+        if kw in title_lower:
+            found_accessory_kw = kw
+            break
+    
+    if not found_accessory_kw:
+        return False  # No accessory keyword found
+    
+    # Check if title also contains a main product keyword
     has_main_product = any(kw in title_lower for kw in MAIN_PRODUCT_KEYWORDS)
     
-    if has_accessory and not has_main_product:
+    # RULE 3: Accessory keyword but NO main product → definitely accessory
+    if not has_main_product:
         return True
     
-    # Check if accessory keyword comes first
-    first_words = " ".join(title_lower.split()[:3])
-    if any(kw in first_words for kw in ACCESSORY_KEYWORDS):
+    # RULE 4: Both present → check which comes first
+    # "Armband für Garmin Fenix" → accessory (Armband at position 0)
+    # "Garmin Fenix mit Armband" → bundle (Garmin at position 0)
+    
+    accessory_pos = title_lower.find(found_accessory_kw)
+    
+    main_product_pos = len(title_lower)  # Default to end
+    for kw in MAIN_PRODUCT_KEYWORDS:
+        pos = title_lower.find(kw)
+        if pos != -1 and pos < main_product_pos:
+            main_product_pos = pos
+    
+    # If accessory keyword comes first → it's about the accessory
+    if accessory_pos < main_product_pos:
         return True
     
+    # Main product comes first → likely a bundle "Garmin mit Armband"
     return False
 
 
@@ -312,15 +423,24 @@ def is_defect_title(title: str, description: str = "") -> bool:
 # COMBINED PRE-FILTER
 # ==============================================================================
 
-def should_skip_listing(title: str, description: str = "") -> Tuple[bool, str]:
+def should_skip_listing(
+    title: str, 
+    description: str = "", 
+    query: str = "", 
+    category: str = ""
+) -> Tuple[bool, str]:
     """
     Combined pre-filter: checks for accessories AND defects.
     
+    v7.2: Now query-aware and category-aware!
+    
     Returns: (should_skip, reason)
     """
-    if is_accessory_title(title):
+    # Check accessory first (with query/category awareness)
+    if is_accessory_title(title, query=query, category=category):
         return (True, "accessory")
     
+    # Then check defects
     is_defect, severity, reason = detect_defect_keywords(title, description)
     if is_defect:
         return (True, f"defect: {reason}")

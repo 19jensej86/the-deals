@@ -297,6 +297,23 @@ JS_EXTRACT = r"""
         }
       }
     }
+    
+    // METHOD 4: Look for any time pattern in spans (last resort)
+    if (!endTimeText && currentBidPrice) {
+      // Only for auctions - if there's a current bid, there MUST be an end time
+      const allSpans = a.querySelectorAll("span");
+      for (const span of allSpans) {
+        const txt = (span.innerText || "").trim();
+        // Match any time-like pattern: "14:52", "Mo, 13. Jan, 11:06", etc.
+        if (/\d{1,2}:\d{2}/.test(txt) && txt.length < 50) {
+          // Avoid matching prices like "350.00"
+          if (!/CHF|Gebot|Sofort/i.test(txt)) {
+            endTimeText = txt;
+            break;
+          }
+        }
+      }
+    }
 
     out.push({
       lid,
@@ -351,21 +368,24 @@ def parse_bids_fallback(mode_text: Optional[str]) -> Optional[int]:
     return None
 
 
-def _calculate_hours_remaining(end_time_text: Optional[str]) -> float:
+def _calculate_hours_remaining(end_time_text: Optional[str], is_buy_now_only: bool = False) -> float:
     """
-    v6.0: Calculates hours remaining from end_time_text.
+    v7.2.1: Calculates hours remaining from end_time_text.
     
-    Returns 999 if parsing fails (unknown).
+    Returns 720 (30 days) for Buy-Now-Only listings (no auction).
+    Returns 999 if parsing fails for auctions (indicates scraper issue).
     """
     if not end_time_text:
-        return 999.0
+        # Buy-Now-Only listings (no auction) have no end time - use 720h
+        # Auctions missing end_time get 999 to flag scraper issues
+        return 720.0 if is_buy_now_only else 999.0
     
     try:
         from utils_time import parse_ricardo_end_time
         
         end_time = parse_ricardo_end_time(end_time_text)
         if not end_time:
-            return 999.0
+            return 720.0 if is_buy_now_only else 999.0
         
         if hasattr(end_time, 'tzinfo') and end_time.tzinfo:
             from zoneinfo import ZoneInfo
@@ -378,7 +398,7 @@ def _calculate_hours_remaining(end_time_text: Optional[str]) -> float:
         return max(0.0, hours)
         
     except Exception:
-        return 999.0
+        return 720.0 if is_buy_now_only else 999.0
 
 
 # ==============================================================================
@@ -448,7 +468,9 @@ def search_ricardo(
                 bid_count = r.get("bidCount", 0)
                 
                 end_time_text = r.get("endTimeText")
-                hours_remaining = _calculate_hours_remaining(end_time_text)
+                # Buy-Now-Only if no current bid and has buy_now price
+                is_buy_now_only = (not current_bid and buy_now is not None)
+                hours_remaining = _calculate_hours_remaining(end_time_text, is_buy_now_only)
 
                 yield {
                     "platform": "ricardo",
@@ -587,7 +609,8 @@ def search_ricardo_for_market_data(
             bid_count = r.get("bidCount", 0)
             
             end_time_text = r.get("endTimeText")
-            hours_remaining = _calculate_hours_remaining(end_time_text)
+            is_buy_now_only = (not current_bid and buy_now is not None)
+            hours_remaining = _calculate_hours_remaining(end_time_text, is_buy_now_only)
             
             if not current_bid and not buy_now:
                 continue
@@ -690,7 +713,8 @@ def search_ricardo_for_component_prices(
             bid_count = r.get("bidCount", 0)
             
             end_time_text = r.get("endTimeText")
-            hours_remaining = _calculate_hours_remaining(end_time_text)
+            is_buy_now_only = (not current_bid and buy_now is not None)
+            hours_remaining = _calculate_hours_remaining(end_time_text, is_buy_now_only)
             
             # PRIORITY 1: Auctions with bids (validated by market!)
             if prefer_auctions_with_bids and current_bid and current_bid >= min_price and bid_count >= 1:
