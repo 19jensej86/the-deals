@@ -18,6 +18,14 @@ general:
   detail_pages_enabled: true
   max_detail_pages_per_run: 5 # Top 5 by expected_profit
 
+  # v9.0: Clarity Detection & Smart Scraping
+  # ----------------------------------------
+  # Automatically detects unclear listings and scrapes detail pages
+  # to get more info. Uses vision as fallback for still-unclear items.
+  clarity_detection_enabled: true
+  max_unclear_detail_scrapes: 10 # Max detail pages for unclear listings
+  max_vision_for_clarity: 5 # Max vision calls for still-unclear items
+
 postgres:
   host: "localhost"
   port: 5432
@@ -74,8 +82,10 @@ ai:
   adaptive_vision_rate: 0.10
 
   # v7.0: Web Search Settings
+  # ⚠️ WARNING: Web search costs ~$0.10-0.15 per batch!
+  # Set to false to use AI estimation only (much cheaper: ~$0.01/run)
   web_search:
-    enabled: true
+    enabled: true # Set to FALSE to disable expensive web searches
     preferred_shops:
       - "digitec.ch"
       - "galaxus.ch"
@@ -87,16 +97,16 @@ ai:
       - "aboutyou.ch"
       - "manor.ch"
 
-  # Pricing (USD pro Call)
+  # Pricing (USD pro Call) - CORRECTED based on actual billing!
   pricing:
-    claude_haiku_usd: 0.001 # Haiku: $0.80/1M input, $4/1M output
-    claude_sonnet_usd: 0.003 # Sonnet: $3/1M input, $15/1M output
-    claude_web_search_usd: 0.01 # Sonnet + Web Search
-    openai_text_usd: 0.001 # GPT-4o-mini fallback
+    claude_haiku_usd: 0.002 # ~2k tokens × $1/1M
+    claude_sonnet_usd: 0.005 # ~1.5k tokens × $3/1M
+    claude_web_search_usd: 0.10 # ~22k tokens + retries = $0.10-0.15!
+    openai_text_usd: 0.001
     vision_usd: 0.007
 
   # Budget limits
   budget:
-    daily_cost_usd_max: 1.50
+    daily_cost_usd_max: 0.50 # Reduced! With web search off: ~$0.05/run
     daily_vision_calls_max: 100
-    daily_web_search_max: 50
+    daily_web_search_max: 10 # Reduced! Each costs ~$0.10

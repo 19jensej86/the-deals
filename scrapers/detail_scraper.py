@@ -23,7 +23,7 @@ import re
 import json
 import random
 import time
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
 
 
@@ -112,7 +112,118 @@ def _extract_rating_from_text(text: str) -> Optional[int]:
 
 
 # ==============================================================================
-# JSON-LD EXTRACTION
+# __NEXT_DATA__ EXTRACTION (PRIMARY - Most reliable)
+# ==============================================================================
+
+def _extract_next_data(page: Page) -> Optional[Dict]:
+    """
+    Extracts __NEXT_DATA__ JSON from Ricardo pages.
+    This contains ALL structured data including description, images, seller info.
+    """
+    try:
+        script = page.query_selector('script#__NEXT_DATA__')
+        if script:
+            content = script.inner_text()
+            data = json.loads(content)
+            # Navigate to the article data
+            props = data.get("props", {}).get("pageProps", {})
+            return props
+        return None
+    except Exception as e:
+        print(f"   ⚠️ __NEXT_DATA__ extraction failed: {e}")
+        return None
+
+
+def _extract_article_from_next_data(next_data: Dict) -> Dict[str, Any]:
+    """
+    Extracts article details from __NEXT_DATA__.
+    
+    Returns structured data:
+    - title, description, condition
+    - seller info (name, rating, id)
+    - shipping details
+    - image URLs
+    - category path
+    """
+    result = {
+        "title": None,
+        "full_description": None,
+        "condition": None,
+        "seller_name": None,
+        "seller_rating": None,
+        "seller_id": None,
+        "shipping_cost": None,
+        "shipping_method": None,
+        "pickup_available": False,
+        "location": None,
+        "postal_code": None,
+        "image_urls": [],
+        "category_path": None,
+        "buy_now_price": None,
+        "current_bid": None,
+    }
+    
+    if not next_data:
+        return result
+    
+    # Get article object
+    article = next_data.get("article", {})
+    
+    if article:
+        # Basic info
+        result["title"] = article.get("title")
+        result["full_description"] = article.get("description")
+        result["condition"] = article.get("conditionKey")
+        result["image_urls"] = article.get("imageUrls", [])
+        
+        # Prices
+        result["buy_now_price"] = article.get("buyNowPrice")
+        result["current_bid"] = article.get("bidPrice")
+        
+        # Shipping
+        shipping_list = article.get("shipping", [])
+        if shipping_list:
+            first_ship = shipping_list[0] if isinstance(shipping_list, list) else shipping_list
+            if isinstance(first_ship, dict):
+                result["shipping_cost"] = first_ship.get("cost")
+                result["shipping_method"] = first_ship.get("key")
+                result["postal_code"] = first_ship.get("zipCode")
+                city = first_ship.get("city")
+                if result["postal_code"] and city:
+                    result["location"] = f"{result['postal_code']} {city}"
+                    
+                # Check for pickup
+                if first_ship.get("key") == "get_by_buyer":
+                    result["pickup_available"] = True
+    
+    # Seller info from nested object
+    seller_data = next_data.get("seller", {})
+    if seller_data:
+        result["seller_name"] = seller_data.get("nickname")
+        result["seller_id"] = seller_data.get("id")
+        # Rating is as percentage (e.g., 99.24 -> 99)
+        score = seller_data.get("score")
+        if score:
+            result["seller_rating"] = int(float(score) * 100) if score <= 1 else int(score)
+    
+    # Category path
+    category = next_data.get("category", {})
+    if category:
+        cat_parts = []
+        cat = category
+        while cat:
+            name = cat.get("name")
+            if name:
+                cat_parts.insert(0, name)
+            cat = cat.get("parent")
+        if cat_parts:
+            result["category_path"] = " > ".join(cat_parts)
+    
+    return result
+
+
+# ==============================================================================
+# JSON-LD EXTRACTION (Fallback)
 # ==============================================================================
 
 def _extract_json_ld(page: Page) -> Optional[Dict]:
@@ -324,40 +435,34 @@ def scrape_detail_page(
         _accept_cookies(page)
         _human_scroll(page)
         
-        # --- 1. EXTRACT JSON-LD ---
-        json_ld = _extract_json_ld(page)
+        # --- 1. PRIMARY: __NEXT_DATA__ (most reliable) ---
+        next_data = _extract_next_data(page)
         
-        if json_ld:
-            # Find Product object
-            product = _find_in_graph(json_ld, "Product")
-            
-            if product:
-                # Description
-                result["full_description"] = product.get("description")
-                
-                # Offers (contains shipping info)
-                offers = product.get("offers")
-                if isinstance(offers, dict):
-                    # Shipping details
-                    shipping = offers.get("shippingDetails")
-                    if isinstance(shipping, dict):
-                        rate = shipping.get("shippingRate")
-                        if isinstance(rate, dict):
-                            result["shipping_cost"] = _extract_price_from_text(
-                                str(rate.get("value", ""))
-                            )
-                    
-                    # Seller info (sometimes embedded as string)
-                    seller = offers.get("seller")
-                    if isinstance(seller, dict):
-                        result["seller_name"] = seller.get("name")
-                    elif isinstance(seller, str):
-                        # Try to parse seller name from string
-                        name_match = re.search(r'"name"\s*:\s*"([^"]+)"', seller)
-                        if name_match:
-                            result["seller_name"] = name_match.group(1)
+        if next_data:
+            article_data = _extract_article_from_next_data(next_data)
+            # Copy all extracted data
+            result["full_description"] = article_data.get("full_description")
+            result["location"] = article_data.get("location")
+            result["postal_code"] = article_data.get("postal_code")
+            result["shipping_method"] = article_data.get("shipping_method")
+            result["shipping_cost"] = article_data.get("shipping_cost")
+            result["pickup_available"] = article_data.get("pickup_available", False)
+            result["seller_name"] = article_data.get("seller_name")
+            result["seller_rating"] = article_data.get("seller_rating")
+            # Store extra data for clarity analysis
+            result["image_urls"] = article_data.get("image_urls", [])
+            result["category_path"] = article_data.get("category_path")
+            result["condition"] = article_data.get("condition")
         
-        # --- 2. FILL GAPS FROM DOM ---
+        # --- 2. FALLBACK: JSON-LD ---
+        if not result["full_description"]:
+            json_ld = _extract_json_ld(page)
+            if json_ld:
+                product = _find_in_graph(json_ld, "Product")
+                if product:
+                    result["full_description"] = product.get("description")
+        
+        # --- 3. FALLBACK: DOM extraction ---
         dom_data = _extract_from_dom(page)
         
         # Only overwrite if we don't have the data yet
@@ -373,9 +478,8 @@ def scrape_detail_page(
             result["seller_rating"] = dom_data.get("seller_rating")
         if not result["seller_name"]:
             result["seller_name"] = dom_data.get("seller_name")
-        
-        # Pickup is always from DOM
-        result["pickup_available"] = dom_data.get("pickup_available", False)
+        if not result["pickup_available"]:
+            result["pickup_available"] = dom_data.get("pickup_available", False)
         
         result["scrape_success"] = True
         
@@ -480,6 +584,104 @@ def scrape_top_deals(
     print(f"\n✅ Detail scraping complete ({len(top_deals)} pages)")
     
     return deals
+
+
+# ==============================================================================
+# CLARITY-BASED SCRAPING (for unclear listings)
+# ==============================================================================
+
+def scrape_unclear_listings(
+    unclear_listings: List[Dict[str, Any]],
+    context: BrowserContext,
+    max_pages: int = 10,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Scrapes detail pages for listings with unclear titles.
+    After scraping, re-evaluates clarity based on description.
+    
+    Args:
+        unclear_listings: Listings flagged as unclear by clarity detector
+        context: Playwright browser context
+        max_pages: Maximum number of pages to scrape
+    
+    Returns:
+        Tuple[now_clear, still_unclear]
+        - now_clear: Listings that became clear after getting description
+        - still_unclear: Listings that still need vision analysis
+    """
+    from clarity_detector import analyze_listing_clarity
+    
+    if not unclear_listings:
+        return [], []
+    
+    to_scrape = unclear_listings[:max_pages]
+    now_clear = []
+    still_unclear = []
+    
+    print(f"\n🔍 Scraping {len(to_scrape)} unclear listings for more details...")
+    
+    for i, listing in enumerate(to_scrape, 1):
+        url = listing.get("url")
+        title = listing.get("title", "")[:40]
+        listing_id = listing.get("listing_id")
+        
+        if not url:
+            still_unclear.append(listing)
+            continue
+        
+        print(f"\n   [{i}/{len(to_scrape)}] {title}...")
+        
+        # Scrape detail page
+        detail_data = scrape_detail_page(
+            url=url,
+            context=context,
+            add_delay=(i > 1),
+        )
+        
+        if detail_data.get("scrape_success"):
+            # Update listing with scraped data
+            listing["detail_scraped"] = True
+            listing["description"] = detail_data.get("full_description") or listing.get("description", "")
+            listing["seller_rating"] = detail_data.get("seller_rating")
+            listing["shipping_cost"] = detail_data.get("shipping_cost")
+            listing["pickup_available"] = detail_data.get("pickup_available")
+            listing["image_urls"] = detail_data.get("image_urls", [])
+            listing["category_path"] = detail_data.get("category_path")
+            
+            if detail_data.get("location"):
+                listing["location"] = detail_data["location"]
+            if detail_data.get("postal_code"):
+                listing["postal_code"] = detail_data["postal_code"]
+            
+            # Re-evaluate clarity with new description
+            new_clarity = analyze_listing_clarity(
+                title=listing.get("title", ""),
+                description=listing.get("description", ""),
+                category=listing.get("category_path"),
+            )
+            
+            listing["_clarity_result"] = new_clarity.to_dict()
+            
+            if new_clarity.is_clear:
+                print(f"   ✅ Now clear: {new_clarity.reasons[-1] if new_clarity.reasons else 'OK'}")
+                now_clear.append(listing)
+            else:
+                print(f"   ⚠️ Still unclear → Vision needed")
+                listing["needs_vision"] = True
+                still_unclear.append(listing)
+        else:
+            print(f"   ❌ Scrape failed: {detail_data.get('scrape_error')}")
+            listing["needs_vision"] = True
+            still_unclear.append(listing)
+    
+    # Add remaining unclear listings that weren't scraped
+    for listing in unclear_listings[max_pages:]:
+        listing["needs_vision"] = True
+        still_unclear.append(listing)
+    
+    print(f"\n📊 Clarity results: {len(now_clear)} now clear, {len(still_unclear)} need vision")
+    
+    return now_clear, still_unclear
 
 
 # ==============================================================================

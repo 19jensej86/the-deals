@@ -1,0 +1,50 @@
+{
+  "export_time": "2026-01-12T07:21:45.185332",
+  "quality_score": 60.0,
+  "summary": {
+    "total_listings": 16,
+    "profitable_deals": 4,
+    "bundles_detected": 7,
+    "web_searches_used": 5,
+    "run_cost_usd": 1.771
+  },
+  "price_sources": {
+    "bundle_calculation": 7,
+    "web_manor": 4,
+    "ai_estimate": 3,
+    "auction_demand": 1,
+    "web_decathlon": 1
+  },
+  "strategies": {
+    "buy_now": 1,
+    "watch": 3,
+    "skip": 12
+  },
+  "profit_stats": {
+    "max": 103.83,
+    "min": -172.51,
+    "avg": -10.926874999999999,
+    "profitable_count": 4
+  },
+  "issues": {
+    "bundle_default_prices": [],
+    "suspicious_prices": [
+      {
+        "title": "Hantelscheiben Set: 2x 15kg, 2x 10kg, 6x 5kg, 4x 2",
+        "issue": "28.0 CHF/kg is too high for weight plates"
+      },
+      {
+        "title": "Kettler Hantelscheiben, 2 Stk. à 2.5kg",
+        "issue": "12.0 CHF/kg is too high for weight plates"
+      },
+      {
+        "title": "Hantelscheiben Set 107,5kg (neu)",
+        "issue": "73.0 CHF/kg is too high for weight plates"
+      }
+    ],
+    "total_issues": 3
+  },
+  "recommendations": [
+    "Some prices appear unrealistic - check AI fallback logic"
+  ]
+}

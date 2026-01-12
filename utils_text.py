@@ -197,9 +197,34 @@ FITNESS_NOT_ACCESSORY = [
     "set",      # Hantelscheiben-Sets sind wertvoll!
     "stange",   # Langhantelstangen sind Hauptprodukte
     "scheibe",  # Hantelscheiben = Hauptprodukt
+    "bumper",   # Bumper Plates = Hauptprodukt (100kg = ~300 CHF!)
     "plate",    # Weight plates = Hauptprodukt
     "hantel",   # Hanteln = Hauptprodukt
     "gewicht",  # Gewichte = Hauptprodukt
+]
+
+# v8.0: CLOTHING PRODUCT TYPES (markenagnostisch!)
+# Diese definieren die Kategorie "clothing" - NICHT Marken!
+CLOTHING_PRODUCT_TYPES = [
+    "jacke", "jacket", "parka", "mantel", "coat", "blazer", "weste",
+    "pullover", "sweater", "hoodie", "sweatshirt", "cardigan",
+    "hemd", "shirt", "bluse", "polo", "t-shirt", "top",
+    "hose", "jeans", "pants", "shorts", "chino", "jogger",
+    "kleid", "dress", "rock", "skirt",
+    "tasche", "handtasche", "bag", "shopper", "rucksack", "backpack",
+    "schuhe", "shoes", "sneaker", "stiefel", "boots", "sandalen",
+    "gürtel", "belt", "schal", "scarf", "mütze", "cap", "hat",
+]
+
+# v8.0: Bei Clothing sind Taschen/Accessoires HAUPTPRODUKTE (nicht Zubehör!)
+# Diese werden aus ACCESSORY_KEYWORDS gefiltert wenn category=clothing
+CLOTHING_MAIN_PRODUCTS = [
+    "tasche", "handtasche", "bag", "shopper", "tote",
+    "rucksack", "backpack",
+    "gürtel", "belt",
+    "schal", "scarf", "tuch",
+    "mütze", "cap", "hat", "hut", "beanie",
+    "geldbörse", "wallet", "portemonnaie",
 ]
 
 # Main product keywords - if present, need position check
@@ -250,10 +275,15 @@ def get_defect_keywords() -> List[str]:
 
 def detect_category(query: str) -> str:
     """
-    Detects product category from query.
-    Used to apply category-specific filtering rules.
+    Detects product category from query based on PRODUCT TYPES, not brands!
+    
+    v8.0: Markenagnostisch - erkennt Kategorie aus Produkttypen im Query.
     """
     query_lower = (query or "").lower()
+    
+    # v8.0: Clothing = Produkttypen (NICHT Marken!)
+    if any(pt in query_lower for pt in CLOTHING_PRODUCT_TYPES):
+        return "clothing"
     
     if any(ind in query_lower for ind in FITNESS_INDICATORS):
         return "fitness"
@@ -306,7 +336,12 @@ def is_accessory_title(title: str, query: str = "", category: str = "") -> bool:
         if kw in query_lower:
             return False  # Don't filter - user is searching for this!
     
-    # RULE 2: Fitness category exception for bundles
+    # RULE 2a: Clothing category exception - bags, belts, etc. are main products!
+    if category_lower in ["clothing", "fashion", "mode"]:
+        effective_keywords = [kw for kw in effective_keywords 
+                             if kw not in CLOTHING_MAIN_PRODUCTS]
+    
+    # RULE 2b: Fitness category exception for bundles
     if category_lower in ["fitness", "sport"]:
         # Remove bundle-related keywords for fitness
         effective_keywords = [kw for kw in effective_keywords 

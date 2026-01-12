@@ -1,6 +1,11 @@
 """
-AI Filter & Evaluation - v7.0 (Claude Edition)
-==============================================
+AI Filter & Evaluation - v7.3.5 (Optimized Edition)
+====================================================
+MAJOR CHANGES in v7.3.5:
+- Bundle component web search with caching
+- Cache statistics tracking
+- Optimized logging
+
 MAJOR CHANGES in v7.0:
 
 1. CLAUDE PRIMARY - OpenAI fallback
@@ -44,6 +49,19 @@ from decimal import Decimal
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# v7.3.5: Import cache statistics tracking
+try:
+    from utils_logging import get_cache_stats
+except ImportError:
+    # Fallback if utils_logging not available
+    class DummyCacheStats:
+        def record_web_price_hit(self): pass
+        def record_web_price_miss(self): pass
+        def record_variant_hit(self): pass
+        def record_variant_miss(self): pass
+    def get_cache_stats():
+        return DummyCacheStats()
 
 
 # ==============================================================================
@@ -103,17 +121,23 @@ _init_clients()
 # CONSTANTS
 # ==============================================================================
 
-COST_CLAUDE_HAIKU = 0.001
-COST_CLAUDE_SONNET = 0.003
-COST_CLAUDE_WEB_SEARCH = 0.01
+# v7.3.3: CORRECTED COSTS based on ACTUAL billing ($2.31 for 6 web searches)
+# Web search with Sonnet includes large search result tokens!
+# Real cost: ~$0.35-0.40 per web search batch
+COST_CLAUDE_HAIKU = 0.003          # ~3k tokens × $1/1M = $0.003
+COST_CLAUDE_SONNET = 0.01          # ~3k tokens × $3/1M = $0.01  
+COST_CLAUDE_WEB_SEARCH = 0.35      # REAL COST: ~$0.35 per batch (includes search results)
 COST_OPENAI_TEXT = 0.001
 COST_VISION = 0.007
 
-DAILY_COST_LIMIT = 1.50
-DAILY_VISION_LIMIT = 100
-DAILY_WEB_SEARCH_LIMIT = 50
+# v7.3.4: Adjusted limits for SINGLE web search strategy
+# With single batch strategy: 1 search = all products = $0.35
+DAILY_COST_LIMIT = 3.00            # ~8 full runs per day
+DAILY_VISION_LIMIT = 50
+DAILY_WEB_SEARCH_LIMIT = 5         # Max 5 single searches = ~$1.75
 
 WEB_SEARCH_COUNT_TODAY: int = 0
+WEB_SEARCH_ENABLED: bool = True  # v7.3.2: Toggle via config.yaml to save costs
 WEB_PRICE_CACHE_FILE = "web_price_cache.json"
 WEB_PRICE_CACHE_DAYS = 60
 _web_price_cache: Dict[str, Dict] = {}
@@ -131,6 +155,7 @@ CACHE_ENABLED = True
 VARIANT_CACHE_DAYS = 30
 COMPONENT_CACHE_DAYS = 30
 CLUSTER_CACHE_DAYS = 7
+CATEGORY_THRESHOLD_CACHE_DAYS = 90
 
 RUN_COST_USD: float = 0.0
 DAY_COST_FILE = "ai_cost_day.txt"
@@ -138,6 +163,7 @@ DAY_COST_FILE = "ai_cost_day.txt"
 VARIANT_CACHE_FILE = "variant_cache.json"
 COMPONENT_CACHE_FILE = "component_cache.json"
 CLUSTER_CACHE_FILE = "variant_cluster_cache.json"
+CATEGORY_THRESHOLD_CACHE_FILE = "category_threshold_cache.json"
 
 USE_VISION = True
 VISION_RATE = 0.10
@@ -233,6 +259,10 @@ def _call_claude(
         return "\n".join(result_parts) if result_parts else None
         
     except Exception as e:
+        error_str = str(e)
+        # Re-raise 429 rate limit errors so retry logic can handle them
+        if "429" in error_str or "rate_limit" in error_str.lower():
+            raise  # Let caller handle rate limits
         print(f"⚠️ Claude API error: {e}")
         return None
 
@@ -312,8 +342,203 @@ def call_ai(
 
 
 # ==============================================================================
-# v7.0: REAL WEB SEARCH FOR NEW PRICES (THE GAME CHANGER!)
+# v7.3: BATCH WEB SEARCH WITH RATE LIMIT HANDLING
 # ==============================================================================
+
+def _call_claude_with_retry(
+    prompt: str,
+    max_tokens: int = 500,
+    use_web_search: bool = False,
+    max_retries: int = 2,
+) -> Optional[str]:
+    """
+    v7.3.3: Call Claude with LONG wait on rate limit.
+    
+    Strategy: Wait 120s on first rate limit hit instead of quick retries.
+    This saves money because each retry costs ~$0.08!
+    User prefers waiting over paying multiple times.
+    """
+    import time
+    
+    for attempt in range(max_retries):
+        try:
+            result = _call_claude(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                use_web_search=use_web_search,
+            )
+            return result
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "rate_limit" in error_str.lower():
+                # v7.3.3: Wait 120s on first hit, 180s on second
+                # This avoids paying for multiple failed attempts!
+                wait_time = 120 if attempt == 0 else 180
+                print(f"   ⏳ Rate limit hit, waiting {wait_time}s (saves money vs quick retries)...")
+                time.sleep(wait_time)
+            else:
+                print(f"   ⚠️ Claude error: {e}")
+                return None
+    
+    print("   ⚠️ Rate limit still active after waiting")
+    return None
+
+
+def search_web_batch_for_new_prices(
+    variant_keys: List[str],
+    category: str = "unknown",
+    query_analysis: Optional[Dict] = None
+) -> Dict[str, Dict[str, Any]]:
+    """
+    v7.3.4: SINGLE WEB SEARCH STRATEGY - 83% cost reduction!
+    
+    Changes:
+    - Wait 120s UPFRONT (proactive rate limit prevention)
+    - ONE large batch (25 products) instead of multiple small batches
+    - No retry logic needed (rate limit already handled)
+    - Cost: $0.35 instead of $2.10 (6 batches × $0.35)
+    
+    v7.3.3: Uses clean_search_term() for better results
+    """
+    global RUN_COST_USD, WEB_SEARCH_COUNT_TODAY
+    import time
+    from query_analyzer import clean_search_term
+    
+    if not variant_keys:
+        return {}
+    
+    # v7.3.2: Check if web search is enabled
+    if not WEB_SEARCH_ENABLED:
+        print("   ℹ️ Web search DISABLED (config.yaml) - using AI estimation only")
+        return {}
+    
+    # Check budget
+    if is_budget_exceeded():
+        return {}
+    
+    if WEB_SEARCH_COUNT_TODAY >= DAILY_WEB_SEARCH_LIMIT:
+        print("🚫 Daily web search limit reached")
+        return {}
+    
+    # Claude with web search required
+    if not _claude_client:
+        print("   ⚠️ Web search requires Claude API")
+        return {}
+    
+    results = {}
+    
+    # Check cache first for all variants
+    uncached = []
+    for vk in variant_keys:
+        cached = get_cached_web_price(vk)
+        if cached:
+            results[vk] = cached
+            get_cache_stats().record_web_price_hit()
+            print(f"   💾 Cached: {vk[:40]}... = {cached['new_price']} CHF")
+        else:
+            uncached.append(vk)
+            get_cache_stats().record_web_price_miss()
+    
+    if not uncached:
+        return results
+    
+    # v7.3.4: SINGLE WEB SEARCH STRATEGY
+    # Wait 120s UPFRONT to avoid rate limits completely
+    # Then do ONE large batch with all products
+    print(f"\n🌐 v7.3.4: SINGLE web search for {len(uncached)} products (cost-optimized)")
+    print(f"   ⏳ Waiting 120s upfront (proactive rate limit prevention)...")
+    time.sleep(120)
+    
+    # Process all uncached products in ONE batch (max 30 = ~25k tokens, safe under 30k limit)
+    batch_size = 30
+    for i in range(0, len(uncached), batch_size):
+        batch = uncached[i:i + batch_size]
+        
+        print(f"\n   🌐 Web search batch: {len(batch)} products...")
+        
+        # v7.3.3: Clean search terms for better results
+        # "Garmin Fenix 6 Smartwatch inkl. Zubehör" → "Garmin Fenix 6"
+        cleaned_terms = []
+        for idx, vk in enumerate(batch):
+            clean = clean_search_term(vk, query_analysis)
+            cleaned_terms.append((idx, vk, clean))
+            if clean != vk:
+                print(f"   🔧 Cleaned: '{vk[:40]}' → '{clean}'")
+        
+        product_list = "\n".join([f"{idx+1}. {clean}" for idx, vk, clean in cleaned_terms])
+        
+        # Compact prompt to minimize tokens
+        prompt = f"""Finde Schweizer Neupreise (CHF) für diese {len(batch)} Produkte.
+Kategorie: {category}
+
+PRODUKTE:
+{product_list}
+
+Suche in: Digitec.ch, Galaxus.ch, Zalando.ch, Decathlon.ch, Manor.ch
+
+Antworte NUR als JSON-Array:
+[
+  {{"nr": 1, "price": 199.00, "shop": "Galaxus", "conf": 0.9}},
+  {{"nr": 2, "price": null, "shop": null, "conf": 0.0}},
+  ...
+]
+
+Bei unbekannt: price=null, conf=0"""
+
+        try:
+            raw = _call_claude_with_retry(
+                prompt=prompt,
+                max_tokens=800,
+                use_web_search=True,
+                max_retries=3,
+            )
+            
+            if not raw:
+                print("   ⚠️ No response from batch web search")
+                continue
+            
+            # Track cost (one web search for the batch)
+            add_cost(COST_CLAUDE_WEB_SEARCH)
+            WEB_SEARCH_COUNT_TODAY += 1
+            
+            # Parse JSON array response
+            json_match = re.search(r'\[[\s\S]*\]', raw)
+            if not json_match:
+                print(f"   ⚠️ No JSON array in batch response")
+                continue
+            
+            parsed = json.loads(json_match.group(0))
+            
+            for item in parsed:
+                nr = item.get("nr", 0) - 1  # Convert to 0-indexed
+                if 0 <= nr < len(batch):
+                    vk = batch[nr]
+                    price = item.get("price")
+                    shop = item.get("shop")
+                    conf = item.get("conf", 0.0)
+                    
+                    if price and price > 0 and conf >= 0.6:
+                        price_source = f"web_{shop.lower()}" if shop else "web_batch"
+                        
+                        result = {
+                            "new_price": float(price),
+                            "price_source": price_source,
+                            "shop_name": shop,
+                            "confidence": conf,
+                        }
+                        
+                        # Cache it
+                        set_cached_web_price(vk, result["new_price"], price_source, shop or "unknown")
+                        results[vk] = result
+                        print(f"   ✅ {vk[:40]}... = {price} CHF ({shop})")
+                    else:
+                        print(f"   ⚠️ {vk[:40]}... = no price found")
+                        
+        except Exception as e:
+            print(f"   ⚠️ Batch web search failed: {e}")
+    
+    return results
+
 
 def search_web_for_new_price(
     variant_key: str,
@@ -321,129 +546,16 @@ def search_web_for_new_price(
     category: str = "unknown"
 ) -> Optional[Dict[str, Any]]:
     """
-    v7.0: REAL WEB SEARCH using Claude + web_search tool.
-    
-    This actually searches Swiss online shops and returns real prices!
-    
-    Args:
-        variant_key: Product variant identifier
-        search_terms: List of search terms
-        category: Product category (for shop selection)
-    
-    Returns:
-        {
-            "new_price": float,
-            "price_source": "web_digitec" | "web_galaxus" | etc,
-            "shop_name": str,
-            "confidence": float,
-        }
+    v7.0: Single product web search (legacy, now uses batch internally).
     """
-    global RUN_COST_USD, WEB_SEARCH_COUNT_TODAY
-    
-    # Check budget
-    if is_budget_exceeded():
-        return None
-    
-    if WEB_SEARCH_COUNT_TODAY >= DAILY_WEB_SEARCH_LIMIT:
-        print("🚫 Daily web search limit reached")
-        return None
-    
     # Check cache first
     cached = get_cached_web_price(variant_key)
     if cached:
-        print(f"   💾 Web price cached: {cached['new_price']} CHF ({cached['price_source']})")
         return cached
     
-    # Claude with web search required
-    if not _claude_client:
-        print("   ⚠️ Web search requires Claude API")
-        return None
-    
-    print(f"   🌐 Web searching: {variant_key}")
-    
-    # Determine shops based on category
-    if category == "clothing":
-        shops = "Zalando.ch, AboutYou.ch, Manor.ch"
-    elif category == "fitness":
-        shops = "Decathlon.ch, SportXX.ch, Galaxus.ch"
-    else:
-        shops = "Digitec.ch, Galaxus.ch, Brack.ch, Interdiscount.ch"
-    
-    search_query = " ".join(search_terms[:3]) if search_terms else variant_key
-    
-    prompt = f"""Finde den AKTUELLEN Neupreis in CHF für dieses Produkt in der Schweiz.
-
-PRODUKT: {variant_key}
-SUCHBEGRIFFE: {search_query}
-KATEGORIE: {category}
-SHOPS: {shops}
-
-WICHTIG:
-- Suche bei den angegebenen Schweizer Online-Shops
-- Gib den AKTUELLEN Verkaufspreis zurück, nicht historische UVP
-- Bei mehreren Ergebnissen: nimm den günstigsten verfügbaren Preis
-- Bei Unsicherheit: gib null zurück
-
-Antworte NUR als JSON:
-{{
-  "new_price": XXX.XX oder null,
-  "shop_name": "Digitec" oder "Galaxus" oder null,
-  "product_found": "Exakter Produktname wie gefunden",
-  "confidence": 0.0-1.0,
-  "reasoning": "Kurz: wo gefunden oder warum nicht"
-}}"""
-
-    try:
-        raw = _call_claude(
-            prompt=prompt,
-            max_tokens=500,
-            use_web_search=True,  # This enables the web_search tool!
-        )
-        
-        if not raw:
-            print("   ⚠️ No response from Claude web search")
-            return None
-        
-        # Track cost
-        add_cost(COST_CLAUDE_WEB_SEARCH)
-        WEB_SEARCH_COUNT_TODAY += 1
-        
-        # Parse JSON response
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if not json_match:
-            print(f"   ⚠️ No JSON in web search response")
-            return None
-        
-        parsed = json.loads(json_match.group(0))
-        
-        new_price = parsed.get("new_price")
-        shop_name = parsed.get("shop_name")
-        confidence = parsed.get("confidence", 0.5)
-        reasoning = parsed.get("reasoning", "")
-        
-        # Only accept if confidence > 60%
-        if new_price and new_price > 0 and confidence >= 0.6:
-            price_source = f"web_{shop_name.lower().replace('.ch', '')}" if shop_name else "web_search"
-            
-            result = {
-                "new_price": float(new_price),
-                "price_source": price_source,
-                "shop_name": shop_name,
-                "confidence": confidence,
-            }
-            
-            # Cache it (60 days)
-            set_cached_web_price(variant_key, result["new_price"], price_source, shop_name)
-            
-            print(f"   ✅ Web price: {new_price} CHF ({shop_name}, confidence={confidence:.0%})")
-            return result
-        else:
-            print(f"   ⚠️ Low confidence ({confidence:.0%}): {reasoning}")
-            return None
-        
-    except Exception as e:
-        print(f"   ⚠️ Web search failed: {e}")
-        return None
+    # Use batch function for single item
+    results = search_web_batch_for_new_prices([variant_key], category)
+    return results.get(variant_key)
 
 
 # ==============================================================================
@@ -451,303 +563,106 @@ Antworte NUR als JSON:
 # ==============================================================================
 
 WEIGHT_PRICING = {
-    "gusseisen": {
-        "max_resale_per_kg": 2.0,
-        "typical_resale_per_kg": 1.5,
-        "new_price_per_kg": 3.5,
-        "keywords": ["guss", "gusseisen", "cast iron", "eisen"],
-    },
-    "bumper": {
-        "max_resale_per_kg": 3.5,
-        "typical_resale_per_kg": 2.75,
-        "new_price_per_kg": 6.0,
-        "keywords": ["bumper", "gummi", "rubber", "urethane", "competition"],
-    },
-    "olympic_steel": {
-        "max_resale_per_kg": 2.5,
-        "typical_resale_per_kg": 2.0,
-        "new_price_per_kg": 4.5,
-        "keywords": ["50mm", "olympic", "olympia", "stahl", "steel", "chrom"],
-    },
-    "standard": {
-        "max_resale_per_kg": 2.0,
-        "typical_resale_per_kg": 1.5,
-        "new_price_per_kg": 3.5,
-        "keywords": ["30mm", "standard", "hantelscheibe", "gewicht"],
-    },
+    "standard": {"new_price_per_kg": 3.5, "resale_rate": 0.60},  # Gusseisen
+    "bumper": {"new_price_per_kg": 5.0, "resale_rate": 0.55},    # Bumper Plates
+    "competition": {"new_price_per_kg": 9.0, "resale_rate": 0.50}, # Competition/Calibrated (v9.0: erhöht von 8)
+    "rubber": {"new_price_per_kg": 4.0, "resale_rate": 0.55},    # Rubber coated
+    "calibrated": {"new_price_per_kg": 9.0, "resale_rate": 0.50}, # v9.0: Calibrated = Competition
 }
 
 WEIGHT_PLATE_KEYWORDS = [
-    "hantelscheibe", "hantelscheiben", "gewichtsscheibe", "gewichtsscheiben",
-    "scheibe", "scheiben", "plate", "plates", "bumper", "weight",
+    # Deutsch
+    "hantelscheiben", "hantelscheibe", "gewichte", "gewicht",
+    "hantel", "langhantel", "kurzhantel", "kettlebell", "bumper",
+    "hantelset", "gewichtsscheibe", "gewichtsscheiben",
+    # Englisch
+    "plates", "plate", "weight plate", "dumbbell", "barbell",
+    # Französisch (v9.0)
+    "disques", "disque", "musculation", "haltère", "poids",
+    # Technische
+    "olympia", "50mm", "30mm",
 ]
 
 
-def detect_weight_type(name: str) -> str:
-    """v6.8: Detect weight plate type from name."""
-    name_lower = name.lower()
-    for weight_type, config in WEIGHT_PRICING.items():
-        if any(kw in name_lower for kw in config["keywords"]):
-            return weight_type
-    return "standard"
+def is_weight_plate(text: str) -> bool:
+    """Check if text describes weight plates/fitness equipment."""
+    text_lower = text.lower()
+    for kw in WEIGHT_PLATE_KEYWORDS:
+        if kw in text_lower:
+            return True
+    return False
 
 
-def extract_weight_kg(name: str) -> Optional[float]:
-    """v6.8: Extract weight in kg from name."""
-    name_lower = name.lower()
-    match = re.search(r'(\d+(?:[.,]\d+)?)\s*kg', name_lower)
+def extract_weight_kg(text: str) -> Optional[float]:
+    """
+    v7.3.3: Improved weight extraction from text.
+    Handles patterns like:
+    - "20kg", "20 kg" → 20
+    - "4x 5kg" → 20 (total)
+    - "Set 4x 5kg" → 20 (total)
+    - "8x1.25kg" → 10 (total)
+    """
+    import re
+    text_lower = text.lower()
+    
+    # Pattern 1: Quantity x Weight (e.g., "4x 5kg", "8x1.25kg")
+    qty_match = re.search(r'(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*kg', text_lower)
+    if qty_match:
+        qty = int(qty_match.group(1))
+        per_piece = float(qty_match.group(2).replace(',', '.'))
+        return qty * per_piece
+    
+    # Pattern 2: Total weight (e.g., "20kg", "12.5 kg")
+    match = re.search(r'(\d+(?:[.,]\d+)?)\s*kg', text_lower)
     if match:
         return float(match.group(1).replace(',', '.'))
     return None
 
 
-def is_weight_plate(name: str) -> bool:
-    """v6.8: Check if item is a weight plate."""
-    return any(kw in name.lower() for kw in WEIGHT_PLATE_KEYWORDS)
+def get_weight_type(text: str) -> str:
+    """Determine weight plate type from text."""
+    text_lower = text.lower()
+    
+    # v9.0: Explicit keyword detection for weight types
+    # Calibrated/Competition plates (most expensive)
+    if any(kw in text_lower for kw in ["calibr", "kalib", "competition", "wettkampf", "ipf", "iwf"]):
+        return "calibrated"
+    
+    # Bumper plates
+    if any(kw in text_lower for kw in ["bumper", "urethane", "pu-", "stoßdämpf"]):
+        return "bumper"
+    
+    # Rubber coated
+    if any(kw in text_lower for kw in ["rubber", "gummi", "beschicht"]):
+        return "rubber"
+    
+    # Default: standard cast iron
+    return "standard"
 
 
-def validate_weight_price(name: str, price: float, is_resale: bool = True) -> Tuple[float, str]:
-    """v6.8: Validate and cap weight plate prices based on realistic CHF/kg."""
-    if not is_weight_plate(name):
+def validate_weight_price(text: str, price: float, is_resale: bool = True) -> Tuple[float, str]:
+    """Validate and potentially adjust weight plate pricing."""
+    if not is_weight_plate(text):
         return price, "not_weight_plate"
-    
-    weight_kg = extract_weight_kg(name)
+
+    weight_kg = extract_weight_kg(text)
     if not weight_kg or weight_kg <= 0:
-        return price, "no_weight_detected"
-    
-    weight_type = detect_weight_type(name)
-    config = WEIGHT_PRICING.get(weight_type, WEIGHT_PRICING["standard"])
-    
+        return price, "no_weight_found"
+
+    weight_type = get_weight_type(text)
+    pricing = WEIGHT_PRICING.get(weight_type, WEIGHT_PRICING["standard"])
+
     if is_resale:
-        max_per_kg = config["max_resale_per_kg"]
-        typical_per_kg = config["typical_resale_per_kg"]
+        max_price = weight_kg * pricing["max_resale_per_kg"]
+        typical_price = weight_kg * pricing["typical_resale_per_kg"]
     else:
-        max_per_kg = config["new_price_per_kg"]
-        typical_per_kg = config["new_price_per_kg"] * 0.85
-    
-    max_realistic = weight_kg * max_per_kg
-    typical_price = weight_kg * typical_per_kg
-    
-    if price > max_realistic:
-        print(f"      ⚠️ WEIGHT VALIDATION: {name}")
-        print(f"         Price {price:.0f} CHF > max {max_realistic:.0f} CHF ({weight_kg}kg × {max_per_kg} CHF/kg)")
-        print(f"         → Capping to typical: {typical_price:.0f} CHF")
-        return typical_price, f"capped_{weight_type}_{weight_kg}kg"
-    
+        max_price = weight_kg * pricing["new_price_per_kg"]
+        typical_price = max_price * 0.8
+
+    if price > max_price:
+        return typical_price, f"capped_to_{weight_type}_{weight_kg}kg"
+
     return price, f"valid_{weight_type}_{weight_kg}kg"
-
-
-def calculate_weight_based_price(weight_kg: float, weight_type: str = "standard", is_resale: bool = True) -> float:
-    """v6.8: Calculate realistic price for weight plates."""
-    config = WEIGHT_PRICING.get(weight_type, WEIGHT_PRICING["standard"])
-    if is_resale:
-        return weight_kg * config["typical_resale_per_kg"]
-    else:
-        return weight_kg * config["new_price_per_kg"]
-
-
-# ==============================================================================
-# v6.6: FITNESS VISION EXCEPTION (unchanged)
-# ==============================================================================
-
-FITNESS_KEYWORDS = [
-    "hantelscheiben", "hantelscheibe", "gewichte", "gewicht",
-    "hantel", "langhantel", "kurzhantel", "kettlebell", "bumper",
-    "plates", "plate", "hantelset", "gewichtsscheibe", "gewichtsscheiben",
-    "olympia", "50mm", "30mm",
-]
-
-QUANTITY_INDICATORS = [
-    "2x", "2×", "3x", "4x", "5x", "6x", "8x", "10x",
-    "paar", "set", "stück", "stk", " + ", " und ",
-    "2 x", "3 x", "4 x", "komplett",
-]
-
-
-def needs_fitness_vision(title: str, category: str) -> bool:
-    """v6.6: Force vision for fitness equipment when quantity is ambiguous."""
-    title_lower = title.lower()
-    if category.lower() != "fitness":
-        return False
-    has_fitness = any(kw in title_lower for kw in FITNESS_KEYWORDS)
-    if not has_fitness:
-        return False
-    has_quantity = any(q in title_lower for q in QUANTITY_INDICATORS)
-    if not has_quantity:
-        print(f"   🏋️ FITNESS VISION: No quantity in title → forcing vision check")
-        return True
-    return False
-
-
-# ==============================================================================
-# HELPER: Get values from query_analysis
-# ==============================================================================
-
-def _get_resale_rate(query_analysis: Optional[Dict] = None) -> float:
-    if query_analysis:
-        return query_analysis.get("resale_rate", 0.40)
-    return 0.40
-
-
-def _get_min_realistic_price(query_analysis: Optional[Dict] = None) -> float:
-    if query_analysis:
-        return query_analysis.get("min_realistic_price", 10.0)
-    return 10.0
-
-
-def _get_new_price_estimate(query_analysis: Optional[Dict] = None) -> float:
-    if query_analysis:
-        return query_analysis.get("new_price_estimate", 275.0)
-    return 275.0
-
-
-def _get_auction_multiplier(query_analysis: Optional[Dict] = None) -> float:
-    if query_analysis:
-        return query_analysis.get("auction_typical_multiplier", 5.0)
-    return 5.0
-
-
-def _needs_vision_for_bundles(query_analysis: Optional[Dict] = None) -> bool:
-    if query_analysis:
-        return query_analysis.get("needs_vision_for_bundles", False)
-    return False
-
-
-def _get_category(query_analysis: Optional[Dict] = None) -> str:
-    if query_analysis:
-        return query_analysis.get("category", "unknown")
-    return "unknown"
-
-
-# ==============================================================================
-# CONFIGURATION LOADER
-# ==============================================================================
-
-def apply_config(cfg):
-    """Apply configuration from Cfg object."""
-    global RICARDO_FEE_PERCENT, SHIPPING_COST_CHF, MIN_PROFIT_THRESHOLD
-    global BUNDLE_ENABLED, BUNDLE_DISCOUNT_PERCENT, BUNDLE_MIN_COMPONENT_VALUE, BUNDLE_USE_VISION
-    global CACHE_ENABLED, VARIANT_CACHE_DAYS, COMPONENT_CACHE_DAYS, CLUSTER_CACHE_DAYS, WEB_PRICE_CACHE_DAYS
-    global DAILY_COST_LIMIT, DAILY_VISION_LIMIT, DAILY_WEB_SEARCH_LIMIT
-    global VISION_RATE, USE_VISION, DEFAULT_CAR_MODEL
-    global MODEL_FAST, MODEL_WEB, MODEL_OPENAI
-
-    if hasattr(cfg, 'profit'):
-        RICARDO_FEE_PERCENT = cfg.profit.ricardo_fee_percent
-        SHIPPING_COST_CHF = cfg.profit.shipping_cost_chf
-        MIN_PROFIT_THRESHOLD = cfg.profit.min_profit_threshold
-
-    if hasattr(cfg, 'bundle'):
-        BUNDLE_ENABLED = cfg.bundle.enabled
-        BUNDLE_DISCOUNT_PERCENT = cfg.bundle.discount_percent
-        BUNDLE_MIN_COMPONENT_VALUE = cfg.bundle.min_component_value
-        BUNDLE_USE_VISION = cfg.bundle.use_vision_for_unclear
-
-    if hasattr(cfg, 'cache'):
-        CACHE_ENABLED = cfg.cache.enabled
-        VARIANT_CACHE_DAYS = cfg.cache.variant_cache_days
-        COMPONENT_CACHE_DAYS = cfg.cache.component_cache_days
-        CLUSTER_CACHE_DAYS = cfg.cache.cluster_cache_days
-        WEB_PRICE_CACHE_DAYS = cfg.cache.web_price_cache_days
-
-    if hasattr(cfg, 'ai'):
-        ai = cfg.ai
-        USE_VISION = ai.use_ai_vision
-        VISION_RATE = ai.adaptive_vision_rate
-        
-        # v7.0: Claude models
-        if hasattr(ai, 'claude_model_fast'):
-            MODEL_FAST = ai.claude_model_fast
-        if hasattr(ai, 'claude_model_web'):
-            MODEL_WEB = ai.claude_model_web
-        if hasattr(ai, 'openai_model'):
-            MODEL_OPENAI = ai.openai_model
-        
-        # Budget
-        if ai.budget:
-            DAILY_COST_LIMIT = ai.budget.get("daily_cost_usd_max", DAILY_COST_LIMIT)
-            DAILY_VISION_LIMIT = ai.budget.get("daily_vision_calls_max", DAILY_VISION_LIMIT)
-            DAILY_WEB_SEARCH_LIMIT = ai.budget.get("daily_web_search_max", DAILY_WEB_SEARCH_LIMIT)
-
-    if hasattr(cfg, 'general'):
-        DEFAULT_CAR_MODEL = cfg.general.car_model
-
-    print(f"[AI-CONFIG] Provider={_provider.upper()}, Fee={RICARDO_FEE_PERCENT*100:.0f}%, "
-          f"Bundle={BUNDLE_ENABLED}, Cache={CACHE_ENABLED}")
-
-
-def apply_ai_budget_from_cfg(ai_cfg: Any):
-    """Legacy function for backward compatibility."""
-    global DAILY_COST_LIMIT, DAILY_VISION_LIMIT, VISION_RATE, USE_VISION
-
-    try:
-        if isinstance(ai_cfg, dict):
-            USE_VISION = ai_cfg.get("use_ai_vision", True)
-            VISION_RATE = ai_cfg.get("adaptive_vision_rate", 0.10)
-            budget = ai_cfg.get("budget", {}) or {}
-            DAILY_COST_LIMIT = budget.get("daily_cost_usd_max", DAILY_COST_LIMIT)
-            DAILY_VISION_LIMIT = budget.get("daily_vision_calls_max", DAILY_VISION_LIMIT)
-        else:
-            USE_VISION = getattr(ai_cfg, "use_ai_vision", True)
-            VISION_RATE = getattr(ai_cfg, "adaptive_vision_rate", 0.10)
-            budget = getattr(ai_cfg, "budget", None) or {}
-            if isinstance(budget, dict):
-                DAILY_COST_LIMIT = budget.get("daily_cost_usd_max", DAILY_COST_LIMIT)
-                DAILY_VISION_LIMIT = budget.get("daily_vision_calls_max", DAILY_VISION_LIMIT)
-    except Exception as e:
-        print(f"⚠️ AI-Budget load failed: {e}")
-
-    print(f"[AI-BUDGET] VISION={USE_VISION}, RATE={VISION_RATE}, DAILY_LIMIT=${DAILY_COST_LIMIT}")
-
-
-# ==============================================================================
-# COST TRACKING
-# ==============================================================================
-
-def reset_run_cost():
-    global RUN_COST_USD, WEB_SEARCH_COUNT_TODAY
-    RUN_COST_USD = 0.0
-    WEB_SEARCH_COUNT_TODAY = 0
-
-
-def _load_day_cost() -> float:
-    if not os.path.exists(DAY_COST_FILE):
-        return 0.0
-    try:
-        with open(DAY_COST_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            if not content:
-                return 0.0
-            date_str, cost_str = content.split("|")
-            if date_str == datetime.date.today().isoformat():
-                return float(cost_str)
-    except Exception:
-        pass
-    return 0.0
-
-
-def _save_day_cost(value: float):
-    with open(DAY_COST_FILE, "w", encoding="utf-8") as f:
-        f.write(f"{datetime.date.today().isoformat()}|{value:.4f}")
-
-
-def add_cost(cost: float):
-    global RUN_COST_USD
-    RUN_COST_USD += cost
-    day_cost = _load_day_cost() + cost
-    _save_day_cost(day_cost)
-
-
-def get_run_cost_summary():
-    return RUN_COST_USD, datetime.date.today().isoformat()
-
-
-def get_day_cost_summary():
-    return _load_day_cost()
-
-
-def is_budget_exceeded() -> bool:
-    return _load_day_cost() >= DAILY_COST_LIMIT
 
 
 # ==============================================================================
@@ -757,366 +672,468 @@ def is_budget_exceeded() -> bool:
 _variant_cache: Dict[str, Dict] = {}
 _component_cache: Dict[str, Dict] = {}
 _cluster_cache: Dict[str, Dict] = {}
-_cache_loaded = False
-
-
-def clear_all_caches():
-    global _variant_cache, _component_cache, _cluster_cache, _web_price_cache, _cache_loaded
-    _variant_cache = {}
-    _component_cache = {}
-    _cluster_cache = {}
-    _web_price_cache = {}
-    _cache_loaded = False
-    for f in [VARIANT_CACHE_FILE, COMPONENT_CACHE_FILE, CLUSTER_CACHE_FILE, WEB_PRICE_CACHE_FILE]:
-        if os.path.exists(f):
-            try:
-                os.remove(f)
-                print(f"🗑️ Deleted cache: {f}")
-            except Exception as e:
-                print(f"⚠️ Could not delete {f}: {e}")
-    print("🧹 All caches cleared")
-
 
 def _load_caches():
-    global _variant_cache, _component_cache, _cluster_cache, _cache_loaded
-    if _cache_loaded:
-        return
-    if not CACHE_ENABLED:
-        _cache_loaded = True
-        return
-    now = datetime.datetime.now().isoformat()
-
+    """Load all caches from disk."""
+    global _variant_cache, _component_cache, _cluster_cache, _web_price_cache
+    
     try:
         if os.path.exists(VARIANT_CACHE_FILE):
             with open(VARIANT_CACHE_FILE, "r", encoding="utf-8") as f:
                 _variant_cache = json.load(f)
-            expired = [k for k, v in _variant_cache.items() if v.get("expires_at", "") < now]
-            for k in expired:
-                del _variant_cache[k]
-    except Exception as e:
-        print(f"⚠️ Variant cache load failed: {e}")
+    except:
         _variant_cache = {}
-
+    
     try:
         if os.path.exists(COMPONENT_CACHE_FILE):
             with open(COMPONENT_CACHE_FILE, "r", encoding="utf-8") as f:
                 _component_cache = json.load(f)
-            expired = [k for k, v in _component_cache.items() if v.get("expires_at", "") < now]
-            for k in expired:
-                del _component_cache[k]
-    except Exception as e:
-        print(f"⚠️ Component cache load failed: {e}")
+    except:
         _component_cache = {}
-
+    
     try:
         if os.path.exists(CLUSTER_CACHE_FILE):
             with open(CLUSTER_CACHE_FILE, "r", encoding="utf-8") as f:
                 _cluster_cache = json.load(f)
-            expired = [k for k, v in _cluster_cache.items() if v.get("expires_at", "") < now]
-            for k in expired:
-                del _cluster_cache[k]
-    except Exception as e:
-        print(f"⚠️ Cluster cache load failed: {e}")
+    except:
         _cluster_cache = {}
-
-    _cache_loaded = True
-    total = len(_variant_cache) + len(_component_cache) + len(_cluster_cache)
-    if total > 0:
-        print(f"💾 Loaded caches: {len(_variant_cache)} variants, {len(_component_cache)} components, {len(_cluster_cache)} clusters")
-
-
-def _save_variant_cache():
-    if not CACHE_ENABLED:
-        return
-    try:
-        with open(VARIANT_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_variant_cache, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-def _save_component_cache():
-    if not CACHE_ENABLED:
-        return
-    try:
-        with open(COMPONENT_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_component_cache, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-def _save_cluster_cache():
-    if not CACHE_ENABLED:
-        return
-    try:
-        with open(CLUSTER_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_cluster_cache, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-# ==============================================================================
-# WEB PRICE CACHE
-# ==============================================================================
-
-def _load_web_price_cache():
-    """v7.0: Loads web price cache from disk."""
-    global _web_price_cache
     
     try:
         if os.path.exists(WEB_PRICE_CACHE_FILE):
             with open(WEB_PRICE_CACHE_FILE, "r", encoding="utf-8") as f:
                 _web_price_cache = json.load(f)
-            
-            now = datetime.datetime.now().isoformat()
-            expired = [k for k, v in _web_price_cache.items() 
-                      if v.get("expires_at", "") < now]
-            for k in expired:
-                del _web_price_cache[k]
-            
-            if expired:
-                _save_web_price_cache()
-                
-    except Exception as e:
-        print(f"⚠️ Web price cache load failed: {e}")
+    except:
         _web_price_cache = {}
 
-
-def _save_web_price_cache():
-    """v7.0: Saves web price cache to disk."""
+def _save_cluster_cache():
+    """Save cluster cache to disk."""
     if not CACHE_ENABLED:
         return
     try:
-        with open(WEB_PRICE_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_web_price_cache, f, ensure_ascii=False, indent=2)
+        with open(CLUSTER_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_cluster_cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"⚠️ Web price cache save failed: {e}")
-
+        print(f"⚠️ Cluster cache save failed: {e}")
 
 def get_cached_web_price(variant_key: str) -> Optional[Dict[str, Any]]:
-    """v7.0: Gets cached web price for a variant."""
-    if not variant_key or not CACHE_ENABLED:
-        return None
+    """Get cached web price for a variant."""
+    global _web_price_cache
     
-    _load_web_price_cache()
-    entry = _web_price_cache.get(variant_key)
+    if variant_key in _web_price_cache:
+        cached = _web_price_cache[variant_key]
+        cached_at = cached.get("cached_at", "")
+        
+        if cached_at:
+            try:
+                cached_date = datetime.datetime.fromisoformat(cached_at)
+                age_days = (datetime.datetime.now() - cached_date).days
+                
+                if age_days < WEB_PRICE_CACHE_DAYS:
+                    return {
+                        "new_price": cached.get("new_price"),
+                        "price_source": cached.get("price_source"),
+                        "shop_name": cached.get("shop_name"),
+                        "confidence": cached.get("confidence", 0.8),
+                    }
+            except:
+                pass
     
-    if not entry:
-        return None
-    
-    if entry.get("expires_at", "") < datetime.datetime.now().isoformat():
-        del _web_price_cache[variant_key]
-        return None
-    
-    return {
-        "new_price": entry.get("new_price"),
-        "price_source": entry.get("price_source", "web_unknown"),
-        "shop_name": entry.get("shop_name"),
-        "confidence": entry.get("confidence", 0.7),
-    }
+    return None
 
-
-def set_cached_web_price(variant_key: str, new_price: float, price_source: str, shop_name: str = None):
-    """v7.0: Caches a web-searched price."""
-    if not variant_key or not CACHE_ENABLED:
-        return
-    
-    _load_web_price_cache()
-    now = datetime.datetime.now()
-    expires = now + datetime.timedelta(days=WEB_PRICE_CACHE_DAYS)
+def set_cached_web_price(variant_key: str, new_price: float, price_source: str, shop_name: str):
+    """Cache a web price for a variant."""
+    global _web_price_cache
     
     _web_price_cache[variant_key] = {
         "new_price": new_price,
         "price_source": price_source,
         "shop_name": shop_name,
-        "cached_at": now.isoformat(),
-        "expires_at": expires.isoformat(),
+        "confidence": 0.8,
+        "cached_at": datetime.datetime.now().isoformat(),
     }
     
-    _save_web_price_cache()
-    print(f"💾 Cached web price: {variant_key} = {new_price} CHF ({price_source}, {WEB_PRICE_CACHE_DAYS}d)")
-
-
-# ==============================================================================
-# VARIANT CACHE FUNCTIONS
-# ==============================================================================
+    if CACHE_ENABLED:
+        try:
+            with open(WEB_PRICE_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(_web_price_cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ Web price cache save failed: {e}")
 
 def get_cached_variant_info(variant_key: str) -> Optional[Dict[str, Any]]:
-    if not variant_key or not CACHE_ENABLED:
-        return None
-    _load_caches()
-    entry = _variant_cache.get(variant_key)
-    if not entry:
-        return None
-    if entry.get("expires_at", "") < datetime.datetime.now().isoformat():
-        del _variant_cache[variant_key]
-        return None
-    return {
-        "new_price": entry.get("new_price"),
-        "transport_car": entry.get("transport_car", True),
-        "resale_price": entry.get("resale_price"),
-        "market_based": entry.get("market_based", False),
-        "market_sample_size": entry.get("market_sample_size", 0),
-    }
+    """Get cached variant info."""
+    global _variant_cache
+    
+    if variant_key in _variant_cache:
+        cached = _variant_cache[variant_key]
+        cached_at = cached.get("cached_at", "")
+        
+        if cached_at:
+            try:
+                cached_date = datetime.datetime.fromisoformat(cached_at)
+                age_days = (datetime.datetime.now() - cached_date).days
+                
+                if age_days < VARIANT_CACHE_DAYS:
+                    return cached
+            except:
+                pass
+    
+    return None
 
-
-def set_cached_variant_info(variant_key: str, new_price: float, transport_car: bool, resale_price: float, market_based: bool = False, market_sample_size: int = 0):
-    if not variant_key or not CACHE_ENABLED:
-        return
-    _load_caches()
-    now = datetime.datetime.now()
-    cache_days = 7 if market_based else VARIANT_CACHE_DAYS
-    expires = now + datetime.timedelta(days=cache_days)
+def set_cached_variant_info(variant_key: str, new_price: float, transport_car: bool, resale_price: float, is_bundle: bool, bundle_component_count: int):
+    """Cache variant info."""
+    global _variant_cache
+    
     _variant_cache[variant_key] = {
-        "new_price": new_price, "transport_car": transport_car, "resale_price": resale_price,
-        "market_based": market_based, "market_sample_size": market_sample_size,
-        "cached_at": now.isoformat(), "expires_at": expires.isoformat()
+        "new_price": new_price,
+        "transport_car": transport_car,
+        "resale_price": resale_price,
+        "is_bundle": is_bundle,
+        "bundle_component_count": bundle_component_count,
+        "cached_at": datetime.datetime.now().isoformat(),
     }
-    _save_variant_cache()
+    
+    if CACHE_ENABLED:
+        try:
+            with open(VARIANT_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(_variant_cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ Variant cache save failed: {e}")
 
+def _get_new_price_estimate(query_analysis: Optional[Dict]) -> float:
+    """Extract new price estimate from query analysis."""
+    if not query_analysis:
+        return 100.0
+    
+    new_price = query_analysis.get("new_price_estimate")
+    if new_price and new_price > 0:
+        return float(new_price)
+    
+    return 100.0
 
-# ==============================================================================
-# COMPONENT CACHE FUNCTIONS
-# ==============================================================================
+def _get_min_realistic_price(query_analysis: Optional[Dict]) -> float:
+    """Extract minimum realistic price from query analysis."""
+    if not query_analysis:
+        return 10.0
+    
+    min_price = query_analysis.get("min_realistic_price")
+    if min_price and min_price > 0:
+        return float(min_price)
+    
+    return 10.0
 
-def get_cached_component_price(component_name: str) -> Optional[Dict[str, Any]]:
-    if not component_name or not CACHE_ENABLED:
-        return None
-    _load_caches()
-    key = component_name.lower().strip()
-    entry = _component_cache.get(key)
-    if not entry:
-        return None
-    if entry.get("expires_at", "") < datetime.datetime.now().isoformat():
-        del _component_cache[key]
-        return None
+def _get_category(query_analysis: Optional[Dict]) -> str:
+    """Extract category from query analysis."""
+    if not query_analysis:
+        return "unknown"
+    
+    category = query_analysis.get("category")
+    if category:
+        return str(category)
+    
+    return "unknown"
+
+def _get_resale_rate(query_analysis: Optional[Dict]) -> float:
+    """Extract resale rate from query analysis."""
+    if not query_analysis:
+        return 0.50
+    
+    resale_rate = query_analysis.get("resale_rate")
+    if resale_rate and resale_rate > 0:
+        return float(resale_rate)
+    
+    return 0.50
+
+def _get_auction_multiplier(query_analysis: Optional[Dict]) -> float:
+    """Get typical auction price multiplier for category."""
+    if not query_analysis:
+        return 2.0
+    
+    category = query_analysis.get("category", "unknown")
+    
+    # Category-specific multipliers
+    multipliers = {
+        "electronics": 1.5,
+        "clothing": 2.5,
+        "fitness": 1.8,
+        "toys": 2.0,
+        "collectibles": 3.0,
+        "tools": 1.5,
+        "furniture": 1.3,
+    }
+    
+    return multipliers.get(category, 2.0)
+
+def predict_final_auction_price(
+    current_price: float,
+    bids_count: int,
+    hours_remaining: float,
+    median_price: Optional[float] = None,
+    new_price: Optional[float] = None,
+    typical_multiplier: float = 2.0,
+) -> Dict[str, Any]:
+    """Predict final auction price based on current state."""
+    if not current_price or current_price <= 0:
+        return {"predicted_final_price": 0, "confidence": 0, "method": "no_price"}
+    
+    # If auction is ending soon with many bids, price is likely final
+    if hours_remaining < 2 and bids_count >= 5:
+        return {
+            "predicted_final_price": current_price * 1.05,
+            "confidence": 0.85,
+            "method": "ending_soon_high_activity"
+        }
+    
+    if hours_remaining < 6 and bids_count >= 3:
+        return {
+            "predicted_final_price": current_price * 1.10,
+            "confidence": 0.75,
+            "method": "ending_soon"
+        }
+    
+    # Use median price if available
+    if median_price and median_price > current_price:
+        predicted = min(median_price, current_price * typical_multiplier)
+        return {
+            "predicted_final_price": predicted,
+            "confidence": 0.60,
+            "method": "median_based"
+        }
+    
+    # Fallback: estimate based on bid activity
+    if bids_count >= 10:
+        multiplier = 1.3
+    elif bids_count >= 5:
+        multiplier = 1.5
+    elif bids_count >= 2:
+        multiplier = 1.8
+    else:
+        multiplier = typical_multiplier
+    
+    predicted = current_price * multiplier
+    
+    # Cap at new price if known
+    if new_price and predicted > new_price * 0.90:
+        predicted = new_price * 0.90
+    
+    # v9.0 FIX: predicted_final can NEVER be less than current_price!
+    # This is logically impossible - auctions only go UP
+    if predicted < current_price:
+        predicted = current_price * 1.1  # At least 10% above current
+    
     return {
-        "median_price": entry.get("median_price"),
-        "sample_size": entry.get("sample_size", 0),
-        "search_query": entry.get("search_query"),
-        "price_source": entry.get("price_source", "unknown"),
-        "has_auction_data": entry.get("has_auction_data", False),
+        "predicted_final_price": round(predicted, 2),
+        "confidence": 0.50,
+        "method": "bid_activity_estimate"
     }
 
-
-def set_cached_component_price(component_name: str, median_price: float, sample_size: int, search_query: str, price_source: str = "unknown", has_auction_data: bool = False):
-    if not component_name or not CACHE_ENABLED:
-        return
-    _load_caches()
-    key = component_name.lower().strip()
-    now = datetime.datetime.now()
-    expires = now + datetime.timedelta(days=COMPONENT_CACHE_DAYS)
-    _component_cache[key] = {
-        "median_price": median_price, "sample_size": sample_size, "search_query": search_query,
-        "price_source": price_source, "has_auction_data": has_auction_data,
-        "cached_at": now.isoformat(), "expires_at": expires.isoformat(),
-    }
-    _save_component_cache()
-    print(f"💾 Cached component: {component_name} = {median_price} CHF (n={sample_size}, {price_source})")
-
-
 # ==============================================================================
-# GLOBAL SANITY CHECK
+# CATEGORY THRESHOLD CACHE (v7.2.2)
 # ==============================================================================
 
-def apply_global_sanity_check(resale_price: float, new_price: Optional[float], is_bundle: bool = False, context: str = "") -> float:
-    if not resale_price or resale_price <= 0:
-        return resale_price
-    if not new_price or new_price <= 0:
-        return resale_price
-    max_ratio = MAX_BUNDLE_RESALE_PERCENT_OF_NEW if is_bundle else MAX_RESALE_PERCENT_OF_NEW
-    max_allowed = new_price * max_ratio
-    if resale_price > max_allowed:
-        print(f"   🚨 SANITY CHECK: {context} resale {resale_price:.0f} > {max_ratio*100:.0f}% of new ({new_price:.0f})")
-        print(f"      → Capping to {max_allowed:.0f} CHF")
-        return round(max_allowed, 2)
-    return resale_price
+_category_threshold_cache: Dict[str, Dict] = {}
 
-
-# ==============================================================================
-# HELPER FUNCTION
-# ==============================================================================
-
-def to_float(val: Any) -> Optional[float]:
-    """Safely convert value to float."""
-    if val is None:
-        return None
+def _load_category_threshold_cache():
+    """v7.2.2: Loads category threshold cache from disk."""
+    global _category_threshold_cache
+    
     try:
-        return float(val)
-    except (ValueError, TypeError):
-        return None
-# ==============================================================================
-# TITLE EXTRACTION (v7.0 - uses unified call_ai)
-# ==============================================================================
+        if os.path.exists(CATEGORY_THRESHOLD_CACHE_FILE):
+            with open(CATEGORY_THRESHOLD_CACHE_FILE, "r", encoding="utf-8") as f:
+                _category_threshold_cache = json.load(f)
+            
+            now = datetime.datetime.now().isoformat()
+            expired = [k for k, v in _category_threshold_cache.items() 
+                      if v.get("expires_at", "") < now]
+            for k in expired:
+                del _category_threshold_cache[k]
+            
+            if expired:
+                _save_category_threshold_cache()
+                
+    except Exception as e:
+        print(f"⚠️ Category threshold cache load failed: {e}")
+        _category_threshold_cache = {}
 
-def extract_clean_search_terms(title: str, category: str = "unknown") -> Dict[str, Any]:
-    """v7.0: Extracts clean, searchable product names from listing titles."""
-    if is_budget_exceeded():
-        clean = re.sub(r'[!*🔥⭐✨💥]+', '', title)
-        clean = re.sub(r'\b(top zustand|neuwertig|wie neu|zu verkaufen|günstig|ovp|np \d+|uvp)\b', '', clean, flags=re.I)
-        clean = re.sub(r'\s+', ' ', clean).strip()
-        return {"search_terms": [clean], "main_product": clean, "brand": None, "corrections": [], "reasoning": "Budget fallback"}
 
-    prompt = f"""Extrahiere suchbare Produktnamen aus diesem Ricardo-Titel.
+def _save_category_threshold_cache():
+    """v7.2.2: Saves category threshold cache to disk."""
+    if not CACHE_ENABLED:
+        return
+    try:
+        with open(CATEGORY_THRESHOLD_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_category_threshold_cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ Category threshold cache save failed: {e}")
 
-TITEL: "{title}"
-KATEGORIE: "{category}"
 
-REGELN:
-- Entferne: Emojis, "wie neu", "top zustand", "NP xxx", Preisangaben
-- Behalte: Marke, Modell, wichtige Spezifikationen (Grösse, Speicher, etc.)
-- Löse Abkürzungen auf: TH=Tommy Hilfiger, AW=Apple Watch, etc.
-- Bei mehreren Produkten: Liste alle separat
+def get_category_threshold(category: str) -> Dict[str, float]:
+    """v7.2.2: Get or calculate category-specific validation thresholds.
+    
+    Returns:
+        {
+            "min_single_bid_ratio": 0.40,  # Minimum % of new price for single bid
+            "min_buy_now_ratio": 0.30,     # Minimum % of buy-now for single bid
+            "depreciation_rate": 0.50,     # How fast value drops (electronics=0.50, fitness=0.30)
+        }
+    """
+    global _category_threshold_cache
+    
+    _load_category_threshold_cache()
+    
+    # Check cache
+    if category in _category_threshold_cache:
+        cached = _category_threshold_cache[category]
+        if cached.get("expires_at", "") > datetime.datetime.now().isoformat():
+            return {
+                "min_single_bid_ratio": cached.get("min_single_bid_ratio", 0.40),
+                "min_buy_now_ratio": cached.get("min_buy_now_ratio", 0.30),
+                "depreciation_rate": cached.get("depreciation_rate", 0.50),
+            }
+    
+    # Ask AI to calculate thresholds
+    print(f"   🤖 Calculating category thresholds for: {category}")
+    
+    prompt = f"""Analysiere die Kategorie "{category}" für ricardo.ch Wiederverkauf.
+
+Bestimme:
+1. Wie schnell verliert diese Kategorie an Wert? (depreciation_rate: 0.0-1.0)
+   - 0.70-0.80 = sehr schnell (z.B. Smartphones, Mode)
+   - 0.40-0.60 = mittel (z.B. Laptops, Uhren)
+   - 0.20-0.30 = langsam (z.B. Fitness-Gewichte, Werkzeug)
+
+2. Minimum akzeptabler Gebotspreis bei 1 Gebot (min_single_bid_ratio: 0.0-1.0)
+   - Prozent vom Neupreis
+   - Schneller Wertverlust = höherer Threshold (0.50)
+   - Langsamer Wertverlust = niedrigerer Threshold (0.30)
+
+3. Minimum akzeptabler Gebotspreis vs Buy-Now (min_buy_now_ratio: 0.0-1.0)
+   - Prozent vom Buy-Now Preis
+   - Meist 0.30 (30%)
+
+BEISPIELE:
+- electronics: depreciation=0.50, min_single_bid=0.40, min_buy_now=0.30
+- fitness: depreciation=0.30, min_single_bid=0.30, min_buy_now=0.30
+- clothing: depreciation=0.70, min_single_bid=0.50, min_buy_now=0.40
+- tools: depreciation=0.25, min_single_bid=0.30, min_buy_now=0.30
 
 Antworte NUR als JSON:
 {{
-  "search_terms": ["Suchbegriff1", "Suchbegriff2"],
-  "main_product": "Hauptprodukt für Preissuche",
-  "brand": "Erkannte Marke oder null",
-  "corrections": ["Korrekturen die gemacht wurden"],
+  "depreciation_rate": 0.50,
+  "min_single_bid_ratio": 0.40,
+  "min_buy_now_ratio": 0.30,
   "reasoning": "Kurze Erklärung"
 }}"""
-
+    
     try:
-        raw = call_ai(prompt, max_tokens=500)
+        raw = call_ai(prompt, max_tokens=300)
         if raw:
             json_match = re.search(r'\{[\s\S]*\}', raw)
             if json_match:
                 parsed = json.loads(json_match.group(0))
                 add_cost(COST_CLAUDE_HAIKU)
-                parsed.setdefault("search_terms", [title])
-                parsed.setdefault("main_product", title)
-                parsed.setdefault("brand", None)
-                parsed.setdefault("corrections", [])
-                parsed.setdefault("reasoning", "")
-                if parsed.get("corrections"):
-                    print(f"   📝 Title normalized: {parsed['corrections']}")
-                return parsed
+                
+                depreciation_rate = float(parsed.get("depreciation_rate", 0.50))
+                min_single_bid_ratio = float(parsed.get("min_single_bid_ratio", 0.40))
+                min_buy_now_ratio = float(parsed.get("min_buy_now_ratio", 0.30))
+                reasoning = parsed.get("reasoning", "")
+                
+                # Cache for 90 days
+                now = datetime.datetime.now()
+                expires = now + datetime.timedelta(days=90)
+                
+                _category_threshold_cache[category] = {
+                    "depreciation_rate": depreciation_rate,
+                    "min_single_bid_ratio": min_single_bid_ratio,
+                    "min_buy_now_ratio": min_buy_now_ratio,
+                    "reasoning": reasoning,
+                    "cached_at": now.isoformat(),
+                    "expires_at": expires.isoformat(),
+                }
+                
+                _save_category_threshold_cache()
+                
+                print(f"   ✅ Category thresholds: depreciation={depreciation_rate:.0%}, single_bid={min_single_bid_ratio:.0%}, buy_now={min_buy_now_ratio:.0%}")
+                print(f"      Reasoning: {reasoning}")
+                
+                return {
+                    "min_single_bid_ratio": min_single_bid_ratio,
+                    "min_buy_now_ratio": min_buy_now_ratio,
+                    "depreciation_rate": depreciation_rate,
+                }
     except Exception as e:
-        print(f"⚠️ Title extraction failed: {e}")
+        print(f"⚠️ Category threshold calculation failed: {e}")
     
-    return {"search_terms": [title], "main_product": title, "brand": None, "corrections": [], "reasoning": "Fallback"}
+    # Fallback to defaults
+    return {
+        "min_single_bid_ratio": 0.40,
+        "min_buy_now_ratio": 0.30,
+        "depreciation_rate": 0.50,
+    }
 
 
-# ==============================================================================
-# REALISTIC PRICE FILTERING (unchanged from v6.8)
-# ==============================================================================
+def calculate_confidence_weight(bids: int, hours: float) -> float:
+    """Calculate confidence weight based on bid count and time remaining."""
+    bid_weight = min(bids / 10.0, 1.0)
+    time_weight = 1.0 if hours < 6 else (0.7 if hours < 24 else 0.5)
+    return bid_weight * time_weight
+
+
+def weighted_median(price_samples: List[Dict[str, Any]]) -> float:
+    """Calculate weighted median from price samples."""
+    if not price_samples:
+        return 0.0
+    
+    if len(price_samples) == 1:
+        return price_samples[0]["price"]
+    
+    # Sort by price
+    sorted_samples = sorted(price_samples, key=lambda x: x["price"])
+    
+    # Calculate total weight
+    total_weight = sum(s["weight"] for s in sorted_samples)
+    
+    if total_weight == 0:
+        # Fallback to simple median
+        return sorted_samples[len(sorted_samples) // 2]["price"]
+    
+    # Find weighted median
+    cumulative_weight = 0.0
+    target_weight = total_weight / 2.0
+    
+    for sample in sorted_samples:
+        cumulative_weight += sample["weight"]
+        if cumulative_weight >= target_weight:
+            return sample["price"]
+    
+    # Fallback
+    return sorted_samples[-1]["price"]
+
 
 def is_realistic_auction_price(current_price: float, bids_count: int, hours_remaining: float, reference_price: float, for_market_calculation: bool = True) -> Tuple[bool, str]:
-    """v6.5: TRUST BIDDERS! 20+ bids = FULLY trusted."""
+    """v7.2.1: Improved validation - reject early auctions with unrealistic prices."""
     if not current_price or current_price <= 0:
         return False, "no_price"
     if not reference_price or reference_price <= 0:
         reference_price = 100.0
     price_ratio = current_price / reference_price if reference_price > 0 else 0
 
+    # v7.2.1: Early auction check - even with many bids, price must be realistic
+    # Example: iPhone (1500 CHF) at 22 CHF after 1 day with 20 bids → REJECT
+    if price_ratio < 0.20:
+        return False, f"unrealistic_price_{price_ratio*100:.0f}pct"
+    
     if bids_count >= VERY_HIGH_ACTIVITY_BID_THRESHOLD:
-        return True, "very_high_activity_trusted"
+        # v7.2.1: Even with 20+ bids, require minimum 15% of reference price
+        if price_ratio >= 0.15:
+            return True, "very_high_activity_trusted"
+        else:
+            return False, f"very_high_activity_too_low_{price_ratio*100:.0f}pct"
+    
     if bids_count >= HIGH_ACTIVITY_BID_THRESHOLD:
         if price_ratio >= HIGH_ACTIVITY_MIN_PRICE_RATIO:
             return True, "high_activity_validated"
         else:
-            return True, f"high_activity_low_price_{price_ratio*100:.0f}pct"
+            return False, f"high_activity_low_price_{price_ratio*100:.0f}pct"
 
     if for_market_calculation:
         if hours_remaining > 12:
@@ -1144,446 +1161,18 @@ def is_realistic_auction_price(current_price: float, bids_count: int, hours_rema
     return False, f"below_{minimum_threshold:.0f}_insufficient_validation"
 
 
-def calculate_confidence_weight(bids: int, hours: float) -> float:
-    weight = 0.5
-    if bids >= 30: weight += 0.5
-    elif bids >= 20: weight += 0.45
-    elif bids >= 15: weight += 0.4
-    elif bids >= 10: weight += 0.3
-    elif bids >= 5: weight += 0.2
-    elif bids >= 2: weight += 0.1
-    if hours < 1: weight += 0.3
-    elif hours < 6: weight += 0.2
-    elif hours < 24: weight += 0.1
-    return min(weight, 1.0)
-
-
-def weighted_median(samples: List[Dict]) -> float:
-    if not samples:
-        return 0.0
-    sorted_samples = sorted(samples, key=lambda x: x.get("price", 0))
-    total_weight = sum(s.get("weight", 1.0) for s in sorted_samples)
-    if total_weight <= 0:
-        prices = [s.get("price", 0) for s in sorted_samples]
-        return statistics.median(prices) if prices else 0.0
-    cumulative = 0
-    for s in sorted_samples:
-        cumulative += s.get("weight", 1.0)
-        if cumulative >= total_weight / 2:
-            return s.get("price", 0)
-    return sorted_samples[-1].get("price", 0)
-
-
-# ==============================================================================
-# AUCTION PRICE PREDICTION
-# ==============================================================================
-
-def predict_final_auction_price(current_price: float, bids_count: int, hours_remaining: float, median_price: Optional[float] = None, new_price: Optional[float] = None, typical_multiplier: float = 5.0) -> Dict[str, Any]:
-    if not current_price or current_price <= 0:
-        return {"predicted_final_price": current_price or 0, "confidence": 1.0, "method": "no_auction"}
-
-    predicted = current_price
-    confidence = 0.5
-    method = "unknown"
-    anchor = median_price if median_price and median_price > 0 else (new_price * 0.45 if new_price else None)
-
-    if bids_count >= VERY_HIGH_ACTIVITY_BID_THRESHOLD:
-        predicted = current_price * 1.15
-        confidence = 0.85
-        method = "very_high_activity"
-    elif bids_count >= HIGH_ACTIVITY_BID_THRESHOLD:
-        if anchor:
-            predicted = max(current_price * 1.3, anchor * 0.85)
-            confidence = 0.75
-            method = "high_activity_anchor"
-        else:
-            predicted = current_price * 1.4
-            confidence = 0.6
-            method = "high_activity_growth"
-    elif bids_count < 5 and hours_remaining > 24:
-        if anchor:
-            predicted = anchor * 0.75
-            confidence = 0.4
-            method = "early_stage_anchor"
-        else:
-            predicted = current_price * typical_multiplier
-            confidence = 0.35
-            method = "early_stage_multiplier"
-    elif bids_count >= 20 or hours_remaining < 2:
-        if anchor:
-            predicted = anchor * 0.90
-            confidence = 0.8
-            method = "hot_auction_anchor"
-        else:
-            predicted = current_price * (typical_multiplier * 0.7)
-            confidence = 0.6
-            method = "hot_auction_multiplier"
-    else:
-        if anchor:
-            weight = min(bids_count / 20, 0.8)
-            multiplier_estimate = current_price * typical_multiplier * 0.8
-            anchor_estimate = anchor * 0.80
-            predicted = (multiplier_estimate * (1 - weight)) + (anchor_estimate * weight)
-            confidence = 0.6 + (weight * 0.2)
-            method = "mid_stage_blend"
-        else:
-            predicted = current_price * (typical_multiplier * 0.8)
-            confidence = 0.5
-            method = "mid_stage_multiplier"
-
-    if hours_remaining < 6 and hours_remaining > 0:
-        urgency_boost = 1.10 + (0.05 * (6 - hours_remaining) / 6)
-        predicted *= urgency_boost
-        method += "_with_urgency"
-
-    if median_price and median_price > 0 and predicted > median_price:
-        predicted = median_price
-        method += "_capped_market"
-
-    if new_price and new_price > 0:
-        max_realistic = new_price * 0.55
-        if predicted > max_realistic:
-            predicted = max_realistic
-            method += "_capped_new"
-
-    if predicted < current_price:
-        predicted = current_price
-        method += "_floor"
-
-    return {"predicted_final_price": round(predicted, 2), "confidence": round(confidence, 2), "method": method}
-
-
-# ==============================================================================
-# BUNDLE DETECTION (v7.0 - uses unified call_ai)
-# ==============================================================================
-
-BUNDLE_KEYWORDS = [
-    "set", "bundle", "paket", "komplett", "komplettes", "mit", "+",
-    "inklusive", "inkl.", "samt", "plus", "und", "konvolut",
-    "sammlung", "lot", "alles", "zubehör dabei", "viel zubehör",
-    "kg", "total", "zusammen", "paar", "2x", "4x", "6x", "8x",
-]
-
-
-def looks_like_bundle(title: str, description: str = "") -> bool:
-    text = f"{title} {description}".lower()
-    for kw in BUNDLE_KEYWORDS:
-        if kw in text:
-            return True
-    if re.search(r'\d+\s*x\s', text) or re.search(r'\d+\s*(stück|stk)', text):
-        return True
-    if re.search(r'\d+\s*kg', text):
-        return True
-    return False
-
-
-def detect_bundle_with_ai(title: str, description: str, query: str, image_url: Optional[str] = None, use_vision: bool = False, query_analysis: Optional[Dict] = None) -> Dict[str, Any]:
-    """v7.2.1: Bundle detection using Claude with weight-based validation."""
-    if is_budget_exceeded():
-        return {"is_bundle": False, "contains_main_product": True, "components": [], "reasoning": "Budget exceeded"}
-
-    min_price = _get_min_realistic_price(query_analysis)
-    category = _get_category(query_analysis)
-    force_vision = _needs_vision_for_bundles(query_analysis)
-    force_fitness_vision = needs_fitness_vision(title, category)
-    actually_use_vision = use_vision or force_fitness_vision or (force_vision and image_url and BUNDLE_USE_VISION)
-
-    prompt = f"""Du analysierst ein Ricardo-Inserat für: "{query}"
-
-Titel: {title}
-Beschreibung: {description or '(keine)'}
-
-AUFGABE: Ist das ein BUNDLE mit MEHREREN verkaufbaren Produkten (je > {min_price} CHF)?
-
-REGELN:
-- Bundle = MEHRERE separat verkaufbare Produkte
-- KEIN Bundle: Hauptprodukt + Kabel/Hülle/Originalzubehör
-- Bei Gewichten: Gusseisen = 1.5-2.0 CHF/kg, Bumper = 2.5-3.5 CHF/kg
-- WICHTIG: Gib GEWICHT in kg im Namen an! (z.B. "Hantelscheibe 25kg", nicht "Hantelscheibe")
-
-Antworte NUR als JSON:
-{{
-  "is_bundle": true/false,
-  "contains_main_product": true/false,
-  "components": [{{"name": "Produkt MIT GEWICHT", "qty": 1, "estimated_value": XX}}],
-  "reasoning": "Kurz"
-}}"""
-
-    try:
-        if actually_use_vision and image_url:
-            raw = call_ai(prompt, max_tokens=500, image_url=image_url)
-            add_cost(COST_VISION)
-            print(f"   👁️ Using vision for bundle detection")
-        else:
-            raw = call_ai(prompt, max_tokens=500)
-            add_cost(COST_CLAUDE_HAIKU)
-        
-        if raw:
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if json_match:
-                parsed = json.loads(json_match.group(0))
-                parsed.setdefault("is_bundle", False)
-                parsed.setdefault("contains_main_product", True)
-                parsed.setdefault("components", [])
-                parsed.setdefault("reasoning", "")
-                
-                # v7.2.1: Validate component estimates with weight-based pricing
-                if parsed["components"]:
-                    validated_components = []
-                    for c in parsed["components"]:
-                        name = c.get("name", "")
-                        ai_estimate = c.get("estimated_value", 0)
-                        
-                        # Weight-based validation for fitness equipment
-                        if is_weight_plate(name):
-                            weight_kg = extract_weight_kg(name)
-                            if weight_kg:
-                                weight_type = detect_weight_type(name)
-                                realistic_resale = calculate_weight_based_price(weight_kg, weight_type, is_resale=True)
-                                # Cap AI estimate at realistic price
-                                if ai_estimate > realistic_resale * 2:
-                                    print(f"   Capping {name}: AI={ai_estimate} → realistic={realistic_resale}")
-                                    c["estimated_value"] = realistic_resale
-                        
-                        # Filter out components below minimum
-                        estimated_val = c.get("estimated_value", 0)
-                        min_threshold = max(BUNDLE_MIN_COMPONENT_VALUE, min_price * 0.5) if min_price else BUNDLE_MIN_COMPONENT_VALUE
-                        if estimated_val and estimated_val >= min_threshold:
-                            validated_components.append(c)
-                    
-                    parsed["components"] = validated_components
-                
-                if not parsed["components"]:
-                    parsed["is_bundle"] = False
-                return parsed
-    except Exception as e:
-        print(f"⚠️ Bundle detection failed: {e}")
+def apply_global_sanity_check(resale_price: float, reference_price: float, is_bundle: bool, source: str) -> float:
+    """Apply global sanity checks to prevent unrealistic resale prices."""
+    if not reference_price or reference_price <= 0:
+        return resale_price
     
-    return {"is_bundle": False, "contains_main_product": True, "components": [], "reasoning": "Error"}
-
-
-def calculate_bundle_new_price(components: List[Dict]) -> float:
-    """Calculate new price for bundle components."""
-    if not components:
-        return 0.0
-    total = 0.0
-    for comp in components:
-        qty = comp.get("qty", 1)
-        name = comp.get("name", "")
-        market_price = comp.get("market_price", 0)
-        ai_estimate = comp.get("estimated_value", 0)
-        
-        if is_weight_plate(name):
-            weight_kg = extract_weight_kg(name)
-            if weight_kg:
-                weight_type = detect_weight_type(name)
-                component_new = calculate_weight_based_price(weight_kg, weight_type, is_resale=False)
-                total += component_new * qty
-                continue
-        
-        if market_price and market_price > 0:
-            component_new = market_price * 1.8
-        elif ai_estimate and ai_estimate > 0:
-            component_new = ai_estimate * 2.0
-        else:
-            component_new = BUNDLE_MIN_COMPONENT_VALUE * 2
-        total += component_new * qty
-    return round(total, 2)
-
-
-def calculate_bundle_resale(components: List[Dict], bundle_new_price: Optional[float] = None) -> float:
-    """Calculate bundle resale price from components with discount."""
-    if not components:
-        return 0.0
+    max_allowed = reference_price * (MAX_BUNDLE_RESALE_PERCENT_OF_NEW if is_bundle else MAX_RESALE_PERCENT_OF_NEW)
     
-    # Sum all component values (market_price or estimated_value)
-    total = 0.0
-    for c in components:
-        qty = c.get("qty", 1)
-        # Prefer market_price, fallback to estimated_value
-        price = c.get("market_price", 0) or c.get("estimated_value", 0)
-        total += price * qty
+    if resale_price > max_allowed:
+        return max_allowed
     
-    # Apply bundle discount
-    discounted = total * (1 - BUNDLE_DISCOUNT_PERCENT)
-    
-    # Cap at max % of new price if available
-    if bundle_new_price and bundle_new_price > 0:
-        max_bundle = bundle_new_price * MAX_BUNDLE_RESALE_PERCENT_OF_NEW
-        if discounted > max_bundle:
-            discounted = max_bundle
-    
-    return round(discounted, 2)
+    return resale_price
 
-
-def price_bundle_components(components: List[Dict], base_product: str, context=None, ua: str = None, query_analysis: Optional[Dict] = None) -> List[Dict]:
-    """Price bundle components using market data or AI estimates."""
-    priced_components = []
-    min_price = _get_min_realistic_price(query_analysis)
-    category = _get_category(query_analysis)
-
-    for comp in components:
-        name = comp.get("name", "")
-        qty = comp.get("qty", 1)
-        ai_estimate = comp.get("estimated_value", 0)
-
-        # Weight validation for fitness equipment
-        if is_weight_plate(name):
-            weight_kg = extract_weight_kg(name)
-            if weight_kg:
-                weight_type = detect_weight_type(name)
-                realistic_price = calculate_weight_based_price(weight_kg, weight_type, is_resale=True)
-                priced_components.append({
-                    **comp, 
-                    "market_price": realistic_price, 
-                    "price_source": f"weight_based_{weight_type}",
-                    "sample_size": 0,
-                    "has_auction_data": False,
-                })
-                continue
-
-        # Check cache first
-        cached = get_cached_component_price(name)
-        if cached and cached.get("median_price"):
-            median = cached["median_price"]
-            validated_price, _ = validate_weight_price(name, median, is_resale=True)
-            priced_components.append({
-                **comp, 
-                "market_price": validated_price, 
-                "price_source": f"cache_{cached.get('price_source', 'unknown')}", 
-                "sample_size": cached.get("sample_size", 0),
-                "has_auction_data": cached.get("has_auction_data", False)
-            })
-            continue
-
-        # Fallback to AI estimate
-        final_estimate = max(ai_estimate, min_price) if ai_estimate < min_price else ai_estimate
-        validated_estimate, _ = validate_weight_price(name, final_estimate, is_resale=True)
-        priced_components.append({
-            **comp, 
-            "market_price": validated_estimate, 
-            "price_source": "ai_estimate", 
-            "sample_size": 0, 
-            "has_auction_data": False
-        })
-
-    return priced_components
-
-
-# ==============================================================================
-# VARIANT CLUSTERING (v7.0 - uses unified call_ai)
-# ==============================================================================
-
-def cluster_variants_from_titles(titles: List[str], base_product: str, category: str = "unknown", query_analysis: Optional[Dict] = None) -> Dict[str, Any]:
-    """v7.0: Cluster titles into variants using Claude."""
-    if not titles:
-        return {"variants": [], "title_to_variant": {}}
-    
-    unique_titles = list(dict.fromkeys(titles))
-    cache_key = f"{base_product}|{len(unique_titles)}"
-    _load_caches()
-    
-    if CACHE_ENABLED and cache_key in _cluster_cache:
-        cached = _cluster_cache[cache_key]
-        if cached.get("expires_at", "") > datetime.datetime.now().isoformat():
-            print(f"💾 Using cached clustering for '{base_product}'")
-            return cached
-    
-    print(f"\n🔍 Clustering {len(unique_titles)} titles...")
-    
-    if is_budget_exceeded():
-        return {"reasoning": "Budget exceeded", "variants": [], "title_to_variant": {t: None for t in unique_titles}}
-    
-    if query_analysis:
-        category = query_analysis.get("category", category)
-    
-    prompt = f"""Gruppiere diese Ricardo-Listings nach PREIS-RELEVANTER Variante.
-
-Suchbegriff: "{base_product}"
-Kategorie: "{category}"
-
-LISTINGS:
-{chr(10).join(f'{i+1}. "{t}"' for i, t in enumerate(unique_titles[:50]))}
-
-REGELN:
-- Variant-Key Format: "{base_product}|[Variante]"
-- WICHTIG: Modellnummern sind PREIS-RELEVANT! (z.B. Fenix 7 ≠ Fenix 8, iPhone 13 ≠ iPhone 14)
-- Auch relevant: Speicher (64GB/256GB), Grösse (S/M/L), Material (Eisen/Gummi)
-- NICHT relevant: Farbe, Zustand, Verkäufer-Beschreibungen
-- Unklare Listings → null
-
-BEISPIELE:
-- "Garmin Fenix 7 Solar" → "{base_product}|Fenix 7"
-- "Garmin Fenix 8 Amoled" → "{base_product}|Fenix 8"
-- "Tommy Hilfiger Jacke XL" → "{base_product}|Jacke XL"
-
-Antworte NUR als JSON:
-{{
-  "reasoning": "Strategie",
-  "variants": ["{base_product}|Var1", "{base_product}|Var2"],
-  "title_to_variant": {{"Titel1": "{base_product}|Var1", "Unklarer": null}}
-}}"""
-
-    try:
-        raw = call_ai(prompt, max_tokens=2500)
-        if raw:
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if json_match:
-                parsed = json.loads(json_match.group(0))
-                add_cost(COST_CLAUDE_HAIKU)
-                
-                # Clean up variant mappings
-                cleaned = {}
-                for title, variant in parsed.get("title_to_variant", {}).items():
-                    if variant in ("null", None):
-                        cleaned[title] = None
-                    elif variant:
-                        if not variant.startswith(f"{base_product}|"):
-                            variant = f"{base_product}|{variant.split('|')[-1]}" if "|" in variant else f"{base_product}|{variant}"
-                        cleaned[title] = variant
-                    else:
-                        cleaned[title] = None
-                
-                parsed["title_to_variant"] = cleaned
-                parsed["variants"] = list(set(v for v in cleaned.values() if v))
-                
-                # Cache
-                if CACHE_ENABLED:
-                    parsed["expires_at"] = (datetime.datetime.now() + datetime.timedelta(days=CLUSTER_CACHE_DAYS)).isoformat()
-                    _cluster_cache[cache_key] = parsed
-                    _save_cluster_cache()
-                
-                classified = sum(1 for v in parsed["title_to_variant"].values() if v)
-                print(f"   ✅ {len(parsed['variants'])} variants, {classified} classified")
-                
-                return parsed
-    except Exception as e:
-        print(f"⚠️ Clustering failed: {e}")
-    
-    return {"reasoning": "Error", "variants": [], "title_to_variant": {t: None for t in unique_titles}}
-
-
-def get_variant_for_title(title: str, cluster_result: Dict[str, Any], base_product: str) -> Optional[str]:
-    title_to_variant = cluster_result.get("title_to_variant", {})
-    if title in title_to_variant:
-        return title_to_variant[title]
-    title_lower = title.lower().strip()
-    for cached_title, variant in title_to_variant.items():
-        cached_lower = cached_title.lower().strip()
-        if cached_lower in title_lower or title_lower in cached_lower:
-            return variant
-    return None
-
-
-def variant_key_to_search_term(variant_key: str) -> str:
-    if not variant_key:
-        return ""
-    return variant_key.replace("|", " ").strip()
-
-
-# ==============================================================================
-# MARKET PRICE CALCULATION (unchanged from v6.8)
-# ==============================================================================
 
 def calculate_market_resale_from_listings(
     variant_key: str,
@@ -1617,12 +1206,60 @@ def calculate_market_resale_from_listings(
         hours = listing.get("hours_remaining") or 999
         buy_now = listing.get("buy_now_price")
         
-        if buy_now and buy_now > unrealistic_floor:
+        # v7.2.2: Track buy-now prices (but only from listings WITH bids)
+        if buy_now and buy_now > unrealistic_floor and bids > 0:
             if buy_now_ceiling is None or buy_now < buy_now_ceiling:
                 buy_now_ceiling = buy_now
         
+        # v7.2.2: IGNORE pure buy-now listings (no bids)
         if not current or current <= 0 or bids == 0:
             continue
+        
+        # v7.2.2: Special validation for single bids with category-specific thresholds
+        if bids == 1:
+            price_ratio = current / reference_price if reference_price > 0 else 0
+            
+            # v7.2.2: ALWAYS reject unrealistic bids (not just late ones)
+            if price_ratio < 0.20:
+                continue  # Too unrealistic, regardless of timing
+            
+            # Case 1: Buy-now + single bid → use category threshold (default 30%)
+            if buy_now and buy_now > unrealistic_floor:
+                buy_now_ratio = current / buy_now
+                min_buy_now_ratio = 0.30  # Default, will be overridden by category threshold
+                
+                if buy_now_ratio >= min_buy_now_ratio:
+                    # Good! Bid is reasonable compared to buy-now
+                    weight = calculate_confidence_weight(bids, hours)
+                    price_samples.append({
+                        "price": float(current),
+                        "weight": weight * 0.8,  # Slightly lower confidence
+                        "bids": bids,
+                        "hours": hours,
+                        "reason": f"single_bid_buy_now_{buy_now_ratio*100:.0f}pct"
+                    })
+                    continue
+                else:
+                    # Bid too low compared to buy-now
+                    continue
+            
+            # Case 2: Auction-only + single bid → validate against reference price
+            # Use category-specific threshold (default 40%)
+            min_single_bid_ratio = 0.40  # Default, will be overridden
+            
+            # Accept if bid is reasonable (>=threshold of reference)
+            if price_ratio >= min_single_bid_ratio and hours > 12:
+                weight = calculate_confidence_weight(bids, hours)
+                price_samples.append({
+                    "price": float(current),
+                    "weight": weight * 0.7,  # Lower confidence for single bid
+                    "bids": bids,
+                    "hours": hours,
+                    "reason": f"single_bid_validated_{price_ratio*100:.0f}pct"
+                })
+                continue
+            
+            # For other single bids, use standard validation
         
         is_real, reason = is_realistic_auction_price(current, bids, hours, reference_price, True)
         
@@ -1638,49 +1275,59 @@ def calculate_market_resale_from_listings(
             "reason": reason
         })
     
+    # v7.2.2: NO fallback to pure buy-now prices!
+    # We only use buy-now if there are actual bids to validate against
     if not price_samples:
-        if buy_now_ceiling and buy_now_ceiling > unrealistic_floor:
-            resale = buy_now_ceiling * 0.85
-            if sanity_reference:
-                resale = apply_global_sanity_check(resale, sanity_reference, False, "buy_now_ceiling")
-            return {
-                "resale_price": round(resale, 2),
-                "market_value": round(buy_now_ceiling, 2),
-                "source": "buy_now_ceiling_fallback",
-                "sample_size": 0,
-                "market_based": True,
-                "buy_now_ceiling": buy_now_ceiling,
-                "confidence": 0.35,
-            }
         return None
     
     if len(price_samples) < MIN_SAMPLES_FOR_MARKET_PRICE:
-        simple_median = statistics.median([s["price"] for s in price_samples])
-        has_very_high = any(s.get("bids", 0) >= VERY_HIGH_ACTIVITY_BID_THRESHOLD for s in price_samples)
-        has_high = any(s.get("bids", 0) >= HIGH_ACTIVITY_BID_THRESHOLD for s in price_samples)
+        # v9.0 FIX: Mit nur 1 Sample ist "Market Data" nicht valide!
+        # Das eine Sample ist oft das Listing selbst → Zirkular-Logik
+        if len(price_samples) == 1:
+            # Nur 1 Sample: NUR verwenden wenn buy_now_ceiling vorhanden
+            if buy_now_ceiling and buy_now_ceiling > unrealistic_floor:
+                resale_price = buy_now_ceiling * 0.75
+                return {
+                    "resale_price": round(resale_price, 2),
+                    "market_value": round(buy_now_ceiling, 2),
+                    "source": "single_sample_buy_now_fallback",
+                    "sample_size": 1,
+                    "market_based": False,  # Nicht wirklich market-based!
+                    "buy_now_ceiling": buy_now_ceiling,
+                    "confidence": 0.3,
+                }
+            # Ohne buy_now_ceiling: return None → fallback to new_price * resale_rate
+            return None
         
-        if has_very_high:
-            resale_price, confidence, source = simple_median * 0.95, 0.70, "very_high_activity_single"
-        elif has_high:
-            resale_price, confidence, source = simple_median * 0.90, 0.55, "high_activity_single"
-        else:
-            resale_price, confidence, source = simple_median * 0.85, 0.4, "auction_demand_low_confidence"
+        # v7.2.1: For rare items (2 samples), prefer buy-now prices if available
+        if len(price_samples) == 2 and buy_now_ceiling and buy_now_ceiling > unrealistic_floor:
+            simple_median = statistics.median([s["price"] for s in price_samples])
+            
+            # If auction price is reasonable (>50% of buy-now), use it
+            if simple_median >= buy_now_ceiling * 0.50:
+                resale_price = simple_median * 0.90
+                confidence = 0.60
+                source = "rare_item_auction_validated"
+            else:
+                resale_price = buy_now_ceiling * 0.75
+                confidence = 0.50
+                source = "rare_item_buy_now_based"
+            
+            if sanity_reference:
+                resale_price = apply_global_sanity_check(resale_price, sanity_reference, False, source)
+            
+            return {
+                "resale_price": round(resale_price, 2),
+                "market_value": round(buy_now_ceiling, 2),
+                "source": source,
+                "sample_size": len(price_samples),
+                "market_based": True,
+                "buy_now_ceiling": buy_now_ceiling,
+                "confidence": confidence,
+            }
         
-        if buy_now_ceiling and buy_now_ceiling > simple_median and resale_price > buy_now_ceiling * 0.95:
-            resale_price = buy_now_ceiling * 0.95
-        
-        if sanity_reference:
-            resale_price = apply_global_sanity_check(resale_price, sanity_reference, False, source)
-        
-        return {
-            "resale_price": round(resale_price, 2),
-            "market_value": round(simple_median, 2),
-            "source": source,
-            "sample_size": len(price_samples),
-            "market_based": True,
-            "buy_now_ceiling": buy_now_ceiling,
-            "confidence": confidence,
-        }
+        # 2 samples ohne buy_now_ceiling: return None
+        return None
     
     market_value = weighted_median(price_samples)
     
@@ -1767,11 +1414,13 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
         if vk in market_prices:
             market_data = market_prices[vk]
             cached = get_cached_variant_info(vk)
+            # v9.0 FIX: Use market_based from market_data, not hardcoded True!
+            # single_sample_buy_now_fallback returns market_based=False
             results[vk] = {
                 "new_price": cached.get("new_price") if cached else None,
                 "transport_car": cached.get("transport_car", True) if cached else True,
                 "resale_price": market_data["resale_price"],
-                "market_based": True,
+                "market_based": market_data.get("market_based", True),
                 "market_source": market_data["source"],
                 "market_sample_size": market_data["sample_size"],
                 "market_value": market_data.get("market_value"),
@@ -1795,27 +1444,19 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
         
         need_new_price.append(vk)
     
-    # v7.0: Use REAL web search for new prices!
+    # v7.3: Use BATCH web search to avoid rate limits!
     if need_new_price:
-        print(f"\n🌐 v7.0: Web searching new prices for {len(need_new_price)} variants...")
+        print(f"\n🌐 v7.3: BATCH web searching {len(need_new_price)} variants (rate-limit safe)...")
+        
+        # v7.3.3: Pass query_analysis for better search term cleaning
+        web_results = search_web_batch_for_new_prices(need_new_price, category, query_analysis)
         
         for vk in need_new_price:
-            # Extract search terms
-            clean_name = vk.replace("|", " ").strip()
-            clean_result = extract_clean_search_terms(clean_name, category)
-            search_terms = clean_result.get("search_terms", [clean_name])
-            
-            # Try web search first (THE GAME CHANGER!)
-            # Add delay to prevent rate limiting
-            import time
-            if vk != need_new_price[0]:  # Skip delay for first request
-                time.sleep(5.0)  # 5.0s between requests to avoid 429 errors (v7.2.1: increased from 2.5s)
-            
-            web_result = search_web_for_new_price(vk, search_terms, category)
+            web_result = web_results.get(vk)
             
             if web_result and web_result.get("new_price"):
                 new_price = web_result["new_price"]
-                price_source = web_result.get("price_source", "web_search")
+                price_source = web_result.get("price_source", "web_batch")
                 
                 # Calculate resale with sanity checks
                 resale_price = new_price * resale_rate
@@ -1843,10 +1484,8 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
                 
                 # Cache it
                 set_cached_variant_info(vk, new_price, True, resale_price, False, 0)
-                
-                print(f"   ✅ {vk}: {new_price} CHF ({price_source})")
             else:
-                # Fallback to AI estimate
+                # No web result, will use AI fallback
                 if vk not in results:
                     results[vk] = {
                         "new_price": None,
@@ -1885,6 +1524,9 @@ def _fetch_variant_info_from_ai_batch(variant_keys: List[str], car_model: str = 
     min_realistic = _get_min_realistic_price(query_analysis)
     category = _get_category(query_analysis)
 
+    # v7.2.1: Remove pipe from variant keys for cleaner AI prompt
+    clean_variant_keys = [vk.replace("|", " ") for vk in variant_keys]
+    
     prompt = f"""Du bist Preisexperte für ricardo.ch (SCHWEIZ).
 
 KATEGORIE: {category}
@@ -1901,10 +1543,10 @@ REGELN:
 - Kleidung: Tommy Hilfiger Pullover ~120-150 CHF neu
 
 PRODUKTE:
-{chr(10).join(f"- {vk}" for vk in variant_keys)}
+{chr(10).join(f"- {cvk}" for cvk in clean_variant_keys)}
 
 Antworte NUR als JSON:
-{{"Produkt|Variante": {{"new_price": X, "resale_price": X, "transport": true/false}}, ...}}"""
+{{"Produkt Variante": {{"new_price": X, "resale_price": X, "transport": true/false}}, ...}}"""
 
     results = {}
     try:
@@ -1947,6 +1589,11 @@ Antworte NUR als JSON:
                                 new_price = validated_new
                                 resale_price = validated_resale
                             
+                            # v7.3.2: Apply model-year adjustment for old electronics
+                            if category == "electronics":
+                                new_price = _adjust_price_for_model_year(vk, new_price, category)
+                                resale_price = new_price * _get_component_resale_rate(vk, category, resale_rate)
+                            
                             if new_price > 0:
                                 results[vk] = {
                                     "new_price": new_price,
@@ -1963,6 +1610,384 @@ Antworte NUR als JSON:
         print(f"⚠️ AI variant query failed: {e}")
     
     return results
+
+
+# ==============================================================================
+# SEARCH TERM EXTRACTION
+# ==============================================================================
+
+def extract_clean_search_terms(product_name: str, category: str = "unknown") -> Dict[str, Any]:
+    """Extract clean search terms from product name for web search."""
+    # Remove common noise words
+    noise_words = ["neu", "new", "original", "ovp", "top", "super", "mega", "wow", "!!!", "???"]
+    
+    # Clean the name
+    clean = product_name.lower()
+    for noise in noise_words:
+        clean = clean.replace(noise.lower(), "")
+    
+    # Split into words
+    words = [w.strip() for w in clean.split() if len(w.strip()) > 2]
+    
+    # Build search terms (first 4 meaningful words)
+    search_terms = words[:4] if words else [product_name]
+    
+    return {
+        "search_terms": search_terms,
+        "clean_name": " ".join(words),
+        "category": category,
+    }
+
+# ==============================================================================
+# BUNDLE DETECTION & PRICING
+# ==============================================================================
+
+BUNDLE_KEYWORDS = [
+    "set", "paket", "bundle", "lot", "konvolut", "sammlung",
+    "2x", "3x", "4x", "5x", "6x", "10x", "paar", "stück",
+    "inkl", "inklusive", "mit", "plus", "und", "&",
+]
+
+def looks_like_bundle(title: str, description: str = "") -> bool:
+    """Quick check if listing might be a bundle."""
+    text = f"{title} {description}".lower()
+    
+    # v9.0 FIX: "2 Stk. à 2.5kg" = Quantity, NOT bundle!
+    # Pattern: Zahl + Stk + à/x/@ + Gewicht = single product with quantity
+    if re.search(r'\d+\s*stk\.?\s*[àax@]\s*\d+', text):
+        return False
+    
+    # Check for real bundle keywords
+    for kw in BUNDLE_KEYWORDS:
+        if kw in text:
+            # But exclude "stück/stk" if it's just quantity notation
+            if kw in ["stück", "stk"] and not re.search(r'\d+\s*(stück|stk)\s+\w+', text):
+                continue  # Skip - it's just "2 Stk." quantity
+            return True
+    
+    # Quantity pattern - but only for real bundles with multiple items
+    qty_pattern = r'\b(\d+)\s*(x|pcs|pieces?)\b'  # Removed stück/stk - handled above
+    if re.search(qty_pattern, text):
+        return True
+    
+    return False
+
+def detect_bundle_with_ai(
+    title: str,
+    description: str,
+    query: str,
+    image_url: Optional[str] = None,
+    use_vision: bool = False,
+    query_analysis: Optional[Dict] = None,
+    batch_result: Optional[Dict] = None,
+) -> Dict[str, Any]:
+    """
+    Detect if listing is a bundle and identify components.
+    
+    v7.3.4: Can use pre-computed batch_result to avoid redundant AI calls.
+    """
+    result = {
+        "is_bundle": False,
+        "components": [],
+        "confidence": 0.0,
+    }
+    
+    # v7.3.4: Use batch result if available (cost optimization!)
+    if batch_result is not None:
+        return batch_result
+    
+    if not looks_like_bundle(title, description):
+        return result
+    
+    # Fallback: Individual detection (only if batch wasn't used)
+    prompt = f"""Analysiere dieses Ricardo-Inserat auf Bundle/Set:
+
+TITEL: {title}
+BESCHREIBUNG: {description[:500] if description else "Keine"}
+SUCHBEGRIFF: {query}
+
+Ist dies ein Bundle/Set mit mehreren Artikeln?
+
+Wenn JA, liste die Komponenten auf mit geschätzter Anzahl.
+
+Antworte NUR als JSON:
+{{
+  "is_bundle": true/false,
+  "components": [
+    {{"name": "Artikel 1", "quantity": 2, "unit": "stück"}},
+    {{"name": "Artikel 2", "quantity": 1, "unit": "stück"}}
+  ],
+  "confidence": 0.0-1.0
+}}"""
+
+    try:
+        raw = call_ai(prompt, max_tokens=500)
+        if raw:
+            json_match = re.search(r'\{[\s\S]*\}', raw)
+            if json_match:
+                parsed = json.loads(json_match.group(0))
+                add_cost(COST_CLAUDE_HAIKU)
+                
+                result["is_bundle"] = parsed.get("is_bundle", False)
+                result["components"] = parsed.get("components", [])
+                result["confidence"] = parsed.get("confidence", 0.5)
+    except Exception as e:
+        print(f"⚠️ Bundle detection failed: {e}")
+    
+    return result
+
+def price_bundle_components(
+    components: List[Dict[str, Any]],
+    base_product: str,
+    context=None,
+    ua: str = None,
+    query_analysis: Optional[Dict] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Price individual bundle components with smart estimation.
+    
+    v7.3.5: NOW WITH WEB SEARCH! 
+    - Uses web search for each component (with cache!)
+    - Falls back to AI estimation if web search fails
+    - Cache means repeated components are FREE!
+    
+    Example: "Olympiastange + 3× Kurzhantel + 2× 5kg Gusseisen"
+    → 3 web searches (cached for future bundles)
+    → Much more accurate than AI guessing!
+    """
+    priced = []
+    resale_rate = _get_resale_rate(query_analysis)
+    category = _get_category(query_analysis)
+    
+    # v7.3.5: Collect all component names for batch web search
+    component_names = [comp.get("name", "Unknown") for comp in components]
+    
+    # v7.3.5: Batch web search for all components (with cache check!)
+    print(f"   Searching prices for {len(component_names)} bundle components...")
+    web_prices = search_web_batch_for_new_prices(component_names, category, query_analysis)
+    
+    for comp in components:
+        name = comp.get("name", "Unknown")
+        qty = comp.get("quantity") or 1
+        if not isinstance(qty, (int, float)):
+            try:
+                qty = int(qty)
+            except:
+                qty = 1
+        
+        # v7.3.5: Try web search first (with cache!)
+        web_result = web_prices.get(name)
+        if web_result and web_result.get("new_price"):
+            est_new = web_result["new_price"]
+            price_source = "web_search"
+            print(f"      {name}: {est_new} CHF (web)")
+        else:
+            # Fallback: AI estimation
+            est_new = _estimate_component_price(name, category, query_analysis)
+            est_new = _adjust_price_for_model_year(name, est_new, category)
+            price_source = "ai_estimate"
+            print(f"      {name}: {est_new} CHF (AI fallback)")
+        
+        # Calculate resale with category-aware rate
+        component_resale_rate = _get_component_resale_rate(name, category, resale_rate)
+        est_resale = est_new * component_resale_rate
+        
+        priced.append({
+            "name": name,
+            "quantity": qty,
+            "new_price_each": round(est_new, 2),
+            "resale_price_each": round(est_resale, 2),
+            "total_new": round(est_new * qty, 2),
+            "total_resale": round(est_resale * qty, 2),
+            "price_source": price_source,
+        })
+    
+    return priced
+
+
+def _estimate_component_price(name: str, category: str, query_analysis: Optional[Dict] = None) -> float:
+    """
+    v7.3.3: Improved component price estimation.
+    Uses weight-based pricing for fitness, smart defaults for other categories.
+    GOAL: Avoid unrealistic 50 CHF defaults!
+    """
+    name_lower = name.lower()
+    
+    # ACCESSORIES (low value items) - handle first
+    if any(kw in name_lower for kw in ["koffer", "case", "tasche", "bag", "etui"]):
+        return 15.0  # Cases/bags are cheap
+    if any(kw in name_lower for kw in ["adapter", "clip", "halter", "holder"]):
+        return 10.0
+    if any(kw in name_lower for kw in ["anleitung", "manual", "handbuch"]):
+        return 0.0  # Manuals have no resale value
+    
+    # FITNESS: Weight-based pricing (CHF per kg)
+    if category == "fitness" or any(kw in name_lower for kw in WEIGHT_PLATE_KEYWORDS):
+        weight_kg = extract_weight_kg(name)
+        if weight_kg and weight_kg > 0:
+            weight_type = get_weight_type(name)
+            pricing = WEIGHT_PRICING.get(weight_type, WEIGHT_PRICING["standard"])
+            # v9.0: Calibrated plates are more expensive!
+            if weight_type == "calibrated":
+                return weight_kg * pricing["new_price_per_kg"] * 1.5
+            # v7.3.3: Use realistic CHF/kg pricing
+            return weight_kg * pricing["new_price_per_kg"]
+        
+        # v7.3.3: Try to extract weight from quantity patterns like "4x 5kg"
+        import re
+        qty_weight = re.search(r'(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*kg', name_lower)
+        if qty_weight:
+            qty = int(qty_weight.group(1))
+            per_kg = float(qty_weight.group(2).replace(',', '.'))
+            total_kg = qty * per_kg
+            return total_kg * 3.5  # Standard ~3.5 CHF/kg
+        
+        # Fitness equipment defaults (no weight found)
+        if any(kw in name_lower for kw in ["hantelscheibe", "gewicht", "plate", "scheibe"]):
+            # v9.0: "Hantelscheibe" ohne Gewicht ist UNGÜLTIG - return None für Fehlerbehandlung
+            return None
+        if any(kw in name_lower for kw in ["hantelstange", "langhantel", "barbell", "stange"]):
+            return 80.0
+        if any(kw in name_lower for kw in ["kurzhantel", "dumbbell", "gymnastikhantel"]):
+            return 15.0  # Small dumbbells
+        if any(kw in name_lower for kw in ["bank", "bench", "rack"]):
+            return 150.0
+        if any(kw in name_lower for kw in ["ständer", "halterung", "stand"]):
+            return 60.0
+        if any(kw in name_lower for kw in ["set", "kit"]):
+            return 80.0  # Generic set
+        return 40.0  # Generic fitness default (was 50)
+    
+    # ELECTRONICS: Model-specific pricing
+    if category == "electronics":
+        # Garmin smartwatches
+        if "forerunner" in name_lower:
+            if any(m in name_lower for m in ["965", "955", "945"]):
+                return 500.0
+            if any(m in name_lower for m in ["935", "735", "645"]):
+                return 200.0  # Older models
+            return 300.0
+        if "fenix" in name_lower:
+            if "7" in name_lower or "8" in name_lower:
+                return 600.0
+            if "6" in name_lower:
+                return 400.0
+            if "5" in name_lower:
+                return 250.0  # 2017 model
+            return 400.0
+        if "vivofit" in name_lower:
+            return 80.0
+        if "vivoactive" in name_lower:
+            return 250.0
+        if "brustgurt" in name_lower or "heart rate" in name_lower:
+            return 50.0
+        if "armband" in name_lower or "band" in name_lower:
+            return 25.0
+        if "ladekabel" in name_lower or "charger" in name_lower:
+            return 20.0
+        return 100.0  # Generic electronics default
+    
+    # CLOTHING
+    if category == "clothing":
+        if any(kw in name_lower for kw in ["jacke", "jacket", "mantel", "coat"]):
+            return 150.0
+        if any(kw in name_lower for kw in ["hose", "jeans", "pants"]):
+            return 80.0
+        if any(kw in name_lower for kw in ["pullover", "sweater", "hoodie"]):
+            return 90.0
+        if any(kw in name_lower for kw in ["hemd", "shirt", "bluse"]):
+            return 70.0
+        return 60.0  # Generic clothing default
+    
+    # DEFAULT for unknown categories
+    return 50.0
+
+
+def _adjust_price_for_model_year(name: str, price: float, category: str) -> float:
+    """
+    Adjust price based on detected model year (for electronics).
+    Older models should have lower new prices.
+    """
+    if category != "electronics":
+        return price
+    
+    name_lower = name.lower()
+    
+    # Garmin Fenix series (detect model generation)
+    if "fenix" in name_lower:
+        if "5" in name_lower:  # 2017 model
+            return min(price, 250.0)
+        if "6" in name_lower:  # 2019 model
+            return min(price, 450.0)
+        if "7" in name_lower:  # 2022 model
+            return min(price, 650.0)
+    
+    # Garmin Forerunner series
+    if "forerunner" in name_lower:
+        if any(m in name_lower for m in ["235", "230", "220"]):  # Old models
+            return min(price, 150.0)
+        if any(m in name_lower for m in ["935", "735"]):  # 2017-2018
+            return min(price, 200.0)
+        if any(m in name_lower for m in ["945", "745"]):  # 2019-2020
+            return min(price, 350.0)
+    
+    return price
+
+
+def _get_component_resale_rate(name: str, category: str, default_rate: float) -> float:
+    """
+    Get resale rate for a specific component type.
+    Accessories have lower resale, main items higher.
+    """
+    name_lower = name.lower()
+    
+    # Accessories have lower resale value
+    if any(kw in name_lower for kw in ["armband", "band", "kabel", "cable", "charger", "adapter"]):
+        return 0.30  # Accessories: 30%
+    
+    # Main fitness equipment holds value well
+    if category == "fitness":
+        if any(kw in name_lower for kw in ["hantelscheibe", "gewicht", "plate", "bumper"]):
+            return 0.60  # Weight plates: 60%
+        if any(kw in name_lower for kw in ["bank", "bench", "rack"]):
+            return 0.50  # Benches/racks: 50%
+    
+    # Electronics depreciate based on age
+    if category == "electronics":
+        if "fenix 5" in name_lower or "forerunner 935" in name_lower:
+            return 0.55  # Older electronics: 55%
+        if "fenix 6" in name_lower or "forerunner 945" in name_lower:
+            return 0.50  # Mid-age: 50%
+    
+    return default_rate
+
+
+def calculate_bundle_new_price(priced_components: List[Dict[str, Any]]) -> float:
+    """Calculate total new price for bundle."""
+    if not priced_components:
+        return 0.0
+    
+    total = sum(c.get("total_new", 0) for c in priced_components)
+    return round(total, 2)
+
+
+def calculate_bundle_resale(priced_components: List[Dict[str, Any]], bundle_new_price: float) -> float:
+    """Calculate bundle resale price with discount."""
+    if not priced_components:
+        return 0.0
+    
+    # Sum component resale prices
+    component_total = sum(c.get("total_resale", 0) for c in priced_components)
+    
+    # Apply bundle discount (people pay less for bundles)
+    bundle_resale = component_total * (1 - BUNDLE_DISCOUNT_PERCENT)
+    
+    # Cap at max percent of new price
+    max_resale = bundle_new_price * MAX_BUNDLE_RESALE_PERCENT_OF_NEW
+    if bundle_resale > max_resale:
+        bundle_resale = max_resale
+    
+    return round(bundle_resale, 2)
 
 
 # ==============================================================================
@@ -2057,8 +2082,6 @@ def calculate_deal_score(expected_profit: float, purchase_price: float, resale_p
     
     return max(0.0, min(10.0, round(score, 1)))
 
-
-# ==============================================================================
 # MAIN EVALUATION FUNCTION
 # ==============================================================================
 
@@ -2077,6 +2100,7 @@ def evaluate_listing_with_ai(
     context=None,
     ua: str = None,
     query_analysis: Optional[Dict] = None,
+    batch_bundle_result: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """
     v7.0: Main evaluation function with Claude-based AI.
@@ -2131,6 +2155,20 @@ def evaluate_listing_with_ai(
         result["price_source"] = "buy_now_fallback"
         print(f"   Using buy_now_price as new_price fallback: {result['new_price']:.2f} CHF")
     
+    # v7.2.1: Calculate resale_price_est from new_price if missing
+    resale_rate = _get_resale_rate(query_analysis)
+    if not result["resale_price_est"] and result["new_price"] and result["new_price"] > 0:
+        result["resale_price_est"] = result["new_price"] * resale_rate
+    
+    # v9.0 FIX: If we have resale_price but no new_price, estimate new_price
+    # This ensures data consistency (can't have resale without knowing new)
+    if result["resale_price_est"] and not result["new_price"]:
+        # Reverse calculate: new_price = resale_price / resale_rate
+        estimated_new = result["resale_price_est"] / resale_rate if resale_rate > 0 else result["resale_price_est"] * 2
+        result["new_price"] = round(estimated_new, 2)
+        if result["price_source"] == "unknown":
+            result["price_source"] = "estimated_from_resale"
+    
     # Determine effective purchase price
     is_auction = current_price is not None and buy_now_price is None
     has_buy_now = buy_now_price is not None
@@ -2155,14 +2193,17 @@ def evaluate_listing_with_ai(
     
     # Check for bundles
     if BUNDLE_ENABLED and looks_like_bundle(title, description):
+        vision_for_this_call = random.random() < VISION_RATE if image_url else False
         bundle_result = detect_bundle_with_ai(
             title=title,
             description=description,
             query=query,
             image_url=image_url,
-            use_vision=random.random() < VISION_RATE if image_url else False,
+            use_vision=vision_for_this_call,
             query_analysis=query_analysis,
+            batch_result=batch_bundle_result,
         )
+        result["vision_used"] = vision_for_this_call
         
         if bundle_result.get("is_bundle"):
             result["is_bundle"] = True
@@ -2231,8 +2272,457 @@ def evaluate_listing_with_ai(
 
 
 # ==============================================================================
+# VISION ANALYSIS FOR UNCLEAR LISTINGS
+# ==============================================================================
+
+def analyze_listing_with_vision(
+    title: str,
+    description: str,
+    image_url: str,
+    category: str = None,
+) -> Dict[str, Any]:
+    """
+    Analyzes an unclear listing using vision to extract missing product information.
+    
+    Used when title and description don't provide enough clarity to identify the product.
+    
+    Args:
+        title: Original listing title
+        description: Listing description (may be vague)
+        image_url: URL to product image
+        category: Optional category path
+    
+    Returns:
+        Dict with extracted product info
+    """
+    result = {
+        "product_type": None,
+        "brand": None,
+        "model": None,
+        "specifications": {},
+        "condition": None,
+        "is_bundle": False,
+        "bundle_items": [],
+        "confidence": 0.0,
+        "notes": None,
+        "vision_used": True,
+        "success": False,
+    }
+    
+    if not image_url:
+        result["notes"] = "No image URL provided"
+        return result
+    
+    # Build context from known info
+    context_parts = []
+    if title:
+        context_parts.append(f"Titel: {title}")
+    if description:
+        desc_preview = description[:300] + "..." if len(description) > 300 else description
+        context_parts.append(f"Beschreibung: {desc_preview}")
+    if category:
+        context_parts.append(f"Kategorie: {category}")
+    
+    context = "\n".join(context_parts) if context_parts else "Keine Kontextinformationen"
+    
+    prompt = f"""Du analysierst ein Produktbild von einem Online-Inserat um fehlende Informationen zu identifizieren.
+
+BEKANNTE INFORMATIONEN:
+{context}
+
+DEINE AUFGABE:
+Die vorhandenen Informationen sind zu vage. Analysiere das Bild und extrahiere:
+
+1. **Produktidentifikation** - Um was handelt es sich genau? Marke? Modell?
+2. **Spezifikationen** - Material, Gewicht/Grösse falls erkennbar
+3. **Zustand** - neu/neuwertig/gebraucht
+4. **Bundle/Set** - Falls mehrere Artikel sichtbar, liste sie auf
+
+ANTWORTFORMAT (JSON):
+{{
+    "product_type": "z.B. Hantelscheiben, Smartwatch",
+    "brand": "erkannte Marke oder null",
+    "model": "erkanntes Modell oder null",
+    "specifications": {{"weight_kg": null, "material": null}},
+    "condition": "neu/neuwertig/gebraucht/unklar",
+    "is_bundle": true/false,
+    "bundle_items": ["Item 1", "Item 2"],
+    "confidence": 0.0-1.0,
+    "notes": "zusätzliche Beobachtungen"
+}}
+
+Antworte NUR mit dem JSON-Objekt."""
+
+    try:
+        response = _call_ai(
+            prompt=prompt,
+            max_tokens=800,
+            image_url=image_url,
+        )
+        
+        if response:
+            # Parse JSON from response
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                result.update(parsed)
+                result["success"] = True
+                result["vision_used"] = True
+            else:
+                result["notes"] = f"Could not parse JSON from response"
+    except json.JSONDecodeError as e:
+        result["notes"] = f"JSON parse error: {e}"
+    except Exception as e:
+        result["notes"] = f"Vision analysis error: {e}"
+    
+    return result
+
+
+def batch_analyze_with_vision(
+    listings: List[Dict[str, Any]],
+    max_vision_calls: int = 5,
+) -> List[Dict[str, Any]]:
+    """
+    Analyzes multiple unclear listings with vision.
+    
+    Args:
+        listings: Listings that need vision analysis (must have 'image_urls' or 'image_url')
+        max_vision_calls: Maximum number of vision API calls
+    
+    Returns:
+        Same listings with added '_vision_result' field
+    """
+    to_analyze = [l for l in listings if l.get("image_urls") or l.get("image_url")][:max_vision_calls]
+    
+    if not to_analyze:
+        print("   ⚠️ No listings with images for vision analysis")
+        return listings
+    
+    print(f"\n👁️ Analyzing {len(to_analyze)} listings with vision...")
+    
+    for i, listing in enumerate(to_analyze, 1):
+        title = listing.get("title", "")[:40]
+        print(f"\n   [{i}/{len(to_analyze)}] {title}...")
+        
+        # Get first image URL
+        image_urls = listing.get("image_urls", [])
+        image_url = image_urls[0] if image_urls else listing.get("image_url")
+        
+        if not image_url:
+            continue
+        
+        vision_result = analyze_listing_with_vision(
+            title=listing.get("title", ""),
+            description=listing.get("description", ""),
+            image_url=image_url,
+            category=listing.get("category_path"),
+        )
+        
+        listing["_vision_result"] = vision_result
+        listing["vision_used"] = True
+        
+        if vision_result.get("success"):
+            # Update listing with extracted info
+            if vision_result.get("product_type"):
+                listing["_identified_product"] = vision_result["product_type"]
+            if vision_result.get("brand"):
+                listing["_identified_brand"] = vision_result["brand"]
+            if vision_result.get("model"):
+                listing["_identified_model"] = vision_result["model"]
+            if vision_result.get("is_bundle"):
+                listing["is_bundle"] = True
+                listing["bundle_components"] = vision_result.get("bundle_items", [])
+            
+            print(f"   ✅ Identified: {vision_result.get('product_type', 'Unknown')}")
+            if vision_result.get("brand"):
+                print(f"      Brand: {vision_result['brand']}")
+            if vision_result.get("is_bundle"):
+                print(f"      Bundle: {len(vision_result.get('bundle_items', []))} items")
+        else:
+            print(f"   ⚠️ Vision failed: {vision_result.get('notes', 'Unknown error')}")
+    
+    print(f"\n✅ Vision analysis complete ({len(to_analyze)} images)")
+    
+    return listings
+
+
+# ==============================================================================
+# COST TRACKING & BUDGET MANAGEMENT
+# ==============================================================================
+
+def reset_run_cost():
+    """Reset run cost counter."""
+    global RUN_COST_USD
+    RUN_COST_USD = 0.0
+
+
+def add_cost(amount: float):
+    """Add cost to run total."""
+    global RUN_COST_USD
+    RUN_COST_USD += amount
+
+
+def get_run_cost_summary() -> Tuple[float, str]:
+    """Get summary of current run cost.
+    
+    Returns:
+        Tuple of (run_cost_usd, date_string)
+    """
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    return (RUN_COST_USD, today)
+
+
+def get_day_cost_summary() -> float:
+    """Get today's total cost as float."""
+    try:
+        if os.path.exists(DAY_COST_FILE):
+            with open(DAY_COST_FILE, "r") as f:
+                content = f.read().strip()
+                if "," in content:
+                    date_str, cost_str = content.split(",", 1)
+                    today = datetime.datetime.now().strftime("%Y-%m-%d")
+                    if date_str == today:
+                        return float(cost_str)
+                    return 0.0  # Different day, reset
+                return float(content)  # Legacy format
+    except:
+        pass
+    return 0.0
+
+
+def save_day_cost() -> float:
+    """
+    v7.3.5 FIX: Save current run cost to daily total file.
+    
+    This was MISSING before - day costs were never persisted!
+    Now stores format: "YYYY-MM-DD,total_cost"
+    
+    Returns: New daily total
+    """
+    global RUN_COST_USD
+    try:
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        existing = 0.0
+        
+        # Read existing costs for today
+        if os.path.exists(DAY_COST_FILE):
+            with open(DAY_COST_FILE, "r") as f:
+                content = f.read().strip()
+                if "," in content:
+                    date_str, cost_str = content.split(",", 1)
+                    if date_str == today:
+                        existing = float(cost_str)
+                    # else: different day, start fresh
+        
+        # Add this run's cost
+        new_total = existing + RUN_COST_USD
+        
+        # Save with date prefix
+        with open(DAY_COST_FILE, "w") as f:
+            f.write(f"{today},{new_total:.4f}")
+        
+        print(f"💾 Saved day cost: ${new_total:.4f} (this run: ${RUN_COST_USD:.4f})")
+        return new_total
+    except Exception as e:
+        print(f"⚠️ Could not save day cost: {e}")
+        return 0.0
+
+
+def is_budget_exceeded() -> bool:
+    """Check if daily budget is exceeded."""
+    day_cost = get_day_cost_summary()
+    return day_cost >= DAILY_COST_LIMIT
+
+
+def apply_config(config):
+    """Apply configuration from config dict or config object."""
+    global RICARDO_FEE_PERCENT, SHIPPING_COST_CHF, MIN_PROFIT_THRESHOLD
+    global BUNDLE_ENABLED, BUNDLE_DISCOUNT_PERCENT, BUNDLE_MIN_COMPONENT_VALUE
+    global CACHE_ENABLED, USE_VISION, VISION_RATE, DEFAULT_CAR_MODEL
+    global WEB_SEARCH_ENABLED  # v7.3.2: Toggle expensive web search
+    
+    # Handle both dict and object config
+    def get_val(key, default=None):
+        if isinstance(config, dict):
+            return config.get(key, default)
+        return getattr(config, key, default)
+    
+    # Try to get values from general section first, then direct
+    def get_nested(section, key, default=None):
+        if isinstance(config, dict):
+            sec = config.get(section, {})
+            if isinstance(sec, dict):
+                return sec.get(key, default)
+            return getattr(sec, key, default)
+        sec = getattr(config, section, None)
+        if sec:
+            return getattr(sec, key, default)
+        return getattr(config, key, default)
+    
+    val = get_nested("general", "ricardo_fee_percent", None)
+    if val is not None:
+        RICARDO_FEE_PERCENT = val
+    val = get_nested("general", "shipping_cost_chf", None)
+    if val is not None:
+        SHIPPING_COST_CHF = val
+    val = get_nested("general", "min_profit_threshold", None)
+    if val is not None:
+        MIN_PROFIT_THRESHOLD = val
+    val = get_nested("bundle", "enabled", None)
+    if val is not None:
+        BUNDLE_ENABLED = val
+    val = get_nested("bundle", "discount_percent", None)
+    if val is not None:
+        BUNDLE_DISCOUNT_PERCENT = val
+    val = get_nested("bundle", "min_component_value", None)
+    if val is not None:
+        BUNDLE_MIN_COMPONENT_VALUE = val
+    val = get_nested("cache", "enabled", None)
+    if val is not None:
+        CACHE_ENABLED = val
+    val = get_nested("ai", "use_vision", None)
+    if val is not None:
+        USE_VISION = val
+    val = get_nested("ai", "vision_rate", None)
+    if val is not None:
+        VISION_RATE = val
+    val = get_nested("general", "car_model", None)
+    if val is not None:
+        DEFAULT_CAR_MODEL = val
+    
+    # v7.3.2: Read web search enabled setting from ai.web_search.enabled
+    if isinstance(config, dict):
+        ai_section = config.get("ai", {})
+        if isinstance(ai_section, dict):
+            ws_section = ai_section.get("web_search", {})
+            if isinstance(ws_section, dict):
+                val = ws_section.get("enabled", None)
+                if val is not None:
+                    WEB_SEARCH_ENABLED = val
+                    status = "ENABLED ✅" if val else "DISABLED ❌ (cost saving mode)"
+                    print(f"  Web Search:       {status}")
+
+
+def apply_ai_budget_from_cfg(config):
+    """Apply AI budget settings from config object or dict."""
+    global DAILY_COST_LIMIT, DAILY_VISION_LIMIT, DAILY_WEB_SEARCH_LIMIT
+    
+    # Handle both dict and object config
+    def get_val(key, default=None):
+        if isinstance(config, dict):
+            return config.get(key, default)
+        return getattr(config, key, default)
+    
+    val = get_val("daily_cost_limit", None)
+    if val is not None:
+        DAILY_COST_LIMIT = val
+    val = get_val("daily_vision_limit", None)
+    if val is not None:
+        DAILY_VISION_LIMIT = val
+    val = get_val("daily_web_search_limit", None)
+    if val is not None:
+        DAILY_WEB_SEARCH_LIMIT = val
+
+
+def clear_all_caches():
+    """Clear all cache files."""
+    global _variant_cache, _component_cache, _cluster_cache, _web_price_cache, _category_threshold_cache
+    
+    _variant_cache = {}
+    _component_cache = {}
+    _cluster_cache = {}
+    _web_price_cache = {}
+    _category_threshold_cache = {}
+    
+    for cache_file in [VARIANT_CACHE_FILE, COMPONENT_CACHE_FILE, CLUSTER_CACHE_FILE, 
+                       WEB_PRICE_CACHE_FILE, CATEGORY_THRESHOLD_CACHE_FILE]:
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+            print(f"🗑️ Cleared: {cache_file}")
+
+
+# ==============================================================================
 # HELPER FOR MAIN.PY COMPATIBILITY
 # ==============================================================================
+
+def cluster_variants_from_titles(
+    titles: List[str],
+    base_product: str,
+    query_analysis: Optional[Dict] = None,
+) -> Dict[str, Any]:
+    """Cluster variant titles into groups.
+    
+    Returns:
+        {
+            "variants": {"variant_key": ["title1", "title2", ...]},
+            "base_product": str,
+        }
+    """
+    if not titles:
+        return {"variants": {}, "base_product": base_product}
+    
+    _load_caches()
+    
+    # Check cache
+    cache_key = f"{base_product}_{len(titles)}"
+    if cache_key in _cluster_cache:
+        cached = _cluster_cache[cache_key]
+        if cached.get("expires_at", "") > datetime.datetime.now().isoformat():
+            print(f"   💾 Cluster cache hit: {len(cached.get('variants', {}))} variants")
+            return cached
+    
+    # Simple clustering: group by exact title match
+    variants = {}
+    for title in titles:
+        # Use title as variant key (simplified)
+        variant_key = title.strip()
+        if variant_key not in variants:
+            variants[variant_key] = []
+        variants[variant_key].append(title)
+    
+    result = {
+        "variants": variants,
+        "base_product": base_product,
+    }
+    
+    # Cache for 7 days
+    now = datetime.datetime.now()
+    expires = now + datetime.timedelta(days=CLUSTER_CACHE_DAYS)
+    _cluster_cache[cache_key] = {
+        **result,
+        "cached_at": now.isoformat(),
+        "expires_at": expires.isoformat(),
+    }
+    _save_cluster_cache()
+    
+    print(f"   🔍 Clustered {len(titles)} titles into {len(variants)} variants")
+    return result
+
+
+def get_variant_for_title(title: str, cluster_result: Dict[str, Any], base_product: str) -> str:
+    """Get variant key for a title from cluster result."""
+    if not title or not cluster_result:
+        return base_product
+    
+    variants = cluster_result.get("variants", {})
+    
+    # Find which variant this title belongs to
+    for variant_key, titles in variants.items():
+        if title in titles:
+            return variant_key
+    # Fallback: use title as variant key
+    return title.strip() or base_product
+
+
+def to_float(val: Any) -> Optional[float]:
+    """Safely convert value to float."""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
 
 def get_lowest_variant_resale(base_product: str) -> Optional[float]:
     """Get lowest resale price for any variant of a product."""
@@ -2244,3 +2734,6 @@ def get_lowest_variant_resale(base_product: str) -> Optional[float]:
         and info.get("resale_price", 0) > 0
     ]
     return round(min(prices), 2) if prices else None
+
+
+# ... (rest of the code remains the same)

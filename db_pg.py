@@ -36,52 +36,87 @@ import json
 
 # All columns that should exist in the listings table
 # Format: (column_name, column_type, default_value_or_None)
+# v7.3.5: OPTIMIZED COLUMN ORDER - Logically grouped for SELECT * readability
 LISTINGS_COLUMNS = [
+    # ========================================================================
+    # GROUP 1: IDENTIFICATION (Most important for joins/lookups)
+    # ========================================================================
     ("id", "SERIAL PRIMARY KEY", None),
     ("platform", "TEXT NOT NULL", None),
     ("listing_id", "TEXT NOT NULL", None),
     ("title", "TEXT", None),
-    ("description", "TEXT", None),
+    ("variant_key", "TEXT", None),
+    
+    # ========================================================================
+    # GROUP 2: PRICES & PROFIT (Most important for analysis!)
+    # ========================================================================
+    ("buy_now_price", "NUMERIC", None),
+    ("current_price_ricardo", "NUMERIC", None),
+    ("predicted_final_price", "NUMERIC", None),
+    ("new_price", "NUMERIC", None),
+    ("resale_price_est", "NUMERIC", None),
+    ("resale_price_bundle", "NUMERIC", None),
+    ("expected_profit", "NUMERIC", None),
+    ("market_value", "NUMERIC", None),
+    ("buy_now_ceiling", "NUMERIC", None),
+    ("shipping_cost", "NUMERIC", None),
+    ("price_source", "TEXT", None),
+    
+    # ========================================================================
+    # GROUP 3: DEAL EVALUATION
+    # ========================================================================
+    ("deal_score", "NUMERIC", None),
+    ("recommended_strategy", "TEXT", None),
+    ("strategy_reason", "TEXT", None),
+    ("market_based_resale", "BOOLEAN", "FALSE"),
+    ("market_sample_size", "INTEGER", None),
+    
+    # ========================================================================
+    # GROUP 4: BUNDLE INFO
+    # ========================================================================
+    ("is_bundle", "BOOLEAN", "FALSE"),
+    ("bundle_components", "JSONB", None),
+    
+    # ========================================================================
+    # GROUP 5: AUCTION INFO
+    # ========================================================================
+    ("bids_count", "INTEGER", None),
+    ("hours_remaining", "FLOAT", None),
+    ("end_time", "TIMESTAMP", None),
+    
+    # ========================================================================
+    # GROUP 6: LOCATION & TRANSPORT
+    # ========================================================================
     ("location", "TEXT", None),
     ("postal_code", "TEXT", None),
     ("shipping", "TEXT", None),
     ("transport_car", "BOOLEAN", None),
-    ("end_time", "TIMESTAMP", None),
-    ("image_url", "TEXT", None),
-    ("url", "TEXT", None),
-    ("detected_product", "TEXT", None),
-    ("ai_notes", "TEXT", None),
-    ("buy_now_price", "NUMERIC", None),
-    ("current_price_ricardo", "NUMERIC", None),
-    ("bids_count", "INTEGER", None),
-    ("new_price", "NUMERIC", None),
-    ("resale_price_est", "NUMERIC", None),
-    ("expected_profit", "NUMERIC", None),
-    ("deal_score", "NUMERIC", None),
+    ("pickup_available", "BOOLEAN", None),
+    ("seller_rating", "INTEGER", None),
+    
+    # ========================================================================
+    # GROUP 7: METADATA (v7.3.5 NEW)
+    # ========================================================================
+    ("run_id", "TEXT", None),                # NEW: Which run created this?
+    ("web_search_used", "BOOLEAN", None),    # NEW: Was web search used?
+    ("cache_hit", "BOOLEAN", None),          # NEW: Was it a cache hit?
+    ("ai_cost_usd", "NUMERIC", None),        # NEW: AI cost for this listing
+    ("vision_used", "BOOLEAN", None),        # NEW: Was vision/image analysis used?
+    ("cleaned_title", "TEXT", None),         # NEW: Title after cleanup for search
+    
+    # ========================================================================
+    # GROUP 8: TIMESTAMPS
+    # ========================================================================
     ("created_at", "TIMESTAMP", "NOW()"),
     ("updated_at", "TIMESTAMP", "NOW()"),
-    # v4.x fields
-    ("variant_key", "TEXT", None),
-    ("predicted_final_price", "NUMERIC", None),
-    ("prediction_confidence", "FLOAT", None),
-    # v5.0 Bundle fields
-    ("is_bundle", "BOOLEAN", "FALSE"),
-    ("bundle_components", "JSONB", None),
-    ("resale_price_bundle", "NUMERIC", None),
-    ("recommended_strategy", "TEXT", None),
-    ("strategy_reason", "TEXT", None),
-    # v5.0 Market tracking
-    ("market_based_resale", "BOOLEAN", "FALSE"),
-    ("market_sample_size", "INTEGER", None),
-    # v6.0 New fields
-    ("market_value", "NUMERIC", None),
-    ("price_source", "TEXT", None),
-    ("buy_now_ceiling", "NUMERIC", None),
-    ("hours_remaining", "FLOAT", None),
-    # v7.0 Detail page fields
-    ("seller_rating", "INTEGER", None),      # NEW: Seller rating %
-    ("shipping_cost", "NUMERIC", None),      # NEW: Shipping cost CHF
-    ("pickup_available", "BOOLEAN", None),   # NEW: Pickup available
+    
+    # ========================================================================
+    # GROUP 9: LONG TEXT & URLs (Last for SELECT * readability)
+    # ========================================================================
+    ("description", "TEXT", None),
+    ("ai_notes", "TEXT", None),
+    ("image_url", "TEXT", None),
+    ("url", "TEXT", None),
 ]
 
 # Columns to skip when checking (they are part of constraints, not addable)
@@ -140,6 +175,7 @@ def get_existing_columns(conn, table_name: str) -> set:
 def ensure_schema(conn):
     """
     Creates tables if not exist and adds missing columns.
+    v7.3.5: Optimized column order + added run_id, web_search_used, cache_hit, ai_cost_usd.
     v7.0: Added seller_rating, shipping_cost, pickup_available columns.
     """
     with conn.cursor() as cur:
@@ -244,10 +280,13 @@ def ensure_schema(conn):
             CREATE INDEX IF NOT EXISTS idx_price_history_time ON price_history(observed_at);
             CREATE INDEX IF NOT EXISTS idx_component_cache_name ON component_cache(component_name);
             CREATE INDEX IF NOT EXISTS idx_market_data_variant ON market_data(variant_key);
+            CREATE INDEX IF NOT EXISTS idx_listings_run_id ON listings(run_id);
+            CREATE INDEX IF NOT EXISTS idx_listings_price_source ON listings(price_source);
+            CREATE INDEX IF NOT EXISTS idx_listings_created_at ON listings(created_at DESC);
         """)
         
         conn.commit()
-        print("✅ DB schema ready (v7.0 with detail page fields)")
+        print("✅ DB schema ready (v7.3.5 - optimized column order + new metadata fields)")
 
 
 def clear_listings(conn):
@@ -277,14 +316,15 @@ def clear_listings(conn):
 def upsert_listing(conn, data: Dict[str, Any]):
     """
     Inserts or updates a listing.
+    v7.3.5: Added run_id, web_search_used, cache_hit, ai_cost_usd fields.
     v7.0: Added seller_rating, shipping_cost, pickup_available fields.
     """
     fields = [
         "platform", "listing_id", "title", "description", "location", "postal_code",
         "shipping", "transport_car", "end_time", "image_url", "url",
-        "detected_product", "ai_notes", "buy_now_price", "current_price_ricardo",
+        "ai_notes", "buy_now_price", "current_price_ricardo",
         "bids_count", "new_price", "resale_price_est", "expected_profit",
-        "deal_score", "variant_key", "predicted_final_price", "prediction_confidence",
+        "deal_score", "variant_key", "predicted_final_price",
         # v5.0 fields
         "is_bundle", "bundle_components", "resale_price_bundle",
         "recommended_strategy", "strategy_reason",
@@ -293,6 +333,10 @@ def upsert_listing(conn, data: Dict[str, Any]):
         "market_value", "price_source", "buy_now_ceiling", "hours_remaining",
         # v7.0 fields
         "seller_rating", "shipping_cost", "pickup_available",
+        # v7.3.5 fields
+        "run_id", "web_search_used", "cache_hit", "ai_cost_usd",
+        # v9.0 fields
+        "vision_used", "cleaned_title",
     ]
 
     # Convert bundle_components dict to JSON string if present

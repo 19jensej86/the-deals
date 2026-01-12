@@ -292,7 +292,13 @@ Analysiere JEDEN Suchbegriff und gib mir folgende Informationen:
 
 10. **auction_typical_multiplier**: Um welchen Faktor steigt ein Auktionspreis typischerweise?
 
-11. **notes**: Kurze Notizen/Tipps für diese Produktkategorie
+11. **search_term_cleanup**: Regeln zum Bereinigen von Listing-Titeln für die Web-Suche:
+    - "remove_after": Liste von Wörtern, nach denen der Rest abgeschnitten wird (z.B. ["inkl", "mit", "+", "und", "NEU", "OVP"])
+    - "remove_words": Wörter die komplett entfernt werden sollen (z.B. ["gebraucht", "neuwertig", "Top-Zustand"])
+    - "keep_parts": Welche Teile behalten? (z.B. "brand_model" = nur Marke+Modell)
+    Beispiel: "Garmin Fenix 6 Smartwatch inkl. Zubehör" → "Garmin Fenix 6"
+
+12. **notes**: Kurze Notizen/Tipps für diese Produktkategorie
 
 Antworte NUR als gültiges JSON:
 {{
@@ -307,6 +313,11 @@ Antworte NUR als gültiges JSON:
     "accessory_keywords": ["...", "..."],
     "defect_keywords": ["...", "..."],
     "auction_typical_multiplier": X.X,
+    "search_term_cleanup": {{
+      "remove_after": ["inkl", "mit", "+", "und", "NEU"],
+      "remove_words": ["gebraucht", "neuwertig"],
+      "keep_parts": "brand_model"
+    }},
     "notes": "..."
   }},
   ...
@@ -388,6 +399,11 @@ def _validate_analysis(analysis: Dict, query: str) -> Dict[str, Any]:
         "accessory_keywords": analysis.get("accessory_keywords", []),
         "defect_keywords": analysis.get("defect_keywords", ["defekt", "kaputt", "bastler"]),
         "auction_typical_multiplier": float(analysis.get("auction_typical_multiplier", 5.0)),
+        "search_term_cleanup": analysis.get("search_term_cleanup", {
+            "remove_after": ["inkl", "mit", "+", "und", "NEU", "OVP", "TOP"],
+            "remove_words": ["gebraucht", "neuwertig", "Top-Zustand", "wie neu"],
+            "keep_parts": "brand_model"
+        }),
         "notes": analysis.get("notes", ""),
     }
     
@@ -412,29 +428,6 @@ def _validate_analysis(analysis: Dict, query: str) -> Dict[str, Any]:
         validated["spelling_variants"].append(query.lower())
     
     return validated
-
-
-def _create_default_analysis(query: str) -> Dict[str, Any]:
-    """Creates a default analysis for a query."""
-    return {
-        "category": "unknown",
-        "resale_rate": 0.40,
-        "min_realistic_price": 10.0,
-        "typical_new_price_range": [50, 500],
-        "new_price_estimate": 275.0,
-        "bundle_common": False,
-        "needs_vision_for_bundles": False,
-        "spelling_variants": [query.lower()],
-        "accessory_keywords": [],
-        "defect_keywords": ["defekt", "kaputt", "bastler", "ersatzteil"],
-        "auction_typical_multiplier": 5.0,
-        "notes": "Default analysis - no specific data",
-    }
-
-
-def _create_fallback_analysis(queries: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Creates fallback analysis for all queries when AI fails."""
-    return {q: _create_default_analysis(q) for q in queries}
 
 
 def get_query_analysis(query: str) -> Optional[Dict[str, Any]]:
@@ -522,3 +515,69 @@ def get_defect_keywords(query_analysis: Optional[Dict] = None) -> List[str]:
     if query_analysis:
         return query_analysis.get("defect_keywords", ["defekt", "kaputt", "bastler"])
     return ["defekt", "kaputt", "bastler"]
+
+
+def get_search_term_cleanup(query_analysis: Optional[Dict] = None) -> Dict[str, Any]:
+    """Gets search term cleanup rules from query analysis."""
+    default = {
+        "remove_after": ["inkl", "mit", "+", "und", "NEU", "OVP", "TOP", "!"],
+        "remove_words": ["gebraucht", "neuwertig", "Top-Zustand", "wie neu", "original"],
+        "keep_parts": "brand_model"
+    }
+    if query_analysis:
+        return query_analysis.get("search_term_cleanup", default)
+    return default
+
+
+def clean_search_term(title: str, query_analysis: Optional[Dict] = None) -> str:
+    """
+    v7.3.3: Clean a listing title to create a better web search term.
+    
+    Example:
+        "Garmin Fenix 6 Smartwatch inkl. Zubehör" -> "Garmin Fenix 6"
+        "Tommy hilfiger Jeans 32/32 straight Ryan" -> "Tommy Hilfiger Jeans"
+    """
+    cleanup = get_search_term_cleanup(query_analysis)
+    
+    # Start with original title
+    clean = title.strip()
+    
+    # Step 1: Remove everything after certain keywords
+    remove_after = cleanup.get("remove_after", [])
+    for keyword in remove_after:
+        # Case-insensitive search
+        lower_clean = clean.lower()
+        kw_lower = keyword.lower()
+        
+        # Find position (with word boundary for short keywords)
+        if len(keyword) <= 2:  # Short keywords like "+" 
+            pos = clean.find(keyword)
+        else:
+            pos = lower_clean.find(kw_lower)
+        
+        if pos > 5:  # Keep at least some characters
+            clean = clean[:pos].strip()
+    
+    # Step 2: Remove specific words
+    remove_words = cleanup.get("remove_words", [])
+    for word in remove_words:
+        # Case-insensitive word removal
+        import re
+        clean = re.sub(rf'\b{re.escape(word)}\b', '', clean, flags=re.IGNORECASE)
+    
+    # Step 3: Clean up whitespace and punctuation
+    clean = re.sub(r'\s+', ' ', clean)  # Multiple spaces to single
+    clean = re.sub(r'[!?.,;:]+$', '', clean)  # Remove trailing punctuation
+    clean = clean.strip()
+    
+    # Step 4: Remove size/quantity info at end (e.g., "32/32", "Gr.30")
+    clean = re.sub(r'\s+\d+[/x]\d+\s*$', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'\s+Gr\.?\s*\d+\s*$', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'\s+Grösse\s*\d+\s*$', '', clean, flags=re.IGNORECASE)
+    
+    # Step 5: Limit to reasonable length (first 5-6 significant words)
+    words = clean.split()
+    if len(words) > 6:
+        clean = ' '.join(words[:6])
+    
+    return clean.strip()
