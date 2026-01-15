@@ -460,10 +460,35 @@ def search_web_batch_for_new_prices(
         # "Garmin Fenix 6 Smartwatch inkl. Zubehör" → "Garmin Fenix 6"
         cleaned_terms = []
         for idx, vk in enumerate(batch):
-            clean = clean_search_term(vk, query_analysis)
-            cleaned_terms.append((idx, vk, clean))
-            if clean != vk:
-                print(f"   🔧 Cleaned: '{vk[:40]}' → '{clean}'")
+            # CRITICAL: Sanitize variant_key BEFORE cleaning
+            # AI bundle detection can return names like "Hantelscheiben {'4x10kg': True}"
+            # Step 1: Normalize to string
+            vk_str = str(vk) if vk else ""
+            if not vk_str.strip():
+                continue
+            
+            # Step 2: Remove stringified dict/list artifacts using regex
+            import re
+            vk_str = re.sub(r'\{[^}]*\}', '', vk_str)  # Remove {...}
+            vk_str = re.sub(r'\[[^\]]*\]', '', vk_str)  # Remove [...]
+            
+            # Step 3: Normalize whitespace
+            vk_str = re.sub(r'\s+', ' ', vk_str).strip()
+            
+            # Step 4: Skip if empty after sanitization
+            if not vk_str:
+                print(f"   ⚠️ Skipping empty variant_key after sanitization")
+                continue
+            
+            # Step 5: Apply clean_search_term for additional normalization
+            clean = clean_search_term(vk_str, query_analysis)
+            cleaned_terms.append((idx, vk_str, clean))
+            if clean != vk_str:
+                print(f"   🔧 Cleaned: '{vk_str[:40]}' → '{clean}'")
+        
+        # OBSERVABILITY: Log websearch input for debugging
+        for idx, vk_original, clean_query in cleaned_terms:
+            print(f"   🔎 Websearch input: product='{clean_query}' | query=\"{clean_query}\"")
         
         product_list = "\n".join([f"{idx+1}. {clean}" for idx, vk, clean in cleaned_terms])
         
@@ -538,24 +563,6 @@ Bei unbekannt: price=null, conf=0"""
             print(f"   ⚠️ Batch web search failed: {e}")
     
     return results
-
-
-def search_web_for_new_price(
-    variant_key: str,
-    search_terms: List[str],
-    category: str = "unknown"
-) -> Optional[Dict[str, Any]]:
-    """
-    v7.0: Single product web search (legacy, now uses batch internally).
-    """
-    # Check cache first
-    cached = get_cached_web_price(variant_key)
-    if cached:
-        return cached
-    
-    # Use batch function for single item
-    results = search_web_batch_for_new_prices([variant_key], category)
-    return results.get(variant_key)
 
 
 # ==============================================================================
@@ -1732,9 +1739,10 @@ Antworte NUR als JSON:
                 result["components"] = parsed.get("components", [])
                 result["confidence"] = parsed.get("confidence", 0.5)
     except Exception as e:
-        print(f"⚠️ Bundle detection failed: {e}")
+        pass  # Return default result on error
     
     return result
+
 
 def price_bundle_components(
     components: List[Dict[str, Any]],
@@ -1742,29 +1750,26 @@ def price_bundle_components(
     context=None,
     ua: str = None,
     query_analysis: Optional[Dict] = None,
+    pre_fetched_prices: Optional[Dict[str, Dict]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Price individual bundle components with smart estimation.
     
-    v7.3.5: NOW WITH WEB SEARCH! 
-    - Uses web search for each component (with cache!)
-    - Falls back to AI estimation if web search fails
-    - Cache means repeated components are FREE!
+    v7.4: Uses PRE-FETCHED prices from PRICE_FETCHING phase (OBJECTIVE B)
+    - No web search during evaluation (cost optimization!)
+    - Falls back to AI estimation if price not available
+    - Pre-fetched prices come from fetch_variant_info_batch()
     
     Example: "Olympiastange + 3× Kurzhantel + 2× 5kg Gusseisen"
-    → 3 web searches (cached for future bundles)
+    → Uses prices fetched in PRICE_FETCHING phase
     → Much more accurate than AI guessing!
     """
     priced = []
     resale_rate = _get_resale_rate(query_analysis)
     category = _get_category(query_analysis)
     
-    # v7.3.5: Collect all component names for batch web search
-    component_names = [comp.get("name", "Unknown") for comp in components]
-    
-    # v7.3.5: Batch web search for all components (with cache check!)
-    print(f"   Searching prices for {len(component_names)} bundle components...")
-    web_prices = search_web_batch_for_new_prices(component_names, category, query_analysis)
+    # Use pre-fetched prices from PRICE_FETCHING phase
+    web_prices = pre_fetched_prices or {}
     
     for comp in components:
         name = comp.get("name", "Unknown")
@@ -1775,18 +1780,23 @@ def price_bundle_components(
             except:
                 qty = 1
         
-        # v7.3.5: Try web search first (with cache!)
+        # Try pre-fetched price first
         web_result = web_prices.get(name)
         if web_result and web_result.get("new_price"):
             est_new = web_result["new_price"]
-            price_source = "web_search"
-            print(f"      {name}: {est_new} CHF (web)")
+            price_source = "pre_fetched"
+            print(f"      {name}: {est_new} CHF (pre-fetched)")
         else:
             # Fallback: AI estimation
             est_new = _estimate_component_price(name, category, query_analysis)
             est_new = _adjust_price_for_model_year(name, est_new, category)
             price_source = "ai_estimate"
             print(f"      {name}: {est_new} CHF (AI fallback)")
+        
+        # Guard: Skip component if price estimation failed
+        if est_new is None or est_new <= 0:
+            print(f"      ⚠️ {name}: Price unavailable, skipping component")
+            continue
         
         # Calculate resale with category-aware rate
         component_resale_rate = _get_component_resale_rate(name, category, resale_rate)
@@ -2006,26 +2016,26 @@ def determine_strategy(expected_profit: float, is_auction: bool, has_buy_now: bo
     bids = bids_count or 0
     
     if profit < MIN_PROFIT_THRESHOLD:
-        return ("skip", f"Profit {profit:.0f} CHF unter Minimum ({MIN_PROFIT_THRESHOLD:.0f})")
+        return ("skip", f"Profit {profit:.0f} CHF below minimum ({MIN_PROFIT_THRESHOLD:.0f})")
     if has_buy_now and profit >= 80:
-        return ("buy_now", f"🔥 Sofort kaufen! Profit {profit:.0f} CHF")
+        return ("buy_now", f"🔥 Buy now! Profit {profit:.0f} CHF")
     if has_buy_now and profit >= 40:
-        return ("buy_now", f"Kaufen empfohlen, Profit {profit:.0f} CHF")
+        return ("buy_now", f"Buy recommended, profit {profit:.0f} CHF")
     if is_auction:
         if bids >= 15:
-            return ("watch", f"⚠️ Heiss umkämpft ({bids} Gebote)")
+            return ("watch", f"⚠️ Highly contested ({bids} bids)")
         if hours < 2 and profit >= 40:
-            return ("bid_now", f"🔥 Endet bald! Max {profit:.0f} CHF Profit möglich")
+            return ("bid_now", f"🔥 Ending soon! Max {profit:.0f} CHF profit possible")
         if hours < 6 and profit >= 30:
-            return ("bid", f"Bieten empfohlen, endet in {hours:.0f}h")
+            return ("bid", f"Bid recommended, ends in {hours:.0f}h")
         if hours < 24 and profit >= 40:
-            return ("bid", f"Heute bieten, Profit {profit:.0f} CHF")
+            return ("bid", f"Bid today, profit {profit:.0f} CHF")
         if profit >= 60:
-            return ("watch", f"Beobachten, guter Profit ({profit:.0f} CHF)")
-        return ("watch", f"Beobachten, {hours:.0f}h verbleibend")
+            return ("watch", f"Watch, good profit ({profit:.0f} CHF)")
+        return ("watch", f"Watch, {hours:.0f}h remaining")
     if profit >= 30:
-        return ("watch", f"Anfragen, Profit {profit:.0f} CHF")
-    return ("watch", f"Beobachten, Profit {profit:.0f} CHF")
+        return ("watch", f"Inquire, profit {profit:.0f} CHF")
+    return ("watch", f"Watch, profit {profit:.0f} CHF")
 
 
 def calculate_deal_score(expected_profit: float, purchase_price: float, resale_price: Optional[float], bids_count: Optional[int] = None, hours_remaining: Optional[float] = None, is_auction: bool = True, has_variant_key: bool = True, market_based_resale: bool = False, is_bundle: bool = False) -> float:
@@ -2080,7 +2090,6 @@ def calculate_deal_score(expected_profit: float, purchase_price: float, resale_p
         elif bids >= 10:
             score += 0.3
     
-    return max(0.0, min(10.0, round(score, 1)))
 
 # MAIN EVALUATION FUNCTION
 # ==============================================================================
@@ -2101,6 +2110,7 @@ def evaluate_listing_with_ai(
     ua: str = None,
     query_analysis: Optional[Dict] = None,
     batch_bundle_result: Optional[Dict] = None,
+    variant_info_by_key: Optional[Dict[str, Dict]] = None,
 ) -> Dict[str, Any]:
     """
     v7.0: Main evaluation function with Claude-based AI.
@@ -2216,6 +2226,7 @@ def evaluate_listing_with_ai(
                 context=context,
                 ua=ua,
                 query_analysis=query_analysis,
+                pre_fetched_prices=variant_info_by_key,
             )
             result["bundle_components"] = priced
             

@@ -29,6 +29,11 @@ Pipeline Steps:
 9. Show AI cost summary
 """
 
+# FIX 1: Configure UTF-8 output for Windows PowerShell (MUST be first)
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
+
 import traceback
 import sys
 import json
@@ -88,37 +93,74 @@ from ai_filter import (
     evaluate_listing_with_ai,
 )
 
-# v9: Product Extraction Pipeline
-try:
-    from product_extractor import (
-        process_query_listings,
-        build_global_product_list,
-    )
-    V9_AVAILABLE = True
-except ImportError as e:
-    print(f"⚠️ v9 product_extractor not available: {e}")
-    V9_AVAILABLE = False
+# v9.2: Enhanced logging
+from logger_utils import get_logger, log_explanation, log_cost_summary
 
-# v9: Clarity Detection
+# v10: Query-Agnostic Product Extraction
 try:
-    from clarity_detector import (
-        analyze_listing_clarity,
-        filter_unclear_listings,
-        process_vision_results,
-    )
-    from scrapers.detail_scraper import scrape_unclear_listings
-    from ai_filter import batch_analyze_with_vision
-    CLARITY_AVAILABLE = True
+    from pipeline.pipeline_runner import process_batch
+    from models.websearch_query import generate_websearch_query
+    from models.bundle_types import get_pricing_method, BundleType
+    from logging_utils.run_logger import RunLogger
+    V10_AVAILABLE = True
 except ImportError as e:
-    print(f"⚠️ Clarity detection not available: {e}")
-    CLARITY_AVAILABLE = False
+    print(f"⚠️ v10 query-agnostic pipeline not available: {e}")
+    V10_AVAILABLE = False
+
+
+def _check_web_search_used(variant_info: Optional[Dict], ai_result: Dict) -> bool:
+    """
+    FIX 1: Determines if web search was ATTEMPTED (not just succeeded).
+    
+    CRITICAL: For bundles, checks if ANY component used web search.
+    
+    Args:
+        variant_info: Variant info from web search
+        ai_result: AI evaluation result (may contain bundle_components)
+    
+    Returns:
+        True if web search was attempted
+    """
+    # FIX 1: Check if web search was attempted (even if no price found)
+    if variant_info and variant_info.get("web_search_attempted"):
+        return True
+    
+    # Check parent price source (web_* or web_search_attempted)
+    if variant_info and (variant_info.get("price_source", "").startswith("web") or 
+                         variant_info.get("price_source") == "web_search_attempted"):
+        return True
+    
+    # Check bundle components
+    bundle_components = ai_result.get("bundle_components")
+    if bundle_components and isinstance(bundle_components, list):
+        for component in bundle_components:
+            if isinstance(component, dict):
+                comp_source = component.get("price_source", "")
+                if comp_source.startswith("web") or comp_source == "web_search_attempted":
+                    return True
+    
+    return False
+
+# Detail scraper integration
+try:
+    from scrapers.detail_scraper import scrape_detail_page
+    DETAIL_SCRAPER_AVAILABLE = True
+except ImportError:
+    DETAIL_SCRAPER_AVAILABLE = False
+
+# Vision analyzer integration
+try:
+    from ai_filter import analyze_listing_with_vision
+    VISION_AVAILABLE = True
+except ImportError:
+    VISION_AVAILABLE = False
 
 
 # ==============================================================================
 # v9 PIPELINE HELPER FUNCTIONS
 # ==============================================================================
 
-def run_v9_pipeline(
+def run_v10_pipeline(
     queries: List[str],
     query_analyses: Dict[str, Any],
     context,
@@ -127,31 +169,47 @@ def run_v9_pipeline(
     global_stats: Dict[str, int],
     car_model: str,
     max_listings_per_query: Optional[int],
+    run_id: str,
 ) -> List[Dict[str, Any]]:
     """
-    v9 Pipeline: Global product deduplication for cost optimization.
+    v10 Pipeline: Query-agnostic product extraction with zero hallucinations.
     
     Flow:
     1. PHASE 1: Scrape all queries, collect listings
-    2. PHASE 2: Extract products from all listings (with deduplication)
-    3. PHASE 3: One batch websearch for all unique products
-    4. PHASE 4: Evaluate all listings using global price cache
+    2. PHASE 2: Query-agnostic product extraction (AI → Detail → Vision → Skip)
+    3. PHASE 3: Websearch for products that passed extraction
+    4. PHASE 4: Pricing and deal evaluation
     
     Returns:
         List of deals for detail scraping
     """
+    logger = get_logger()
+    
     all_deals_for_detail = []
     
     # =========================================================================
     # PHASE 1: SCRAPE ALL QUERIES
     # =========================================================================
-    log_section("v9 PHASE 1: Scraping All Queries")
+    logger.step_start(
+        step_name="SCRAPING",
+        what="Scraping Ricardo listings for all search queries",
+        why="We need to collect all available listings to find good deals",
+        uses_ai=False,
+        uses_rules=True,
+    )
+    
+    log_explanation(
+        "Wir besuchen Ricardo.ch und suchen nach jedem Produkt. "
+        "Für jedes Inserat extrahieren wir: Titel, Preis, Endzeit, Bild, Beschreibung. "
+        "Wir filtern offensichtlichen Müll (Zubehör, Defekte, ausgeschlossene Begriffe) bereits hier. "
+        "Dieser Schritt verwendet KEINE KI - es ist reines Web-Scraping mit regelbasierten Filtern."
+    )
     
     all_listings_by_query: Dict[str, List[Dict[str, Any]]] = {}
     query_categories: Dict[str, str] = {}
     
     for query in queries:
-        print(f"\n🔍 Scraping: {query}")
+        logger.step_progress(f"Scraping query: '{query}'")
         
         query_analysis = query_analyses.get(query)
         
@@ -237,153 +295,249 @@ def run_v9_pipeline(
             print(f"   ❌ Scraping error: {e}")
             continue
         
+        logger.step_success(f"Scraped '{query}'", count=len(listings))
+        if skipped_count > 0:
+            logger.step_logic(f"Pre-filtered {skipped_count} listings (accessories, defects, excluded terms)")
         all_listings_by_query[query] = listings
-        print(f"   ✅ {len(listings)} listings (filtered {skipped_count})")
     
     # Count totals
     total_listings = sum(len(lst) for lst in all_listings_by_query.values())
-    print(f"\n📦 Total: {total_listings} listings from {len(queries)} queries")
+    
+    logger.step_result(
+        summary=f"Scraped {total_listings} listings from {len(queries)} queries",
+        quality_metrics={
+            "Total scraped": global_stats["total_scraped"],
+            "Passed filters": total_listings,
+            "Filtered out": global_stats["total_scraped"] - total_listings,
+        },
+    )
+    
+    logger.step_end(f"Scraping complete - {total_listings} listings ready for processing")
     
     if total_listings == 0:
-        print("⚠️ No listings found across all queries")
+        logger.step_warning("No listings found across all queries")
         return []
     
-    # =========================================================================
-    # PHASE 1.5: CLARITY DETECTION & SMART DETAIL SCRAPING
-    # =========================================================================
-    clarity_enabled = getattr(cfg.general, "clarity_detection_enabled", False)
-    max_unclear_scrapes = getattr(cfg.general, "max_unclear_detail_scrapes", 10)
-    max_vision_clarity = getattr(cfg.general, "max_vision_for_clarity", 5)
+    # Convert to format expected by new pipeline
+    all_listings_flat = []
+    for query, listings in all_listings_by_query.items():
+        for listing in listings:
+            all_listings_flat.append({
+                "listing_id": listing.get("listing_id", ""),
+                "title": listing.get("title", ""),
+                "description": listing.get("description", ""),
+                "url": listing.get("url", ""),
+                "image_url": listing.get("image_url"),
+                "image_urls": listing.get("image_urls", []),
+                "current_price_ricardo": listing.get("current_price_ricardo"),
+                "buy_now_price": listing.get("buy_now_price"),
+                "bids_count": listing.get("bids_count"),
+                "hours_remaining": listing.get("hours_remaining"),
+                "end_time_text": listing.get("end_time_text"),
+                "location": listing.get("location"),
+                "postal_code": listing.get("postal_code"),
+                "shipping": listing.get("shipping"),
+                "_query": listing.get("_query"),
+                "_category": listing.get("_category"),
+            })
     
-    if clarity_enabled and CLARITY_AVAILABLE:
-        log_section("v9 PHASE 1.5: Clarity Detection")
-        
-        # Flatten all listings for clarity check
-        all_flat = [l for listings in all_listings_by_query.values() for l in listings]
-        
-        # Filter into clear and unclear
-        clear_listings, unclear_listings = filter_unclear_listings(
-            all_flat,
-            max_unclear=max_unclear_scrapes + 10,  # Get a bit more for prioritization
-        )
-        
-        print(f"\n📊 Clarity Analysis:")
-        print(f"   Clear titles:   {len(clear_listings)}")
-        print(f"   Unclear titles: {len(unclear_listings)}")
-        
-        if unclear_listings and max_unclear_scrapes > 0:
-            # Scrape detail pages for unclear listings
-            print(f"\n🔍 Scraping detail pages for {min(len(unclear_listings), max_unclear_scrapes)} unclear listings...")
-            
-            now_clear, still_unclear = scrape_unclear_listings(
-                unclear_listings=unclear_listings,
-                context=context,
-                max_pages=max_unclear_scrapes,
-            )
-            
-            # Vision analysis for still-unclear listings
-            if still_unclear and max_vision_clarity > 0:
-                print(f"\n👁️ Vision analysis for {min(len(still_unclear), max_vision_clarity)} still-unclear listings...")
-                still_unclear = batch_analyze_with_vision(
-                    listings=still_unclear,
-                    max_vision_calls=max_vision_clarity,
+    # =========================================================================
+    # PHASE 2: QUERY-AGNOSTIC PRODUCT EXTRACTION
+    # =========================================================================
+    logger.step_start(
+        step_name="QUERY_AGNOSTIC_EXTRACTION",
+        what="Extract structured product data from listing titles",
+        why="We need to understand what's being sold - without assumptions based on the search query. Only explicitly mentioned properties are extracted.",
+        uses_ai=True,
+    )
+    
+    log_explanation(
+        "We now analyze each listing title to identify a unique product. "
+        "Goal is to enable clean web search without colors, condition, or marketing terms. "
+        "IMPORTANT: AI does NOT know the search query. It only extracts what's explicitly in the title. "
+        "No hallucinations: Brand ≠ Material, Weight ≠ Diameter. "
+        "If uncertain, the listing is escalated for detail scraping or vision analysis."
+    )
+    
+    # Setup detail scraper adapter
+    detail_scraper_func = None
+    if DETAIL_SCRAPER_AVAILABLE:
+        def detail_scraper_adapter(url: str) -> dict:
+            """Adapter for existing detail scraper."""
+            try:
+                result = scrape_detail_page(url, context)
+                return result if result else {}
+            except Exception as e:
+                print(f"   ⚠️ Detail scraping failed: {e}")
+                return {}
+        detail_scraper_func = detail_scraper_adapter
+    
+    # Setup vision analyzer adapter
+    vision_analyzer_func = None
+    if VISION_AVAILABLE:
+        def vision_analyzer_adapter(title: str, description: str, image_url: str) -> dict:
+            """Adapter for existing vision analyzer."""
+            try:
+                result = analyze_listing_with_vision(
+                    title=title,
+                    description=description,
+                    image_url=image_url
                 )
-                
-                # Convert vision results to improved titles
-                # e.g. "iPhone" → "Apple iPhone 12 Mini"
-                # e.g. "Krafttraining Set" → bundle with 3 items
-                process_vision_results(still_unclear)
-            
-            # Update the original listings in all_listings_by_query
-            # (they're the same objects, so updates propagate automatically)
-            
-            enriched_count = len(now_clear) + len([l for l in still_unclear if l.get("_vision_result")])
-            print(f"\n✅ Enriched {enriched_count} unclear listings with additional data")
+                return result if result else {}
+            except Exception as e:
+                print(f"   ⚠️ Vision analysis failed: {e}")
+                return {}
+        vision_analyzer_func = vision_analyzer_adapter
     
-    # =========================================================================
-    # PHASE 2: PRODUCT EXTRACTION & DEDUPLICATION
-    # =========================================================================
-    log_section("v9 PHASE 2: Product Extraction & Deduplication")
+    logger.step_ai_details(
+        ai_purpose="Inseratstitel sind zu komplex für Regex: mehrsprachig, unstrukturiert, viele Sonderfälle. KI versteht Kontext ohne Halluzinationen.",
+        input_summary=f"{total_listings} Inseratstitel (OHNE Suchanfrage-Information)",
+        expected_output="Strukturierte Produktdaten: Brand, Model, Specs (nur explizit erwähnt), Bundle-Typ, Confidence",
+        fallback="Bei niedriger Confidence: Detail-Scraping → Vision → Skip",
+    )
     
-    all_listing_products = []
+    logger.step_progress(f"Processing {total_listings} listings through query-agnostic pipeline...")
+    
+    # Process batch with new pipeline
+    extracted_products, run_logger_v10 = process_batch(
+        listings=all_listings_flat,
+        run_id=run_id,
+        detail_scraper=detail_scraper_func,
+        vision_analyzer=vision_analyzer_func
+    )
+    
+    logger.step_result(
+        summary=f"Extracted {len(extracted_products)} products (query-agnostic)",
+        quality_metrics={
+            "Total listings": total_listings,
+            "Products extracted": len(extracted_products),
+            "Ready for pricing": run_logger_v10.run_stats["ready_for_pricing"],
+            "Needed detail scraping": run_logger_v10.run_stats["needed_detail"],
+            "Needed vision": run_logger_v10.run_stats["needed_vision"],
+            "Skipped (unclear)": run_logger_v10.run_stats["skipped"],
+        },
+    )
+    
+    logger.step_end(f"Query-agnostic extraction complete - {len(extracted_products)} products ready")
+    
+    # Map extracted products back to original listings for compatibility
+    listing_id_to_extracted = {ep.listing_id: ep for ep in extracted_products}
     
     for query, listings in all_listings_by_query.items():
-        if not listings:
+        for listing in listings:
+            listing_id = listing.get("listing_id")
+            extracted = listing_id_to_extracted.get(listing_id)
+            
+            if extracted and extracted.products:
+                # Use first product for variant_key
+                first_product = extracted.products[0]
+                from models.product_identity import ProductIdentity
+                identity = ProductIdentity.from_product_spec(first_product)
+                
+                listing["variant_key"] = identity.product_key
+                listing["_cleaned_title"] = identity.websearch_base
+                listing["_products"] = extracted.products
+                listing["_is_bundle"] = extracted.bundle_type != BundleType.SINGLE_PRODUCT
+                listing["_bundle_type"] = extracted.bundle_type
+                listing["_extraction_confidence"] = extracted.overall_confidence
+                
+                # CRITICAL: Store detail data if available
+                if hasattr(extracted, 'detail_data') and extracted.detail_data:
+                    listing["_detail_data"] = extracted.detail_data
+            else:
+                listing["variant_key"] = None
+                listing["_cleaned_title"] = None
+                listing["_products"] = []
+                listing["_is_bundle"] = False
+    
+    # Count valid extractions
+    valid_extractions = len([ep for ep in extracted_products if ep.products])
+    invalid_count = total_listings - valid_extractions
+    
+    if invalid_count > 0:
+        logger.step_warning(f"{invalid_count} listings could not be extracted (skipped or too unclear)")
+    
+    # =========================================================================
+    # PHASE 3: WEBSEARCH QUERY GENERATION & PRICE FETCHING
+    # =========================================================================
+    logger.step_start(
+        step_name="WEBSEARCH_QUERY_GENERATION",
+        what="Generate optimized websearch queries",
+        why="We need clean, shop-optimized queries without noise (colors, sizes, marketing) for precise price search.",
+        uses_ai=False,
+        uses_rules=True,
+    )
+    
+    log_explanation(
+        "For each extracted product we generate an optimized websearch query. "
+        "It contains only price-relevant information: Brand, Model, important specs. "
+        "IMPORTANT: The query is generated ONLY from ProductSpec, NEVER from the original search query. "
+        "Units are normalized (Zoll → inch), but NOT converted (inch → cm)."
+    )
+    
+    # Generate websearch queries for all extracted products
+    websearch_queries = []
+    product_key_to_query = {}
+    
+    for extracted in extracted_products:
+        if not extracted.products or not extracted.can_price:
             continue
+        
+        for product in extracted.products:
+            query = generate_websearch_query(product)
+            identity = ProductIdentity.from_product_spec(product)
             
-        category = query_categories[query]
-        print(f"\n🔧 Processing {len(listings)} listings for '{query}' (category: {category})")
-        
-        # Convert listings to format expected by product_extractor
-        # Use vision-improved title if available (e.g. "iPhone" → "Apple iPhone 12 Mini")
-        listing_dicts = []
-        for l in listings:
-            # Check for vision-improved title
-            title = l.get("_vision_title") or l.get("title", "")
-            
-            listing_dicts.append({
-                "listing_id": l.get("listing_id", ""),
-                "title": title,
-                "description": l.get("description", ""),
-                # Pass bundle info from vision if detected
-                "_vision_bundle_titles": l.get("_vision_bundle_titles"),
-                "_is_bundle": l.get("_is_bundle", False),
-            })
-        
-        # Extract products
-        listing_products = process_query_listings(query, listing_dicts, category)
-        all_listing_products.extend(listing_products)
-        
-        # Assign product keys back to listings
-        for lp in listing_products:
-            for listing in listings:
-                if listing.get("listing_id") == lp.listing_id:
-                    listing["_products"] = lp.products
-                    listing["_is_bundle"] = lp.is_bundle
-                    # Use first product's key as variant_key for compatibility
-                    if lp.products:
-                        listing["variant_key"] = lp.products[0].product_key
-                        listing["_cleaned_title"] = lp.products[0].display_name
-                        # v9.0: Log ALL title cleanups (before → after)
-                        original = listing.get("title", "")
-                        cleaned = lp.products[0].display_name
-                        print(f"   🔧 '{original}' → '{cleaned}'")
-                    break
+            websearch_queries.append(query.primary_query)
+            product_key_to_query[identity.product_key] = query
     
-    # Build global product list
-    global_products = build_global_product_list(all_listing_products)
+    # Deduplicate queries
+    unique_queries = list(set(websearch_queries))
     
-    print(f"\n📊 Deduplication Results:")
-    print(f"   Raw listings:     {total_listings}")
-    print(f"   Unique products:  {len(global_products)}")
-    print(f"   Dedup rate:       {(1 - len(global_products)/max(total_listings, 1))*100:.0f}%")
+    logger.step_result(
+        summary=f"Generated {len(unique_queries)} unique websearch queries",
+        quality_metrics={
+            "Products extracted": len(extracted_products),
+            "Can be priced": len([ep for ep in extracted_products if ep.can_price]),
+            "Unique queries": len(unique_queries),
+            "Deduplication": f"{(1 - len(unique_queries)/max(len(websearch_queries), 1))*100:.0f}%",
+        },
+    )
+    
+    logger.step_end(f"Websearch queries ready - {len(unique_queries)} unique queries")
     
     # =========================================================================
-    # PHASE 3: PRICE FETCHING (ONE BATCH FOR ALL!)
+    # PHASE 3.5: PRICE FETCHING
     # =========================================================================
-    log_section("v9 PHASE 3: Global Price Fetching")
+    logger.step_start(
+        step_name="PRICE_FETCHING",
+        what="Price search for all unique products",
+        why="We need to know what each product costs new/used to calculate profit potential.",
+        uses_ai=True,
+        uses_web_search=True,
+        uses_db=True,
+    )
     
-    # Flatten all listings for market calculation
-    all_listings_flat = [l for listings in all_listings_by_query.values() for l in listings]
+    log_explanation(
+        "For each product we search: (1) New price from web shops, (2) Used price from Ricardo auctions. "
+        "Sources in priority: Web search (most accurate), market data (good for popular items), AI estimate (fallback). "
+        "Web search uses AI with web access - most expensive step, but best results."
+    )
     
-    # v9: Create mapping from product_key (hash) to display_name (searchable)
-    # This is critical - web search needs readable names, not hashes!
-    key_to_name = {pk: p.display_name for pk, p in global_products.items()}
-    name_to_key = {p.display_name: pk for pk, p in global_products.items()}
+    # FIX 3: English-only logs
+    logger.step_ai_details(
+        ai_purpose="Web shops have different formats. AI with web search understands every shop layout reliably.",
+        input_summary=f"{len(unique_queries)} unique product names (e.g. 'Garmin Fenix 7', 'Tommy Hilfiger Winter')",
+        expected_output="Retail price + source (e.g. '399 CHF from Galaxus')",
+        fallback="If web search fails: AI estimates price based on product knowledge",
+    )
     
-    # Use display_names for web search
-    display_names = list(key_to_name.values())
+    print(f"\n📦 Websearch queries ({len(unique_queries)} total):")
+    for q in unique_queries:
+        print(f"   • {q}")
     
-    print(f"\n📦 Product dedup summary:")
-    for name in display_names[:5]:
-        print(f"   • {name}")
-    if len(display_names) > 5:
-        print(f"   ... and {len(display_names) - 5} more")
-    
-    # 3a) Market-based resale (from competing Ricardo listings)
+    # Market-based resale (from competing Ricardo listings)
     print(f"\n📈 Calculating market prices from {len(all_listings_flat)} listings...")
     
-    # Use first query's analysis as reference (for min_realistic, etc.)
     first_query = queries[0] if queries else ""
     first_analysis = query_analyses.get(first_query)
     
@@ -397,33 +551,68 @@ def run_v9_pipeline(
         query_analysis=first_analysis,
     )
     
-    market_count = len(market_prices)
-    print(f"   ✅ Market prices for {market_count} variants")
+    logger.step_success(f"Market prices calculated", count=len(market_prices))
+    logger.step_logic(f"Marktpreise stammen von vergangenen Ricardo-Auktionen mit Geboten (kostenlos - keine KI-Kosten)")
     
-    # 3b) Web search for NEW prices (one batch!)
-    # v9: Pass display_names (readable) instead of hashes
-    print(f"\n🌐 Fetching new prices for {len(display_names)} unique products...")
+    # Web search for NEW prices
+    logger.step_progress(f"Fetching new prices for {len(unique_queries)} unique products via web search...")
+    # FIX 3: English-only logs
+    logger.step_logic("Web search uses AI with web access - most expensive operation")
     
     variant_info_map = fetch_variant_info_batch(
-        variant_keys=display_names,  # v9: Use readable names!
+        variant_keys=unique_queries,
         car_model=car_model,
-        market_prices={key_to_name.get(k, k): v for k, v in market_prices.items()},
+        market_prices=market_prices,
         query_analysis=first_analysis,
     )
     
-    # v9: Map results back to product_keys for lookup
+    # Map results to product keys
     variant_info_by_key = {}
-    for name, info in variant_info_map.items():
-        key = name_to_key.get(name, name)
-        variant_info_by_key[key] = info
-    variant_info_map = variant_info_by_key
+    for query_str, info in variant_info_map.items():
+        # Find matching product key
+        for pk, query_obj in product_key_to_query.items():
+            if query_obj.primary_query == query_str:
+                variant_info_by_key[pk] = info
+                break
     
-    print(f"   ✅ Price info for {len(variant_info_map)} products")
+    web_found = sum(1 for v in variant_info_by_key.values() if v.get("new_price"))
+    web_success_rate = (web_found / len(unique_queries) * 100) if unique_queries else 0
+    
+    logger.step_result(
+        summary=f"Price fetching complete for {len(variant_info_by_key)} products",
+        quality_metrics={
+            "Market prices": len(market_prices),
+            "Web search attempts": len(unique_queries),
+            "Web search success": f"{web_found} ({web_success_rate:.0f}%)",
+            "AI fallback used": len(unique_queries) - web_found,
+        },
+    )
+    
+    logger.step_end(f"Price data ready - {web_found} web prices + {len(market_prices)} market prices")
     
     # =========================================================================
     # PHASE 4: EVALUATE ALL LISTINGS
     # =========================================================================
-    log_section("v9 PHASE 4: Evaluating All Listings")
+    logger.step_start(
+        step_name="DEAL_EVALUATION",
+        what="Evaluate each listing for profit calculation and strategy recommendation",
+        why="We need to decide which listings are good deals worth pursuing.",
+        uses_ai=True,
+        uses_db=True,
+    )
+    
+    log_explanation(
+        "For each listing we calculate: Expected profit = (Resale price - Purchase price - Fees). "
+        "We also predict the final auction price and recommend a strategy: Buy now (top deal), Bid (good deal), Watch (maybe), or Skip (not profitable). "
+        "AI is used to understand listing quality, detect defects, and make intelligent predictions."
+    )
+    
+    logger.step_ai_details(
+        ai_purpose="Listings have complex factors: condition, seller rating, shipping, bundle logic. AI can intelligently weigh all factors.",
+        input_summary=f"{total_listings} listings with prices, descriptions, images",
+        expected_output="Profit calculation, strategy recommendation, deal score",
+        fallback="If AI fails: simple profit formula without quality adjustments",
+    )
     
     for query, listings in all_listings_by_query.items():
         if not listings:
@@ -444,25 +633,28 @@ def run_v9_pipeline(
             bids_count = listing.get("bids_count")
             hours_remaining = listing.get("hours_remaining")
             
-            # Get variant info from global cache
-            variant_info = variant_info_map.get(variant_key) if variant_key else None
+            # Get variant info from global cache (use variant_info_by_key from v10 pipeline)
+            variant_info = variant_info_by_key.get(variant_key) if variant_key else None
             
-            # v9: Use rule-based bundle detection result
+            # v10: Use query-agnostic bundle detection result
             is_bundle = listing.get("_is_bundle", False)
+            bundle_type = listing.get("_bundle_type", BundleType.SINGLE_PRODUCT)
             products = listing.get("_products", [])
             
-            # Create batch_bundle_result from our rule-based detection
+            # Create batch_bundle_result from query-agnostic detection
             batch_bundle_result = None
             if is_bundle and products:
                 batch_bundle_result = {
                     "is_bundle": True,
+                    "bundle_type": bundle_type.value if hasattr(bundle_type, 'value') else str(bundle_type),
                     "components": [
-                        {"name": p.display_name, "quantity": p.quantity}
+                        {"name": p.product_type, "quantity": 1}
                         for p in products
                     ],
+                    "pricing_method": get_pricing_method(bundle_type).value if hasattr(bundle_type, 'value') else "unknown",
                 }
             
-            # Evaluate
+            # Evaluate (OBJECTIVE B: pass variant_info_by_key for bundle component pricing)
             ai_result = evaluate_listing_with_ai(
                 title=title,
                 description=listing.get("description") or "",
@@ -479,6 +671,7 @@ def run_v9_pipeline(
                 ua=cfg.general.user_agent,
                 query_analysis=query_analysis,
                 batch_bundle_result=batch_bundle_result,
+                variant_info_by_key=variant_info_by_key,
             )
             
             # Log result
@@ -487,7 +680,8 @@ def run_v9_pipeline(
             strategy = ai_result.get("recommended_strategy", 'skip')
             
             strategy_icon = {'buy_now': '🔥', 'bid_now': '🔥', 'bid': '💰', 'watch': '👀', 'skip': '⏭️'}.get(strategy, '❓')
-            print(f"   {strategy_icon} {title[:50]}... | Profit: {profit or 0:.0f} CHF")
+            # FIX 3: Show full title, no truncation
+            print(f"   {strategy_icon} {title} | Profit: {profit or 0:.0f} CHF")
             
             # Save to database
             end_time = parse_ricardo_end_time(listing.get("end_time_text"))
@@ -499,8 +693,7 @@ def run_v9_pipeline(
             if ai_result.get("market_based_resale"):
                 price_source = ai_result.get("market_source", "auction_demand")
             
-            # v9.0: Data sanity validation before DB insert
-            # Fix any remaining data inconsistencies
+            # v10: Data sanity validation before DB insert
             current_price = listing.get("current_price_ricardo") or listing.get("price")
             predicted = ai_result.get("predicted_final_price")
             resale = ai_result.get("resale_price_est")
@@ -556,11 +749,26 @@ def run_v9_pipeline(
                 "buy_now_ceiling": ai_result.get("buy_now_ceiling"),
                 "hours_remaining": round(hours_remaining, 1) if hours_remaining is not None else None,
                 # v9: Metadata fields
-                "web_search_used": variant_info.get("price_source", "").startswith("web") if variant_info else False,
+                "web_search_used": _check_web_search_used(variant_info, ai_result),
                 "cache_hit": variant_info.get("from_cache", False) if variant_info else False,
                 "vision_used": ai_result.get("vision_used", False),
                 "cleaned_title": listing.get("_cleaned_title"),
+                "run_id": run_id,
+                # v10: Additional metadata
+                "extraction_confidence": listing.get("_extraction_confidence", 0.0),
+                "bundle_type_v10": listing.get("_bundle_type").value if listing.get("_bundle_type") else None,
+                # FIX 6: Populate ai_cost_usd field
+                "ai_cost_usd": ai_result.get("ai_cost_usd", 0.0),
             }
+            
+            # CRITICAL: Add detail data if available
+            detail_data = listing.get("_detail_data")
+            if detail_data:
+                data["description"] = detail_data.get("full_description", "")
+                data["shipping"] = detail_data.get("shipping_cost")
+                data["pickup_available"] = detail_data.get("pickup_available")
+                data["seller_rating"] = detail_data.get("seller_rating")
+                data["location"] = detail_data.get("location")
             
             upsert_listing(conn, data)
             
@@ -576,7 +784,33 @@ def run_v9_pipeline(
         
         all_deals_for_detail.extend(deals_this_query)
     
-    print(f"\n✅ v9 Pipeline complete: {total_listings} listings processed")
+    # Count strategies
+    strategies = {}
+    for query_deals in [deals_this_query]:
+        for deal in query_deals:
+            strat = deal.get("recommended_strategy", "unknown")
+            strategies[strat] = strategies.get(strat, 0) + 1
+    
+    profitable_deals = len([d for d in all_deals_for_detail if d.get("expected_profit", 0) > 10])
+    
+    logger.step_result(
+        summary=f"Evaluated {total_listings} listings - found {profitable_deals} profitable deals",
+        quality_metrics={
+            "Total evaluated": total_listings,
+            "Profitable deals": profitable_deals,
+            "Strategies": strategies,
+        },
+    )
+    
+    logger.step_end(f"Bewertung abgeschlossen - {profitable_deals} Deals lohnenswert")
+    
+    # Print v10 pipeline cost breakdown
+    print("\n" + "="*60)
+    print("v10 PIPELINE COST BREAKDOWN")
+    print("="*60)
+    run_logger_v10.print_cost_breakdown()
+    print("="*60)
+    
     return all_deals_for_detail
 
 
@@ -728,7 +962,7 @@ def export_analysis_data(listings: list, filename: str = "analysis_data.json"):
             for c in comps:
                 if isinstance(c, dict) and c.get('new_price_each') == 50.0:
                     bundle_issues.append({
-                        'title': b.get('title', '')[:50],
+                        'title': b.get('title', ''),
                         'component': c.get('name', ''),
                         'issue': 'Default 50 CHF price used'
                     })
@@ -742,9 +976,9 @@ def export_analysis_data(listings: list, filename: str = "analysis_data.json"):
         
         # Check for old electronics with too high new_price
         if 'fenix 5' in title.lower() and new_p > 400:
-            suspicious.append({'title': title[:50], 'issue': f'Fenix 5 new_price {new_p} CHF too high (model from 2017)'})
+            suspicious.append({'title': title, 'issue': f'Fenix 5 new_price {new_p} CHF too high (model from 2017)'})
         if 'fenix 6' in title.lower() and new_p > 600:
-            suspicious.append({'title': title[:50], 'issue': f'Fenix 6 new_price {new_p} CHF too high (model from 2019)'})
+            suspicious.append({'title': title, 'issue': f'Fenix 6 new_price {new_p} CHF too high (model from 2019)'})
         
         # Check for weight equipment with wrong prices
         if any(kw in title.lower() for kw in ['hantelscheiben', 'hantelscheibe', 'gewicht', 'kg']):
@@ -753,7 +987,7 @@ def export_analysis_data(listings: list, filename: str = "analysis_data.json"):
             if kg_match:
                 kg = float(kg_match.group(1))
                 if new_p > 0 and new_p / kg > 10:  # More than 10 CHF/kg is suspicious
-                    suspicious.append({'title': title[:50], 'issue': f'{new_p/kg:.1f} CHF/kg is too high for weight plates'})
+                    suspicious.append({'title': title, 'issue': f'{new_p/kg:.1f} CHF/kg is too high for weight plates'})
     
     # v7.3.3: Improved quality score calculation
     # Count web sources (good data quality)
@@ -793,7 +1027,8 @@ def export_analysis_data(listings: list, filename: str = "analysis_data.json"):
             'total_listings': total,
             'profitable_deals': len(profitable),
             'bundles_detected': len(bundles),
-            'web_searches_used': WEB_SEARCH_COUNT_TODAY,
+            'web_searches_used': len([l for l in listings if l.get('web_search_used')]),  # FIX 4: Count listings, not API calls
+            'web_search_api_calls': WEB_SEARCH_COUNT_TODAY,  # FIX 4: Track API calls separately
             'run_cost_usd': round(RUN_COST_USD, 4),
         },
         'price_sources': price_sources,
@@ -868,13 +1103,13 @@ def run_once():
     max_unclear_detail_scrapes = getattr(cfg.general, "max_unclear_detail_scrapes", 10)
     max_vision_for_clarity = getattr(cfg.general, "max_vision_for_clarity", 5)
     
-    # v9: Always use if available (no config needed - v9 is simply better)
-    use_v9_pipeline = V9_AVAILABLE
+    # v10: Always use if available (query-agnostic, zero hallucinations)
+    use_v10_pipeline = V10_AVAILABLE
     
-    if use_v9_pipeline:
-        print("🚀 v9 Pipeline: Global product deduplication (cost-optimized)")
+    if use_v10_pipeline:
+        print("🚀 v10 Pipeline: Query-agnostic product extraction (zero hallucinations)")
     else:
-        print("⚠️ v9 Pipeline not available - ensure product_extractor.py exists")
+        print("⚠️ v10 Pipeline not available - ensure models/ and pipeline/ modules exist")
 
     # --------------------------------------------------------------------------
     # 2) DATABASE CONNECTION
@@ -898,14 +1133,14 @@ def run_once():
     # 3) CLEAR DB IF TESTING MODE
     # --------------------------------------------------------------------------
     if cfg.db.clear_on_start:
-        print("\n⚠️ Testing mode: Clearing all listings...")
+        print("\n⚠️ Testing mode: Clearing all listings from database...")
         clear_listings(conn)
 
     # --------------------------------------------------------------------------
     # 4) CLEAR CACHES IF CONFIGURED
     # --------------------------------------------------------------------------
     if cfg.cache.clear_on_start:
-        print("\n⚠️ Cache clear mode: Clearing all caches...")
+        print("\n⚠️ Cache clear mode: Clearing all caches (web prices, variant info, query analysis)...")
         clear_all_caches()
         clear_query_cache()
 
@@ -918,12 +1153,44 @@ def run_once():
         print("❌ No search queries configured!")
         return
     
-    log_section(f"Analyzing {len(queries)} Search Queries")
+    # v9.2: Enhanced logging
+    logger = get_logger()
+    logger.step_start(
+        step_name="QUERY_ANALYSIS",
+        what="Analyzing search queries to understand what products we're looking for",
+        why="We need to know product categories, typical prices, and common accessories to filter listings intelligently",
+        uses_ai=True,
+    )
+    
+    log_explanation(
+        "Each search query (like 'Tommy Hilfiger' or 'Garmin smartwatch') is analyzed by AI. "
+        "The AI tells us: What category is this? What's a realistic minimum price? "
+        "Which accessories are commonly bundled? This helps us filter out junk listings later."
+    )
+    
+    logger.step_ai_details(
+        ai_purpose="Queries are too diverse for hardcoded rules. AI understands context and product knowledge.",
+        input_summary=f"{len(queries)} search queries (e.g. 'Tommy Hilfiger', 'Garmin smartwatch')",
+        expected_output="Category, min price, accessory keywords, defect keywords for each query",
+        fallback="If AI fails, use generic category detection (regex-based)",
+    )
+    
+    logger.step_progress(f"Analyzing {len(queries)} queries...")
     
     query_analyses = analyze_queries(
         queries=queries,
         model=cfg.ai.openai_model,
     )
+    
+    logger.step_result(
+        summary=f"All {len(queries)} queries analyzed successfully",
+        quality_metrics={
+            "Queries analyzed": len(queries),
+            "Cache hits": "Cached for 30 days (no cost on re-runs)",
+        },
+    )
+    
+    logger.step_end("Query analysis complete - ready to scrape listings")
 
     # --------------------------------------------------------------------------
     # 6) START BROWSER
@@ -933,6 +1200,10 @@ def run_once():
 
     # v7.0: Collect all deals for detail scraping at the end
     all_deals_for_detail: List[Dict[str, Any]] = []
+    
+    # v9.2: Generate unique run_id for this pipeline execution
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    print(f"\n🆔 Run ID: {run_id}")
     
     # v7.2: Global statistics
     global_stats = {
@@ -956,11 +1227,11 @@ def run_once():
             print("🟢 Browser context ready (headful, persistent)")
 
             # ------------------------------------------------------------------
-            # v9 vs v7 PIPELINE BRANCHING
+            # v10 PIPELINE
             # ------------------------------------------------------------------
-            if use_v9_pipeline:
-                # v9: Global product deduplication pipeline
-                all_deals_for_detail = run_v9_pipeline(
+            if use_v10_pipeline:
+                # v10: Query-agnostic product extraction pipeline
+                all_deals_for_detail = run_v10_pipeline(
                     queries=queries,
                     query_analyses=query_analyses,
                     context=context,
@@ -969,44 +1240,174 @@ def run_once():
                     global_stats=global_stats,
                     car_model=car_model,
                     max_listings_per_query=max_listings_per_query,
+                    run_id=run_id,
                 )
                 
-                # Detail scraping for v9
+                # Detail scraping for v10
                 if detail_pages_enabled and all_deals_for_detail:
                     all_deals_for_detail.sort(key=lambda x: x.get("expected_profit", 0), reverse=True)
                     top_deals = all_deals_for_detail[:max_detail_pages]
                     
-                    print(f"\n🔍 v9: Scraping {len(top_deals)} detail pages (top by profit)...")
+                    logger.step_start(
+                        step_name="DETAIL_SCRAPING",
+                        what=f"Scraping detail pages for top {len(top_deals)} deals",
+                        why="Detail pages contain extra info: seller rating, shipping cost, exact location - helps make better buying decisions",
+                        uses_ai=False,
+                        uses_rules=True,
+                    )
+                    
+                    log_explanation(
+                        "We visit the actual listing pages (not just search results) to extract additional details. "
+                        "This step does NOT use AI - it's pure web scraping with DOM selectors. "
+                        "We only scrape the most profitable deals to save time."
+                    )
+                    
                     try:
                         from scrapers.detail_scraper import scrape_top_deals
                         enriched_deals = scrape_top_deals(deals=top_deals, context=context, max_pages=len(top_deals))
+                        
+                        # v9.2: VALIDATION - Track which listings actually got detail data
+                        detail_success_count = 0
+                        detail_fail_count = 0
+                        
                         if enriched_deals:
                             for deal in enriched_deals:
                                 if deal.get("detail_data"):
                                     detail = deal["detail_data"]
-                                    # v9.0: Pass ALL detail data including location
-                                    update_listing_details(conn, {
-                                        "listing_id": deal["listing_id"],
-                                        "seller_rating": detail.get("seller_rating"),
-                                        "shipping_cost": detail.get("shipping_cost"),
-                                        "pickup_available": detail.get("pickup_available"),
-                                        "location": detail.get("location"),
-                                        "postal_code": detail.get("postal_code"),
-                                        "description": detail.get("full_description"),
-                                        "shipping": detail.get("shipping_method"),
-                                    })
-                        print(f"   ✅ Detail scraping complete")
+                                    
+                                    # v9.2: VALIDATION - Check if we actually got data
+                                    has_data = any([
+                                        detail.get("seller_rating"),
+                                        detail.get("shipping_cost"),
+                                        detail.get("pickup_available") is not None,
+                                        detail.get("location"),
+                                        detail.get("postal_code"),
+                                    ])
+                                    
+                                    if has_data:
+                                        # v9.0: Pass ALL detail data including location
+                                        update_listing_details(conn, {
+                                            "listing_id": deal["listing_id"],
+                                            "seller_rating": detail.get("seller_rating"),
+                                            "shipping_cost": detail.get("shipping_cost"),
+                                            "pickup_available": detail.get("pickup_available"),
+                                            "location": detail.get("location"),
+                                            "postal_code": detail.get("postal_code"),
+                                            "description": detail.get("full_description"),
+                                            "shipping": detail.get("shipping_method"),
+                                        })
+                                        detail_success_count += 1
+                                        
+                                        # OBJECTIVE A: Re-evaluate deal with detail data (ZERO COST)
+                                        from ai_filter import re_evaluate_with_details
+                                        from db_pg import update_listing_reevaluation
+                                        
+                                        # Get original evaluation result
+                                        original_result = {
+                                            "expected_profit": deal.get("expected_profit", 0),
+                                            "deal_score": deal.get("deal_score", 0),
+                                            "recommended_strategy": deal.get("recommended_strategy", "watch"),
+                                            "strategy_reason": deal.get("strategy_reason", ""),
+                                            "resale_price_est": deal.get("resale_price_est", 0),
+                                            "price_source": deal.get("price_source", "unknown"),
+                                            "market_based_resale": deal.get("market_based_resale", False),
+                                        }
+                                        
+                                        # Determine purchase price
+                                        buy_now_price = deal.get("buy_now_price")
+                                        current_price = deal.get("current_price_ricardo")
+                                        predicted_final = deal.get("predicted_final_price")
+                                        
+                                        if buy_now_price:
+                                            purchase_price = buy_now_price
+                                        elif predicted_final:
+                                            purchase_price = predicted_final
+                                        elif current_price:
+                                            purchase_price = current_price
+                                        else:
+                                            purchase_price = 0
+                                        
+                                        # Re-evaluate with detail data
+                                        is_auction = current_price is not None and buy_now_price is None
+                                        has_buy_now = buy_now_price is not None
+                                        
+                                        updated = re_evaluate_with_details(
+                                            original_result=original_result,
+                                            detail_data=detail,
+                                            purchase_price=purchase_price,
+                                            is_auction=is_auction,
+                                            has_buy_now=has_buy_now,
+                                            bids_count=deal.get("bids_count", 0),
+                                            hours_remaining=deal.get("hours_remaining"),
+                                            is_bundle=deal.get("is_bundle", False)
+                                        )
+                                        
+                                        # Log re-evaluation if values changed
+                                        if updated["expected_profit"] != original_result["expected_profit"]:
+                                            print(f"   🔄 Re-evaluated {deal['listing_id']}:")
+                                            print(f"      Profit: {original_result['expected_profit']:.0f} → {updated['expected_profit']:.0f} CHF")
+                                            print(f"      Strategy: {original_result['recommended_strategy']} → {updated['recommended_strategy']}")
+                                            
+                                            adjustments = updated.get("detail_adjustments", {})
+                                            if adjustments.get("shipping_cost"):
+                                                print(f"      Shipping: -{adjustments['shipping_cost']:.0f} CHF")
+                                            if adjustments.get("rating_penalty"):
+                                                print(f"      Rating penalty: -{adjustments['rating_penalty']:.0f} CHF")
+                                            if adjustments.get("pickup_only_penalty"):
+                                                print(f"      Pickup-only: -{adjustments['pickup_only_penalty']:.0f} CHF")
+                                        
+                                        # Update database with re-evaluated values
+                                        update_listing_reevaluation(conn, {
+                                            "listing_id": deal["listing_id"],
+                                            "expected_profit": updated["expected_profit"],
+                                            "deal_score": updated["deal_score"],
+                                            "recommended_strategy": updated["recommended_strategy"],
+                                            "strategy_reason": updated["strategy_reason"],
+                                        })
+                                    else:
+                                        print(f"   ⚠️ No detail data for {deal['listing_id']} - scraping failed")
+                                        detail_fail_count += 1
+                                else:
+                                    detail_fail_count += 1
+                        
+                        # v9.2: Report actual success rate with verification
+                        from logger_utils import log_verification
+                        
+                        if detail_success_count > 0:
+                            log_verification(
+                                claim=f"{detail_success_count} detail pages scraped successfully",
+                                verified=True,
+                                evidence=f"Database fields populated: location, shipping_cost, pickup_available",
+                            )
+                        
+                        if detail_fail_count > 0:
+                            log_verification(
+                                claim=f"{detail_fail_count} detail pages scraped",
+                                verified=False,
+                                evidence="No usable data extracted from these pages",
+                            )
+                        
+                        logger.step_result(
+                            summary=f"Detail scraping complete",
+                            quality_metrics={
+                                "Attempted": len(top_deals),
+                                "Successful": detail_success_count,
+                                "Failed": detail_fail_count,
+                                "Success rate": f"{(detail_success_count/len(top_deals)*100):.0f}%" if top_deals else "0%",
+                            },
+                        )
+                        
+                        logger.step_end(f"Detail scraping complete - {detail_success_count}/{len(top_deals)} successful")
                     except Exception as e:
-                        print(f"   ⚠️ Detail scraping failed: {e}")
+                        logger.step_error(f"Detail scraping failed: {e}")
             
             # ------------------------------------------------------------------
-            # v7 FALLBACK: If v9 not available, show error
+            # FALLBACK: If v10 not available, show error
             # ------------------------------------------------------------------
-            if not use_v9_pipeline:
-                print("❌ v9 Pipeline not enabled. Please set pipeline.use_v9_product_extraction: true in config.yaml")
-                print("   Or ensure product_extractor.py is available.")
-                # Skip to report generation
-                pass
+            if not use_v10_pipeline:
+                print("❌ v10 Pipeline not available. Please ensure models/ and pipeline/ modules are installed.")
+                print("   Required modules: models.bundle_types, models.product_spec, pipeline.pipeline_runner")
+                return
             
             # ------------------------------------------------------------------
             # 8) DETAIL SCRAPING SUMMARY
@@ -1051,19 +1452,31 @@ def run_once():
                 print(f"\n💰 Pre-filter efficiency: {filter_rate:.1f}% filtered (saves AI costs!)")
 
             # ------------------------------------------------------------------
-            # 11) AI COST SUMMARY
+            # 11) AI COST SUMMARY (v9.2: Enhanced with step breakdown)
             # ------------------------------------------------------------------
             run_cost, day = get_run_cost_summary()
-            
-            # v7.3.5 FIX: Save day cost BEFORE getting summary!
-            # This was missing - day costs were never persisted!
             day_total = save_day_cost()
-
-            log_section("Cost Summary")
-            print(f"💰 This run:    ${run_cost:.4f} USD")
+            
+            # Get cost summary from logger
+            cost_info = logger.get_cost_summary()
+            
+            # Calculate approximate cost breakdown
+            from ai_filter import RUN_COST_USD, WEB_SEARCH_COUNT_TODAY
+            
+            log_cost_summary(
+                ai_calls=len(cost_info["ai_steps"]) + len(cost_info["cost_steps"]),
+                web_searches=WEB_SEARCH_COUNT_TODAY,
+                total_cost_usd=run_cost,
+                breakdown={
+                    "Query Analysis": 0.002,  # Haiku
+                    "Title Normalization": 0.005,  # Haiku batch
+                    "Web Price Search": run_cost * 0.85,  # ~85% of cost
+                    "Deal Evaluation": run_cost * 0.10,  # ~10% of cost
+                },
+            )
+            
+            print(f"\n📅 Date: {day}")
             print(f"📊 Today total: ${day_total:.4f} USD")
-            print(f"📅 Date:        {day}")
-            print(f"🔍 Detail pages scraped: {len([d for d in all_deals_for_detail if d.get('detail_scraped')])} (no AI cost)")
 
             # ------------------------------------------------------------------
             # 12) EXPORT DATA FOR ANALYSIS

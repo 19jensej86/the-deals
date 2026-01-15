@@ -26,6 +26,13 @@ general:
   max_unclear_detail_scrapes: 10 # Max detail pages for unclear listings
   max_vision_for_clarity: 5 # Max vision calls for still-unclear items
 
+  # v9.2: AI-based Title Normalization
+  # ----------------------------------
+  # Uses AI instead of regex for title cleanup and bundle detection.
+  # Much better for multilingual titles and edge cases.
+  # Cost: ~0.002 CHF per 10 titles (Haiku)
+  ai_title_normalization: true
+
 postgres:
   host: "localhost"
   port: 5432
@@ -107,6 +114,6 @@ ai:
 
   # Budget limits
   budget:
-    daily_cost_usd_max: 0.50 # Reduced! With web search off: ~$0.05/run
+    daily_cost_usd_max: 5.00 # Increased 10x for testing (was 0.50)
     daily_vision_calls_max: 100
-    daily_web_search_max: 10 # Reduced! Each costs ~$0.10
+    daily_web_search_max: 100 # Increased 10x for testing (was 10)

@@ -24,6 +24,11 @@ Returns per query:
 This data is cached for 30 days per query set.
 """
 
+# FIX 1: Configure UTF-8 output for Windows PowerShell (MUST be first)
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
+
 import os
 import json
 import hashlib
@@ -531,16 +536,26 @@ def get_search_term_cleanup(query_analysis: Optional[Dict] = None) -> Dict[str, 
 
 def clean_search_term(title: str, query_analysis: Optional[Dict] = None) -> str:
     """
-    v7.3.3: Clean a listing title to create a better web search term.
+    v7.4: Clean a listing title to create a better web search term.
+    
+    Removes non-price-relevant attributes and enforces singular forms.
     
     Example:
         "Garmin Fenix 6 Smartwatch inkl. Zubehör" -> "Garmin Fenix 6"
-        "Tommy hilfiger Jeans 32/32 straight Ryan" -> "Tommy Hilfiger Jeans"
+        "Tommy Hilfiger Jeans 32/32 straight Ryan kariert" -> "Tommy Hilfiger Jeans"
+        "Hantelscheiben 15kg gummiert" -> "Hantelscheibe 15kg gummiert"
+        "Hantelscheiben {'4x10kg': True} Pro" -> "Hantelscheibe 10kg Pro"
     """
+    import re
+    
     cleanup = get_search_term_cleanup(query_analysis)
     
     # Start with original title
     clean = title.strip()
+    
+    # Step 0: Remove dict/JSON artifacts from bundle decomposition
+    clean = re.sub(r'\{[^}]*\}', '', clean)
+    clean = re.sub(r'\[[^\]]*\]', '', clean)
     
     # Step 1: Remove everything after certain keywords
     remove_after = cleanup.get("remove_after", [])
@@ -558,26 +573,67 @@ def clean_search_term(title: str, query_analysis: Optional[Dict] = None) -> str:
         if pos > 5:  # Keep at least some characters
             clean = clean[:pos].strip()
     
-    # Step 2: Remove specific words
+    # Step 2: Remove non-price-relevant attributes
+    # Size patterns
+    clean = re.sub(r'\b\d+[/x]\d+\b', '', clean, flags=re.IGNORECASE)  # 32/32, 10x15
+    clean = re.sub(r'\bGr\.?\s*\d+\b', '', clean, flags=re.IGNORECASE)  # Gr.30, Gr 30
+    clean = re.sub(r'\bGrösse\s*\d+\b', '', clean, flags=re.IGNORECASE)  # Grösse 30
+    clean = re.sub(r'\bSize\s*[XSML]+\b', '', clean, flags=re.IGNORECASE)  # Size XL
+    
+    # Fit/style attributes
+    fit_words = ['slim', 'regular', 'straight', 'relaxed', 'skinny', 'loose', 'tight', 'fitted']
+    for fit in fit_words:
+        clean = re.sub(rf'\b{fit}\s+fit\b', '', clean, flags=re.IGNORECASE)
+        clean = re.sub(rf'\b{fit}\b', '', clean, flags=re.IGNORECASE)
+    
+    # Pattern/color attributes
+    pattern_words = ['kariert', 'gestreift', 'gepunktet', 'gemustert', 'uni', 'einfarbig', 
+                     'checked', 'striped', 'dotted', 'patterned', 'solid']
+    for pattern in pattern_words:
+        clean = re.sub(rf'\b{pattern}\b', '', clean, flags=re.IGNORECASE)
+    
+    # Color words (common ones)
+    color_words = ['schwarz', 'weiss', 'rot', 'blau', 'grün', 'gelb', 'grau', 
+                   'black', 'white', 'red', 'blue', 'green', 'yellow', 'grey', 'gray']
+    for color in color_words:
+        clean = re.sub(rf'\b{color}\b', '', clean, flags=re.IGNORECASE)
+    
+    # Step 3: Remove specific words
     remove_words = cleanup.get("remove_words", [])
     for word in remove_words:
-        # Case-insensitive word removal
-        import re
         clean = re.sub(rf'\b{re.escape(word)}\b', '', clean, flags=re.IGNORECASE)
     
-    # Step 3: Clean up whitespace and punctuation
+    # Step 4: Enforce singular forms for pricing
+    # German plurals -> singular
+    singular_map = {
+        r'\bHantelscheiben\b': 'Hantelscheibe',
+        r'\bHanteln\b': 'Hantel',
+        r'\bGewichte\b': 'Gewicht',
+        r'\bScheiben\b': 'Scheibe',
+        r'\bStangen\b': 'Stange',
+        r'\bKurzhanteln\b': 'Kurzhantel',
+        r'\bLanghanteln\b': 'Langhantel',
+        r'\bBänke\b': 'Bank',
+        r'\bRacks\b': 'Rack',
+        r'\bPullover\b': 'Pullover',  # Already singular
+        r'\bHemden\b': 'Hemd',
+        r'\bHosen\b': 'Hose',
+        r'\bJacken\b': 'Jacke',
+    }
+    for plural, singular in singular_map.items():
+        clean = re.sub(plural, singular, clean, flags=re.IGNORECASE)
+    
+    # Step 5: Clean up whitespace and punctuation
     clean = re.sub(r'\s+', ' ', clean)  # Multiple spaces to single
     clean = re.sub(r'[!?.,;:]+$', '', clean)  # Remove trailing punctuation
     clean = clean.strip()
     
-    # Step 4: Remove size/quantity info at end (e.g., "32/32", "Gr.30")
-    clean = re.sub(r'\s+\d+[/x]\d+\s*$', '', clean, flags=re.IGNORECASE)
-    clean = re.sub(r'\s+Gr\.?\s*\d+\s*$', '', clean, flags=re.IGNORECASE)
-    clean = re.sub(r'\s+Grösse\s*\d+\s*$', '', clean, flags=re.IGNORECASE)
-    
-    # Step 5: Limit to reasonable length (first 5-6 significant words)
+    # Step 6: Limit to reasonable length (first 5-6 significant words)
     words = clean.split()
     if len(words) > 6:
         clean = ' '.join(words[:6])
     
     return clean.strip()
+
+
+# ... (rest of the code remains the same)

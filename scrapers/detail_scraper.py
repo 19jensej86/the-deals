@@ -561,12 +561,15 @@ def scrape_top_deals(
         else:
             print(f"   ⚠️ Scrape failed: {detail_data.get('scrape_error')}")
         
-        # Update original deal in the list
+        # Store detail data in the expected structure
         if listing_id and listing_id in deals_by_id:
             original_deal = deals_by_id[listing_id]
             
-            # Add detail data
+            # Store in detail_data dict (main.py expects this)
+            original_deal["detail_data"] = detail_data
             original_deal["detail_scraped"] = True
+            
+            # Also update top-level fields for backward compatibility
             original_deal["seller_rating"] = detail_data.get("seller_rating")
             original_deal["shipping_cost"] = detail_data.get("shipping_cost")
             original_deal["pickup_available"] = detail_data.get("pickup_available")

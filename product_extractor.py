@@ -67,20 +67,21 @@ REMOVE_PATTERNS = [
     r'\b(neu|neuwertig|gebraucht|defekt)\b',
     r'\b(original|ovp|unbenutzt|ungetragen|einwandfrei|perfekt|makellos)\b',
     r'\b(recertified|refurbished|b-ware)\b',
-    # Farben (inkl. zusammengesetzte wie Dunkelblau)
-    r'\b(dunkel|hell|light|dark)?(schwarz|weiss|blau|rot|grün|gelb|grau|braun|pink|lila|orange)\b',
-    r'\b(beige|navy|bordeaux|olive|anthrazit|türkis|gold|silber|rose|mint|creme|ivory)\b',
-    r'\b(black|white|blue|red|green|grey|brown|dust rose|midnight|cream)\b',
-    # Grössen - komplette Patterns inkl. "Gr." prefix
-    r'\|?\s*grösse\s*(xxs|xs|s|m|l|xl|xxl|xxxl|\d+)?\b',  # "| Grösse M" oder "| Grösse"
-    r'\bgr\.?\s*(xxs|xs|s|m|l|xl|xxl|xxxl)\b',  # Gr.XS, Gr. M etc.
-    r'\bgr\.?\s*\d+\b',                          # Gr. 42, Gr.176
+    # Farben - EXPLIZIT zusammengesetzte Farben ZUERST!
+    r'\b(dunkelblau|hellblau|dunkelgrau|hellgrau|dunkelbraun|hellbraun|dunkelgrün|hellgrün|dunkelrot|hellrot)\b',
+    r'\b(schwarz|weiss|blau|rot|grün|gelb|grau|braun|pink|lila|orange|violett|türkis)\b',
+    r'\b(beige|navy|bordeaux|olive|anthrazit|gold|silber|rose|mint|creme|ivory|taupe|khaki)\b',
+    r'\b(black|white|blue|red|green|grey|gray|brown|pink|purple|orange|cream|midnight)\b',
+    # Grössen - WICHTIG: Pipe + Grösse Pattern muss funktionieren!
+    r'\|\s*Grösse\s*[A-Z0-9]*',                  # "| Grösse M" oder "| Grösse" (case sensitive für Anfang)
+    r'\|\s*grösse\s*\w*',                        # "| grösse" lowercase
+    r',?\s*[Gg]r\.?\s*(xxs|xs|s|m|l|xl|xxl|xxxl|\d+)\b',  # ", Gr. M" oder "Gr.42"
     r'\bsize\s*(xxs|xs|s|m|l|xl|xxl|xxxl|\d+)\b',
-    r'\b(xxs|xs|s|m|l|xl|xxl|xxxl)\b',           # Standalone sizes (nach Gr. patterns!)
+    r'\b(xxs|xs|xl|xxl|xxxl)\b',                 # Nur eindeutige Grössen (S/M/L zu häufig in Namen)
     r'\b\d{2}/\d{2}\b',                          # 32/32
     r'\b\(\d{2,3}\)\b',                          # (116)
-    # Mengenangaben für Singular-Suche
-    r'\b\d+\s*stk\.?\s*[àax@]\s*',               # "2 Stk. à" -> entfernen für Singular
+    # Mengenangaben für Singular-Suche - MUSS Gewicht behalten!
+    r',?\s*\d+\s*[Ss]tk\.?\s*[àax@]\s*',        # ", 2 Stk. à" -> entfernen (Komma optional)
     # Marketing
     r'\bthflex\b',
     r'\binkl\.?\s*(ovp|box|zubehör)\b',
@@ -738,31 +739,266 @@ def decompose_bundle_universal(
 # HAUPTFUNKTION: Process Query
 # ==============================================================================
 
+# v9.2: Global flag for AI-based title normalization
+USE_AI_TITLE_NORMALIZATION = True
+
+
 def process_query_listings(
     query: str,
     listings: List[Dict[str, Any]],
     category: str,
+    use_ai_normalization: bool = None,
 ) -> List[ListingProducts]:
     """
     Verarbeitet alle Listings einer Query.
     
+    v9.2: NEUE AI-basierte Titel-Normalisierung!
+    - Ersetzt Regex-basiertes Cleanup
+    - Bessere Bundle-Erkennung
+    - Mehrsprachig (DE/FR/EN)
+    - Edge-Cases werden korrekt behandelt
+    
     Steps:
     0. Vision-erkannte Bundles/Titel übernehmen (wenn vorhanden)
-    1. Für jedes Listing: Bundle Detection (regelbasiert)
-    2. Wenn Bundle: Versuche regelbasierte Zerlegung
-    3. Wenn nicht zerlegbar: markiere für AI-Call
-    4. Sonst: Title cleanup
+    1. AI Title Normalization (NEU in v9.2!)
+    2. Fallback: Regex-basierte Verarbeitung
     
     Args:
         query: User-Query (z.B. "Tommy Hilfiger")
         listings: Liste von Rohdaten-Inseraten
         category: Kategorie (smartwatch, clothing, fitness)
+        use_ai_normalization: Override für AI-Normalisierung (default: USE_AI_TITLE_NORMALIZATION)
     
     Returns:
         Liste von ListingProducts (Mapping Inserat → Produkte)
     """
     results: List[ListingProducts] = []
     
+    # v9.2: Determine if we should use AI normalization
+    use_ai = use_ai_normalization if use_ai_normalization is not None else USE_AI_TITLE_NORMALIZATION
+    
+    # v9.2: AI-based title normalization (batch processing)
+    if use_ai and listings:
+        try:
+            from ai_filter import normalize_titles_with_ai
+            
+            # Check if AI normalization was already done globally (passed via _ai_normalized)
+            has_precomputed = any(l.get("_ai_normalized") is not None for l in listings)
+            
+            if has_precomputed:
+                # Use pre-computed AI normalization from global batch
+                print(f"\n✅ Using pre-computed AI normalization (global batch)")
+                
+                # Process pre-computed results
+                for listing in listings:
+                    listing_id = listing.get("listing_id", "")
+                    title = listing.get("title", "")
+                    
+                    # Check for vision-detected bundle titles first
+                    vision_bundle_titles = listing.get("_vision_bundle_titles")
+                    if vision_bundle_titles and isinstance(vision_bundle_titles, list):
+                        products = []
+                        for vt in vision_bundle_titles:
+                            if vt and isinstance(vt, str) and len(vt.strip()) > 2:
+                                products.append(Product(
+                                    product_key=generate_product_key(vt.strip()),
+                                    display_name=vt.strip(),
+                                    category=category,
+                                    quantity=1,
+                                    source_listings=[listing_id],
+                                ))
+                        if products:
+                            results.append(ListingProducts(
+                                listing_id=listing_id,
+                                original_title=title,
+                                products=products,
+                                is_bundle=True,
+                            ))
+                            continue
+                    
+                    # Use pre-computed AI products
+                    ai_products = listing.get("_ai_normalized", [])
+                    
+                    if ai_products:
+                        products = []
+                        is_bundle = len(ai_products) > 1 or any(p.get("quantity", 1) > 1 for p in ai_products)
+                        
+                        for ap in ai_products:
+                            name = ap.get("name", title)
+                            qty = ap.get("quantity", 1)
+                            
+                            # v9.2: POST-AI CLEANUP (Safety net for AI failures)
+                            # Remove size/color/condition if AI missed them
+                            name = re.sub(r'\b(Gr\.?|Grösse|taille|size)\s*[A-Z0-9]*\b', '', name, flags=re.IGNORECASE)
+                            name = re.sub(r'\b\d+mm\b', '', name, flags=re.IGNORECASE)  # "43mm"
+                            name = re.sub(r'\b(neu|neuwertig|gebraucht|top zustand|garantieaustausch)\b', '', name, flags=re.IGNORECASE)
+                            name = re.sub(r'\b(schwarz|weiss|blau|rot|grün|black|white|blue|red)\b', '', name, flags=re.IGNORECASE)
+                            name = re.sub(r'\bI\s+Smartwatch\b', '', name, flags=re.IGNORECASE)  # "Forerunner 970 I Smartwatch"
+                            name = re.sub(r'\s+', ' ', name).strip()
+                            name = re.sub(r',\s*$', '', name).strip()
+                            
+                            # Validation: Name must not be empty
+                            if not name or len(name) < 3:
+                                print(f"   ⚠️ Empty name after cleanup for '{title[:40]}' - using fallback")
+                                name = clean_title_for_search(title, query, category)
+                            
+                            # Generate consistent product_key
+                            weight_match = re.search(r'(\d+(?:[.,]\d+)?)\s*kg', name.lower())
+                            if weight_match and category == "fitness":
+                                weight = float(weight_match.group(1).replace(',', '.'))
+                                product_key = f"hantelscheibe_{weight}kg"
+                            else:
+                                product_key = generate_product_key(name)
+                            
+                            products.append(Product(
+                                product_key=product_key,
+                                display_name=name,
+                                category=category,
+                                quantity=qty,
+                                source_listings=[listing_id],
+                            ))
+                        
+                        results.append(ListingProducts(
+                            listing_id=listing_id,
+                            original_title=title,
+                            products=products,
+                            is_bundle=is_bundle,
+                        ))
+                        
+                        # Log the normalization
+                        if products:
+                            print(f"   ✅ '{title[:50]}' → {[p.display_name for p in products]}")
+                    else:
+                        # Fallback: use regex-based cleanup
+                        clean_title = clean_title_for_search(title, query, category)
+                        products = [Product(
+                            product_key=generate_product_key(clean_title),
+                            display_name=clean_title,
+                            category=category,
+                            quantity=1,
+                            source_listings=[listing_id],
+                        )]
+                        results.append(ListingProducts(
+                            listing_id=listing_id,
+                            original_title=title,
+                            products=products,
+                            is_bundle=False,
+                        ))
+                
+                return results
+            
+            # Otherwise: do AI normalization now (per-query batch)
+            # Collect all titles for batch AI processing
+            titles = [l.get("title", "") for l in listings if l.get("title")]
+            
+            if titles:
+                print(f"\n🤖 v9.2: AI Title Normalization für {len(titles)} Titel...")
+                ai_normalized = normalize_titles_with_ai(titles, query, batch_size=15)
+                
+                # Process AI-normalized results
+                for listing in listings:
+                    listing_id = listing.get("listing_id", "")
+                    title = listing.get("title", "")
+                    
+                    # Check for vision-detected bundle titles first
+                    vision_bundle_titles = listing.get("_vision_bundle_titles")
+                    if vision_bundle_titles and isinstance(vision_bundle_titles, list):
+                        products = []
+                        for vt in vision_bundle_titles:
+                            if vt and isinstance(vt, str) and len(vt.strip()) > 2:
+                                products.append(Product(
+                                    product_key=generate_product_key(vt.strip()),
+                                    display_name=vt.strip(),
+                                    category=category,
+                                    quantity=1,
+                                    source_listings=[listing_id],
+                                ))
+                        if products:
+                            results.append(ListingProducts(
+                                listing_id=listing_id,
+                                original_title=title,
+                                products=products,
+                                is_bundle=True,
+                            ))
+                            continue
+                    
+                    # Use AI-normalized products
+                    ai_products = ai_normalized.get(title, [])
+                    
+                    if ai_products:
+                        products = []
+                        is_bundle = len(ai_products) > 1 or any(p.get("quantity", 1) > 1 for p in ai_products)
+                        
+                        for ap in ai_products:
+                            name = ap.get("name", title)
+                            qty = ap.get("quantity", 1)
+                            
+                            # v9.2: POST-AI CLEANUP (Safety net - same as pre-computed path)
+                            name = re.sub(r'\b(Gr\.?|Grösse|taille|size)\s*[A-Z0-9]*\b', '', name, flags=re.IGNORECASE)
+                            name = re.sub(r'\b\d+mm\b', '', name, flags=re.IGNORECASE)
+                            name = re.sub(r'\b(neu|neuwertig|gebraucht|top zustand|garantieaustausch)\b', '', name, flags=re.IGNORECASE)
+                            name = re.sub(r'\b(schwarz|weiss|blau|rot|grün|black|white|blue|red)\b', '', name, flags=re.IGNORECASE)
+                            name = re.sub(r'\bI\s+Smartwatch\b', '', name, flags=re.IGNORECASE)
+                            name = re.sub(r'\s+', ' ', name).strip()
+                            name = re.sub(r',\s*$', '', name).strip()
+                            
+                            # v9.2: VALIDATION - Name must not be empty
+                            if not name or len(name) < 3:
+                                print(f"   ⚠️ Empty name after cleanup for '{title[:40]}' - using fallback")
+                                name = clean_title_for_search(title, query, category)
+                            
+                            # Generate consistent product_key based on normalized name
+                            # For fitness: use weight-based key if weight present
+                            weight_match = re.search(r'(\d+(?:[.,]\d+)?)\s*kg', name.lower())
+                            if weight_match and category == "fitness":
+                                weight = float(weight_match.group(1).replace(',', '.'))
+                                product_key = f"hantelscheibe_{weight}kg"
+                            else:
+                                product_key = generate_product_key(name)
+                            
+                            products.append(Product(
+                                product_key=product_key,
+                                display_name=name,
+                                category=category,
+                                quantity=qty,
+                                source_listings=[listing_id],
+                            ))
+                        
+                        results.append(ListingProducts(
+                            listing_id=listing_id,
+                            original_title=title,
+                            products=products,
+                            is_bundle=is_bundle,
+                        ))
+                        
+                        # Log the normalization
+                        if products:
+                            print(f"   ✅ '{title[:50]}' → {[p.display_name for p in products]}")
+                    else:
+                        # Fallback: use regex-based cleanup
+                        clean_title = clean_title_for_search(title, query, category)
+                        products = [Product(
+                            product_key=generate_product_key(clean_title),
+                            display_name=clean_title,
+                            category=category,
+                            quantity=1,
+                            source_listings=[listing_id],
+                        )]
+                        results.append(ListingProducts(
+                            listing_id=listing_id,
+                            original_title=title,
+                            products=products,
+                            is_bundle=False,
+                        ))
+                
+                return results
+                
+        except ImportError as e:
+            print(f"   ⚠️ AI normalization not available: {e}")
+        except Exception as e:
+            print(f"   ⚠️ AI normalization failed: {e} - using regex fallback")
+    
+    # Fallback: Original regex-based processing
     for listing in listings:
         listing_id = listing.get("listing_id", "")
         title = listing.get("title", "")

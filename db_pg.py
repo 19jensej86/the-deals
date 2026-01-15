@@ -339,11 +339,16 @@ def upsert_listing(conn, data: Dict[str, Any]):
         "vision_used", "cleaned_title",
     ]
 
-    # Convert bundle_components dict to JSON string if present
+    # DEFENSIVE: Normalize ALL dict/list values to JSON strings before DB insert
+    # psycopg2 cannot adapt dict/list types - must be serialized
     values = []
     for k in fields:
         v = data.get(k)
-        if k == "bundle_components" and v is not None and not isinstance(v, str):
+        # Convert any dict or list to JSON string (not just bundle_components)
+        if v is not None and isinstance(v, (dict, list)):
+            # OBSERVABILITY: Log dict/list normalization for debugging
+            type_name = "dict" if isinstance(v, dict) else "list"
+            print(f"   🗄️ DB normalize: field={k} ({type_name} → JSON)")
             v = json.dumps(v, ensure_ascii=False)
         values.append(v)
     
@@ -447,6 +452,51 @@ def update_listing_details(conn, deal: Dict[str, Any]):
               f"(Rating={rating}%, Ship={shipping} CHF, Pickup={pickup})")
     else:
         print(f"   ⚠️ Listing {listing_id} not found for update")
+
+
+def update_listing_reevaluation(conn, data: Dict[str, Any]):
+    """
+    OBJECTIVE A: Update listing with re-evaluated values after detail scraping.
+    
+    Updates profit, score, and strategy based on detail scraping results.
+    This is called AFTER detail scraping to adjust deal metrics.
+    
+    Args:
+        conn: Database connection
+        data: Dict with:
+            - listing_id (required)
+            - expected_profit
+            - deal_score
+            - recommended_strategy
+            - strategy_reason
+    """
+    listing_id = data.get("listing_id")
+    if not listing_id:
+        print("   ⚠️ No listing_id for re-evaluation update")
+        return
+    
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE listings
+            SET expected_profit = %s,
+                deal_score = %s,
+                recommended_strategy = %s,
+                strategy_reason = %s,
+                updated_at = NOW()
+            WHERE listing_id = %s AND platform = 'ricardo'
+        """, (
+            data.get("expected_profit"),
+            data.get("deal_score"),
+            data.get("recommended_strategy"),
+            data.get("strategy_reason"),
+            listing_id
+        ))
+        updated = cur.rowcount
+    
+    if updated > 0:
+        print(f"   ✅ Re-evaluated: {listing_id}")
+    else:
+        print(f"   ⚠️ Listing {listing_id} not found for re-evaluation")
 
 
 # ==============================================================================
