@@ -124,6 +124,166 @@ SKIP_COLUMNS = ["id"]
 
 
 # ==============================================================================
+# v11: UNIFIED SCHEMA - "One Product = One Row"
+# ==============================================================================
+# Single listings table that represents:
+# - One row per product (not per Ricardo listing)
+# - Bundles: multiple rows with same bundle_id
+# - Full pricing, websearch, and audit data inline
+# - No separate products/pricing tables needed
+
+SCHEMA_VERSION = "v11.1"
+
+# Unified listings table - One Product = One Row
+LISTINGS_V11_SCHEMA = """
+CREATE TABLE IF NOT EXISTS listings (
+    -- ========================================================================
+    -- PRIMARY KEY & RUN TRACKING
+    -- ========================================================================
+    id BIGSERIAL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    
+    -- ========================================================================
+    -- SOURCE LISTING (Ricardo)
+    -- ========================================================================
+    platform TEXT NOT NULL DEFAULT 'ricardo',
+    source_listing_id TEXT NOT NULL,  -- Ricardo listing ID
+    title TEXT,
+    description TEXT,
+    url TEXT,
+    image_url TEXT,
+    
+    -- ========================================================================
+    -- PRODUCT IDENTIFICATION
+    -- ========================================================================
+    product_name TEXT,
+    cleaned_name TEXT,
+    product_type TEXT,
+    variant_key TEXT,
+    
+    -- ========================================================================
+    -- QUANTITY & BUNDLE LOGIC
+    -- ========================================================================
+    quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity >= 1),
+    bundle_id TEXT,  -- NULL = single product, same value = bundle components
+    is_bundle_component BOOLEAN DEFAULT FALSE,
+    
+    -- ========================================================================
+    -- PRICING (Total = for quantity in this row)
+    -- ========================================================================
+    new_price_total NUMERIC,
+    new_price_unit NUMERIC,
+    resale_price_est_total NUMERIC,
+    resale_price_unit NUMERIC,
+    
+    -- Ricardo prices
+    buy_now_price NUMERIC,
+    current_price_ricardo NUMERIC,
+    predicted_final_price NUMERIC,
+    
+    -- ========================================================================
+    -- PRICE SOURCE & AUDIT
+    -- ========================================================================
+    price_source TEXT NOT NULL DEFAULT 'no_price',
+    price_confidence NUMERIC,
+    web_sources JSONB,  -- Full audit trail from websearch
+    quantity_parsed_from_snippet BOOLEAN DEFAULT FALSE,
+    
+    -- ========================================================================
+    -- MARKET DATA
+    -- ========================================================================
+    market_value NUMERIC,
+    market_sample_size INTEGER DEFAULT 0,
+    market_based BOOLEAN DEFAULT FALSE,
+    buy_now_ceiling NUMERIC,
+    
+    -- ========================================================================
+    -- DEAL EVALUATION
+    -- ========================================================================
+    expected_profit NUMERIC,
+    deal_score NUMERIC,
+    recommended_strategy TEXT,
+    strategy_reason TEXT,
+    
+    -- ========================================================================
+    -- AUCTION INFO
+    -- ========================================================================
+    bids_count INTEGER,
+    hours_remaining NUMERIC,
+    end_time TIMESTAMP,
+    
+    -- ========================================================================
+    -- LOCATION & TRANSPORT
+    -- ========================================================================
+    location TEXT,
+    postal_code TEXT,
+    shipping TEXT,
+    shipping_cost NUMERIC,
+    pickup_available BOOLEAN,
+    transport_car BOOLEAN,
+    
+    -- ========================================================================
+    -- SELLER INFO
+    -- ========================================================================
+    seller_rating INTEGER,
+    
+    -- ========================================================================
+    -- METADATA & OBSERVABILITY
+    -- ========================================================================
+    web_search_used BOOLEAN DEFAULT FALSE,
+    vision_used BOOLEAN DEFAULT FALSE,
+    cache_hit BOOLEAN DEFAULT FALSE,
+    ai_cost_usd NUMERIC,
+    ai_notes TEXT,
+    
+    -- ========================================================================
+    -- TIMESTAMPS
+    -- ========================================================================
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    
+    -- ========================================================================
+    -- CONSTRAINTS
+    -- ========================================================================
+    CONSTRAINT valid_price_source CHECK (
+        price_source IN (
+            'web_median', 'web_single', 'web_median_qty_adjusted',
+            'ai_estimate', 'query_baseline', 'buy_now_fallback',
+            'bundle_aggregate', 'market_auction', 'no_price'
+        )
+    ),
+    CONSTRAINT valid_quantity CHECK (quantity >= 1)
+);
+"""
+
+# Indexes for the unified listings table
+LISTINGS_V11_INDEXES = """
+-- Run tracking
+CREATE INDEX IF NOT EXISTS idx_listings_run ON listings(run_id);
+CREATE INDEX IF NOT EXISTS idx_listings_created ON listings(created_at DESC);
+
+-- Source listing lookup
+CREATE INDEX IF NOT EXISTS idx_listings_source ON listings(platform, source_listing_id);
+
+-- Product identification
+CREATE INDEX IF NOT EXISTS idx_listings_product_type ON listings(product_type);
+CREATE INDEX IF NOT EXISTS idx_listings_variant ON listings(variant_key);
+CREATE INDEX IF NOT EXISTS idx_listings_cleaned_name ON listings(cleaned_name);
+
+-- Bundle grouping
+CREATE INDEX IF NOT EXISTS idx_listings_bundle ON listings(bundle_id) WHERE bundle_id IS NOT NULL;
+
+-- Deal evaluation
+CREATE INDEX IF NOT EXISTS idx_listings_score ON listings(deal_score DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_listings_profit ON listings(expected_profit DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_listings_strategy ON listings(recommended_strategy);
+
+-- Price source analysis
+CREATE INDEX IF NOT EXISTS idx_listings_price_source ON listings(price_source);
+"""
+
+
+# ==============================================================================
 # CONNECTION
 # ==============================================================================
 
@@ -310,59 +470,457 @@ def clear_listings(conn):
 
 
 # ==============================================================================
-# UPSERT
+# v11: UNIFIED SCHEMA MANAGEMENT - "One Product = One Row"
+# ==============================================================================
+
+def ensure_schema_v2(conn, reset_schema: bool = False):
+    """
+    v11.1: Ensures unified listings table exists (One Product = One Row).
+    
+    Args:
+        conn: Database connection
+        reset_schema: If True, drops and recreates table (DANGEROUS - only for dev/testing)
+    
+    IMPORTANT: By default, this creates the table IF NOT EXISTS.
+    Data persistence is managed separately via clear_listings(run_id).
+    """
+    with conn.cursor() as cur:
+        if reset_schema:
+            # DANGEROUS: Only use for development/testing
+            print(f"⚠️ RESET_SCHEMA=True: Dropping listings table...")
+            cur.execute("DROP TABLE IF EXISTS listings CASCADE;")
+            conn.commit()
+            print("   🗑️ listings table dropped")
+        
+        # Create unified listings table (idempotent)
+        print(f"📦 Ensuring v11.1 unified listings table exists...")
+        cur.execute(LISTINGS_V11_SCHEMA)
+        print("   ✅ listings table ready")
+        
+        # Create indexes (idempotent)
+        for idx_sql in LISTINGS_V11_INDEXES.strip().split(";"):
+            if idx_sql.strip():
+                try:
+                    cur.execute(idx_sql)
+                except Exception as e:
+                    pass  # Index already exists
+        print("   ✅ Indexes ready")
+        
+        conn.commit()
+        print(f"✅ v11.1 unified schema initialized")
+
+
+def clear_listings(conn, run_id: str = None):
+    """
+    v11.1: Clears listings table for a specific run or all data.
+    
+    Args:
+        conn: Database connection
+        run_id: If provided, only clears data for this run. If None, clears all.
+    """
+    with conn.cursor() as cur:
+        if run_id:
+            cur.execute("DELETE FROM listings WHERE run_id = %s", (run_id,))
+            print(f"🧹 Cleared run: {run_id}")
+        else:
+            cur.execute("DELETE FROM listings")
+            print("🧹 Cleared all listings")
+        conn.commit()
+
+
+# ==============================================================================
+# v11.1: UNIFIED LISTING INSERT - "One Product = One Row"
+# ==============================================================================
+
+
+def insert_listing(conn, run_id: str, data: Dict[str, Any]) -> int:
+    """
+    v11.1: Inserts a product row into the unified listings table.
+    
+    This represents ONE PRODUCT (not one Ricardo listing).
+    For bundles, call this multiple times with same bundle_id.
+    
+    Args:
+        conn: Database connection
+        run_id: Current run ID
+        data: Product data dict with all fields from unified schema
+    
+    Returns:
+        The listing row ID
+    """
+    # Serialize JSONB fields
+    web_sources = data.get("web_sources")
+    if web_sources and isinstance(web_sources, list):
+        web_sources = json.dumps(web_sources, ensure_ascii=False)
+    
+    # Validate price_source
+    valid_sources = {
+        'web_median', 'web_single', 'web_median_qty_adjusted',
+        'ai_estimate', 'query_baseline', 'buy_now_fallback',
+        'bundle_aggregate', 'market_auction', 'no_price'
+    }
+    price_source = data.get("price_source", "no_price")
+    if price_source not in valid_sources:
+        price_source = "no_price"
+    
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO listings (
+                run_id, platform, source_listing_id, title, description, url, image_url,
+                product_name, cleaned_name, product_type, variant_key,
+                quantity, bundle_id, is_bundle_component,
+                new_price_total, new_price_unit, resale_price_est_total, resale_price_unit,
+                buy_now_price, current_price_ricardo, predicted_final_price,
+                price_source, price_confidence, web_sources, quantity_parsed_from_snippet,
+                market_value, market_sample_size, market_based, buy_now_ceiling,
+                expected_profit, deal_score, recommended_strategy, strategy_reason,
+                bids_count, hours_remaining, end_time,
+                location, postal_code, shipping, shipping_cost, pickup_available, transport_car,
+                seller_rating,
+                web_search_used, vision_used, cache_hit, ai_cost_usd, ai_notes
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s,
+                %s, %s, %s, %s, %s
+            )
+            RETURNING id
+        """, (
+            run_id,
+            data.get("platform", "ricardo"),
+            data.get("source_listing_id"),
+            data.get("title"),
+            data.get("description"),
+            data.get("url"),
+            data.get("image_url"),
+            data.get("product_name"),
+            data.get("cleaned_name"),
+            data.get("product_type"),
+            data.get("variant_key"),
+            data.get("quantity", 1),
+            data.get("bundle_id"),
+            data.get("is_bundle_component", False),
+            data.get("new_price_total"),
+            data.get("new_price_unit"),
+            data.get("resale_price_est_total"),
+            data.get("resale_price_unit"),
+            data.get("buy_now_price"),
+            data.get("current_price_ricardo"),
+            data.get("predicted_final_price"),
+            price_source,
+            data.get("price_confidence"),
+            web_sources,
+            data.get("quantity_parsed_from_snippet", False),
+            data.get("market_value"),
+            data.get("market_sample_size", 0),
+            data.get("market_based", False),
+            data.get("buy_now_ceiling"),
+            data.get("expected_profit"),
+            data.get("deal_score"),
+            data.get("recommended_strategy"),
+            data.get("strategy_reason"),
+            data.get("bids_count"),
+            data.get("hours_remaining"),
+            data.get("end_time"),
+            data.get("location"),
+            data.get("postal_code"),
+            data.get("shipping"),
+            data.get("shipping_cost"),
+            data.get("pickup_available"),
+            data.get("transport_car"),
+            data.get("seller_rating"),
+            data.get("web_search_used", False),
+            data.get("vision_used", False),
+            data.get("cache_hit", False),
+            data.get("ai_cost_usd"),
+            data.get("ai_notes"),
+        ))
+        listing_id = cur.fetchone()[0]
+    
+    return listing_id
+
+
+# ==============================================================================
+# v11.1: QUERY & EXPORT HELPERS (Unified Schema)
+# ==============================================================================
+
+def get_listings(conn, run_id: str = None, 
+                 min_score: float = None,
+                 strategy: str = None,
+                 limit: int = 100) -> List[Dict]:
+    """
+    v11.1: Gets listings (products) from unified table.
+    
+    Args:
+        run_id: Filter by run (optional)
+        min_score: Minimum deal_score filter (optional)
+        strategy: Filter by recommended_strategy (optional)
+        limit: Max rows to return
+    
+    Returns:
+        List of listing dicts
+    """
+    conditions = []
+    params = []
+    
+    if run_id:
+        conditions.append("run_id = %s")
+        params.append(run_id)
+    if min_score is not None:
+        conditions.append("deal_score >= %s")
+        params.append(min_score)
+    if strategy:
+        conditions.append("recommended_strategy = %s")
+        params.append(strategy)
+    
+    where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+    params.append(limit)
+    
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT *
+            FROM listings
+            {where_clause}
+            ORDER BY deal_score DESC NULLS LAST, expected_profit DESC NULLS LAST
+            LIMIT %s
+        """, params)
+        
+        columns = [desc[0] for desc in cur.description]
+        results = []
+        for row in cur.fetchall():
+            d = dict(zip(columns, row))
+            # Parse JSONB fields
+            if d.get('web_sources') and isinstance(d['web_sources'], str):
+                try:
+                    d['web_sources'] = json.loads(d['web_sources'])
+                except:
+                    pass
+            results.append(d)
+        
+        return results
+
+
+def get_bundle_groups(conn, run_id: str = None, limit: int = 50) -> List[Dict]:
+    """
+    v11.1: Gets all bundle groups with their components.
+    """
+    conditions = ["bundle_id IS NOT NULL"]
+    params = []
+    
+    if run_id:
+        conditions.append("run_id = %s")
+        params.append(run_id)
+    
+    where_clause = "WHERE " + " AND ".join(conditions)
+    params.append(limit)
+    
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT bundle_id, COUNT(*) as component_count
+            FROM listings
+            {where_clause}
+            GROUP BY bundle_id
+            HAVING COUNT(*) > 1
+            ORDER BY COUNT(*) DESC
+            LIMIT %s
+        """, params)
+        
+        return [{"bundle_id": row[0], "component_count": row[1]} 
+                for row in cur.fetchall()]
+
+
+def export_listings_json(conn, run_id: str, filepath: str = "last_run_listings.json"):
+    """
+    v11.1: Exports listings to JSON file.
+    """
+    listings = get_listings(conn, run_id=run_id, limit=10000)
+    
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(listings, f, ensure_ascii=False, indent=2, default=str)
+    
+    print(f"📁 Exported {len(listings)} listings to {filepath}")
+    return len(listings)
+
+
+def export_listings_csv(conn, run_id: str, filepath: str = "last_run_listings.csv"):
+    """
+    v11.1: Exports listings to CSV file.
+    """
+    import csv
+    
+    listings = get_listings(conn, run_id=run_id, limit=10000)
+    
+    if not listings:
+        print(f"⚠️ No listings to export")
+        return 0
+    
+    # Flatten web_sources for CSV
+    for listing in listings:
+        if listing.get('web_sources'):
+            listing['web_sources'] = json.dumps(listing['web_sources'])
+    
+    fieldnames = list(listings[0].keys())
+    
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(listings)
+    
+    print(f"📁 Exported {len(listings)} listings to {filepath}")
+    return len(listings)
+
+
+# ==============================================================================
+# UPSERT (Legacy - kept for backward compatibility)
 # ==============================================================================
 
 def upsert_listing(conn, data: Dict[str, Any]):
     """
-    Inserts or updates a listing.
+    Inserts a listing into the unified listings table.
+    
+    v11.1: Changed from UPSERT to simple INSERT.
+    WHY: The unified listings table has NO unique constraint by design.
+         "One Product = One Row" allows duplicates (e.g., bundles).
+         Deduplication is handled by run_id + testing mode cleanup.
+    
+    FIELD MAPPING: main.py uses "listing_id" → DB expects "source_listing_id"
+    
     v7.3.5: Added run_id, web_search_used, cache_hit, ai_cost_usd fields.
     v7.0: Added seller_rating, shipping_cost, pickup_available fields.
     """
-    fields = [
-        "platform", "listing_id", "title", "description", "location", "postal_code",
-        "shipping", "transport_car", "end_time", "image_url", "url",
-        "ai_notes", "buy_now_price", "current_price_ricardo",
-        "bids_count", "new_price", "resale_price_est", "expected_profit",
-        "deal_score", "variant_key", "predicted_final_price",
-        # v5.0 fields
-        "is_bundle", "bundle_components", "resale_price_bundle",
-        "recommended_strategy", "strategy_reason",
-        "market_based_resale", "market_sample_size",
-        # v6.0 fields
-        "market_value", "price_source", "buy_now_ceiling", "hours_remaining",
-        # v7.0 fields
-        "seller_rating", "shipping_cost", "pickup_available",
-        # v7.3.5 fields
-        "run_id", "web_search_used", "cache_hit", "ai_cost_usd",
-        # v9.0 fields
-        "vision_used", "cleaned_title",
-    ]
-
-    # DEFENSIVE: Normalize ALL dict/list values to JSON strings before DB insert
-    # psycopg2 cannot adapt dict/list types - must be serialized
+    # Map incoming data fields to database columns
+    # CRITICAL: main.py uses "listing_id", but unified schema expects "source_listing_id"
+    field_mapping = {
+        "platform": "platform",
+        "listing_id": "source_listing_id",  # MAPPING FIX
+        "title": "title",
+        "description": "description",
+        "location": "location",
+        "postal_code": "postal_code",
+        "shipping": "shipping",
+        "transport_car": "transport_car",
+        "end_time": "end_time",
+        "image_url": "image_url",
+        "url": "url",
+        "ai_notes": None,  # SKIP - ai_notes is legacy, strategy_reason comes separately
+        "buy_now_price": "buy_now_price",
+        "current_price_ricardo": "current_price_ricardo",
+        "bids_count": "bids_count",
+        "new_price": "new_price_total",  # new_price → new_price_total
+        "resale_price_est": "resale_price_est_total",  # resale_price_est → resale_price_est_total
+        "expected_profit": "expected_profit",
+        "deal_score": "deal_score",
+        "variant_key": "variant_key",
+        "predicted_final_price": "predicted_final_price",
+        "prediction_confidence": None,  # SKIP - not in unified schema
+        "is_bundle": "is_bundle_component",  # is_bundle → is_bundle_component
+        "bundle_components": None,  # SKIP - this is JSONB data, not bundle_id
+        "resale_price_bundle": None,  # SKIP - already in resale_price_est_total
+        "recommended_strategy": "recommended_strategy",
+        "strategy_reason": "strategy_reason",
+        "market_based_resale": "market_based",  # market_based_resale → market_based
+        "market_sample_size": "market_sample_size",
+        "market_value": "market_value",
+        "price_source": "price_source",
+        "buy_now_ceiling": "buy_now_ceiling",
+        "hours_remaining": "hours_remaining",
+        "seller_rating": "seller_rating",
+        "shipping_cost": "shipping_cost",
+        "pickup_available": "pickup_available",
+        "run_id": "run_id",
+        "web_search_used": "web_search_used",
+        "cache_hit": None,  # SKIP - not in unified schema
+        "ai_cost_usd": None,  # SKIP - not in unified schema
+        "vision_used": "vision_used",
+        "cleaned_title": "cleaned_name",  # cleaned_title → cleaned_name
+        "extraction_confidence": None,  # SKIP - v10 field not in unified schema
+        "bundle_type_v10": None,  # SKIP - v10 field not in unified schema
+    }
+    
+    # Build SQL fields and values based on what's in data
+    db_fields = []
     values = []
-    for k in fields:
-        v = data.get(k)
-        # Convert any dict or list to JSON string (not just bundle_components)
-        if v is not None and isinstance(v, (dict, list)):
-            # OBSERVABILITY: Log dict/list normalization for debugging
-            type_name = "dict" if isinstance(v, dict) else "list"
-            print(f"   🗄️ DB normalize: field={k} ({type_name} → JSON)")
-            v = json.dumps(v, ensure_ascii=False)
-        values.append(v)
+    
+    for data_key, db_col in field_mapping.items():
+        if data_key in data:
+            # Skip fields not in unified schema (db_col is None)
+            if db_col is None:
+                continue
+            
+            v = data.get(data_key)
+            
+            # Convert any dict or list to JSON string
+            if v is not None and isinstance(v, (dict, list)):
+                type_name = "dict" if isinstance(v, dict) else "list"
+                print(f"   🗄️ DB normalize: field={db_col} ({type_name} → JSON)")
+                v = json.dumps(v, ensure_ascii=False)
+            
+            db_fields.append(db_col)
+            values.append(v)
+    
+    # DEFENSIVE VALIDATION: Check NOT NULL constraints BEFORE database insert
+    # This prevents cryptic PostgreSQL errors and provides clear diagnostics
+    required_fields = {
+        "run_id": "Run ID must be set",
+        "platform": "Platform must be set (default: 'ricardo')",
+        "source_listing_id": "Source listing ID (Ricardo ID) is required",
+    }
+    
+    missing_fields = []
+    for req_field, error_msg in required_fields.items():
+        if req_field not in db_fields:
+            missing_fields.append(f"  • {req_field}: {error_msg}")
+        else:
+            idx = db_fields.index(req_field)
+            if values[idx] is None or (isinstance(values[idx], str) and not values[idx].strip()):
+                missing_fields.append(f"  • {req_field}: {error_msg} (value is None or empty)")
+    
+    # CRITICAL: Validate price_source against CHECK constraint
+    # Schema enforces: price_source IN ('web_median', 'web_single', 'web_median_qty_adjusted',
+    #                                    'ai_estimate', 'query_baseline', 'buy_now_fallback',
+    #                                    'bundle_aggregate', 'market_auction', 'no_price')
+    valid_price_sources = {
+        'web_median', 'web_single', 'web_median_qty_adjusted',
+        'ai_estimate', 'query_baseline', 'buy_now_fallback',
+        'bundle_aggregate', 'market_auction', 'no_price'
+    }
+    
+    if "price_source" in db_fields:
+        idx = db_fields.index("price_source")
+        price_source_value = values[idx]
+        if price_source_value not in valid_price_sources:
+            missing_fields.append(
+                f"  • price_source: Invalid value '{price_source_value}'\n"
+                f"    Allowed: {', '.join(sorted(valid_price_sources))}"
+            )
+    
+    if missing_fields:
+        title = data.get('title', 'UNKNOWN')[:50]
+        error_report = "\n".join(missing_fields)
+        raise ValueError(
+            f"❌ PRE-INSERT VALIDATION FAILED for listing: {title}\n"
+            f"Missing or invalid required fields:\n{error_report}\n"
+            f"Data keys present: {list(data.keys())[:10]}"
+        )
     
     placeholders = ", ".join(["%s"] * len(values))
-    updates = ", ".join([f"{k}=EXCLUDED.{k}" for k in fields[2:]])  # skip platform+listing_id
 
+    # v11.1: Simple INSERT (no ON CONFLICT)
+    # The unified schema has no unique constraint - duplicates are OK
+    # Testing mode clears data by run_id, normal mode keeps history
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            INSERT INTO listings ({', '.join(fields)})
-            VALUES ({placeholders})
-            ON CONFLICT (platform, listing_id)
-            DO UPDATE SET {updates},
-                          updated_at = NOW();
+            INSERT INTO listings ({', '.join(db_fields)})
+            VALUES ({placeholders});
             """,
             values,
         )
@@ -436,7 +994,7 @@ def update_listing_details(conn, deal: Dict[str, Any]):
     update_sql = f"""
         UPDATE listings 
         SET {', '.join(updates)}, updated_at = NOW()
-        WHERE listing_id = %s AND platform = 'ricardo'
+        WHERE source_listing_id = %s AND platform = 'ricardo'
     """
     
     with conn.cursor() as cur:
@@ -483,7 +1041,7 @@ def update_listing_reevaluation(conn, data: Dict[str, Any]):
                 recommended_strategy = %s,
                 strategy_reason = %s,
                 updated_at = NOW()
-            WHERE listing_id = %s AND platform = 'ricardo'
+            WHERE source_listing_id = %s AND platform = 'ricardo'
         """, (
             data.get("expected_profit"),
             data.get("deal_score"),

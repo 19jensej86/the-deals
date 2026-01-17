@@ -64,9 +64,11 @@ bundle:
 
 search:
   queries:
-    - "Tommy Hilfiger"
-    - "Garmin smartwatch"
-    - "Hantelscheiben"
+    - "Garmin Fenix 7"
+    - "AirPods Pro"
+    - "Hantelscheibe 5kg"
+    - "Kurzhantel Set"
+    - "Tommy Hilfiger Hoodie"
 
 # =================================================
 # AI Configuration - v7.0 CLAUDE

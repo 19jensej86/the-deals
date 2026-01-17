@@ -54,6 +54,13 @@ from db_pg import (
     clear_expired_market_data,
     clear_stale_market_for_variant,
     update_listing_details,
+    # v11.1: Unified schema functions
+    ensure_schema_v2,
+    insert_listing,
+    get_listings,
+    get_bundle_groups,
+    export_listings_json,
+    export_listings_csv,
 )
 from scrapers.browser_ctx import (
     ensure_chrome_closed,
@@ -743,7 +750,7 @@ def run_v10_pipeline(
             
             price_source = ai_result.get("price_source", "ai_estimate")
             if ai_result.get("market_based_resale"):
-                price_source = ai_result.get("market_source", "auction_demand")
+                price_source = ai_result.get("market_source", "market_auction")
             
             # v10: Data sanity validation before DB insert
             current_price = listing.get("current_price_ricardo") or listing.get("price")
@@ -1185,10 +1192,21 @@ def run_once():
         print("⚠️ v10 Pipeline not available - ensure models/ and pipeline/ modules exist")
 
     # --------------------------------------------------------------------------
-    # 2) DATABASE CONNECTION
+    # 2) DATABASE CONNECTION + v11 SCHEMA RESET
     # --------------------------------------------------------------------------
     try:
         conn = get_conn(cfg.pg)
+        
+        # v11.1: Generate unique run_id for this execution
+        import uuid
+        run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        print(f"\n🆔 Run ID: {run_id}")
+        
+        # v11.1: SCHEMA INITIALIZATION (idempotent, no auto-drop)
+        print("\n🗄️ v11.1: Initializing unified schema...")
+        ensure_schema_v2(conn, reset_schema=False)
+        
+        # Also ensure legacy schema for backward compatibility during transition
         ensure_schema(conn)
         
         # Clear expired market data
@@ -1203,11 +1221,25 @@ def run_once():
         return
 
     # --------------------------------------------------------------------------
-    # 3) CLEAR DB IF TESTING MODE
+    # 3) DATA CLEARING BASED ON RUNTIME MODE
     # --------------------------------------------------------------------------
-    if cfg.db.clear_on_start:
-        print("\n⚠️ Testing mode: Clearing all listings from database...")
-        clear_listings(conn)
+    if cfg.runtime.mode == "testing":
+        # Testing mode: Clear data for this run_id only
+        print(f"\n🧪 Testing mode: Clearing data for run_id={run_id}...")
+        clear_listings(conn, run_id=run_id)
+        
+        # Also clear legacy table if configured
+        if cfg.db.clear_on_start:
+            print("   🧹 Also clearing legacy listings table...")
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM listings WHERE run_id = %s OR run_id IS NULL", (run_id,))
+                    conn.commit()
+            except Exception as e:
+                print(f"   ⚠️ Legacy clear failed: {e}")
+    else:
+        # Normal mode: Data persists across runs
+        print(f"\n💾 Normal mode: Data will persist (run_id={run_id})")
 
     # --------------------------------------------------------------------------
     # 4) CLEAR CACHES IF CONFIGURED

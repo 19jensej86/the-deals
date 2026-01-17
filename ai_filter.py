@@ -48,6 +48,38 @@ from decimal import Decimal
 
 from dotenv import load_dotenv
 
+# ==============================================================================
+# PRICE SOURCE CONSTANTS (Schema-Valid Enum)
+# ==============================================================================
+# These MUST match the CHECK constraint in db_pg.py LISTINGS_V11_SCHEMA
+# Any other value will cause: psycopg2.errors.CheckViolation
+
+PRICE_SOURCE_WEB_MEDIAN = "web_median"
+PRICE_SOURCE_WEB_SINGLE = "web_single"
+PRICE_SOURCE_WEB_QTY_ADJUSTED = "web_median_qty_adjusted"
+PRICE_SOURCE_AI_ESTIMATE = "ai_estimate"
+PRICE_SOURCE_QUERY_BASELINE = "query_baseline"
+PRICE_SOURCE_BUY_NOW_FALLBACK = "buy_now_fallback"
+PRICE_SOURCE_BUNDLE_AGGREGATE = "bundle_aggregate"
+PRICE_SOURCE_MARKET_AUCTION = "market_auction"
+PRICE_SOURCE_NO_PRICE = "no_price"
+
+# Internal-only constants (not in schema, used for logic flow)
+PRICE_SOURCE_UNKNOWN = "unknown"  # Temporary state, must be replaced before DB insert
+
+# Valid set for validation (schema-enforced values only)
+VALID_PRICE_SOURCES = {
+    PRICE_SOURCE_WEB_MEDIAN,
+    PRICE_SOURCE_WEB_SINGLE,
+    PRICE_SOURCE_WEB_QTY_ADJUSTED,
+    PRICE_SOURCE_AI_ESTIMATE,
+    PRICE_SOURCE_QUERY_BASELINE,
+    PRICE_SOURCE_BUY_NOW_FALLBACK,
+    PRICE_SOURCE_BUNDLE_AGGREGATE,
+    PRICE_SOURCE_MARKET_AUCTION,
+    PRICE_SOURCE_NO_PRICE,
+}
+
 load_dotenv()
 
 # v7.3.5: Import cache statistics tracking
@@ -342,6 +374,131 @@ def call_ai(
 
 
 # ==============================================================================
+# v11: EXPLICIT QUANTITY PARSING FROM SHOP SNIPPETS
+# ==============================================================================
+
+def parse_quantity_from_snippet(snippet: str) -> Dict[str, Any]:
+    """
+    v11: Parse quantity and weight from shop text snippets.
+    
+    Patterns recognized:
+    - "2 × 5 kg" → qty=2, weight=5
+    - "2x5kg" → qty=2, weight=5
+    - "Set 4 × 10 kg" → qty=4, weight=10
+    - "Paar 15kg" → qty=2, weight=15
+    - "2er Set 5kg" → qty=2, weight=5
+    
+    Returns:
+        Dict with quantity_in_offer, unit_weight_kg, pattern_matched
+    
+    RULE: Only return values if EXPLICITLY found in text. No assumptions!
+    """
+    import re
+    
+    if not snippet:
+        return {"quantity_in_offer": None, "unit_weight_kg": None, "pattern_matched": None}
+    
+    snippet_lower = snippet.lower().strip()
+    result = {"quantity_in_offer": None, "unit_weight_kg": None, "pattern_matched": None}
+    
+    # Pattern 1: "N × M kg" or "Nx M kg" (e.g., "2 × 5 kg", "4x10kg")
+    qty_weight_match = re.search(r'(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*kg', snippet_lower)
+    if qty_weight_match:
+        result["quantity_in_offer"] = int(qty_weight_match.group(1))
+        result["unit_weight_kg"] = float(qty_weight_match.group(2).replace(',', '.'))
+        result["pattern_matched"] = qty_weight_match.group(0)
+        return result
+    
+    # Pattern 2: "Paar" = 2 pieces (explicit)
+    if re.search(r'\bpaar\b', snippet_lower):
+        weight_match = re.search(r'(\d+(?:[.,]\d+)?)\s*kg', snippet_lower)
+        if weight_match:
+            result["quantity_in_offer"] = 2
+            result["unit_weight_kg"] = float(weight_match.group(1).replace(',', '.'))
+            result["pattern_matched"] = f"paar + {weight_match.group(0)}"
+            return result
+    
+    # Pattern 3: "2er Set" or "4er Pack" (German quantity indicators)
+    set_match = re.search(r'(\d+)er[\s-]*(set|pack|kit)', snippet_lower)
+    if set_match:
+        weight_match = re.search(r'(\d+(?:[.,]\d+)?)\s*kg', snippet_lower)
+        if weight_match:
+            result["quantity_in_offer"] = int(set_match.group(1))
+            result["unit_weight_kg"] = float(weight_match.group(1).replace(',', '.'))
+            result["pattern_matched"] = f"{set_match.group(0)} + {weight_match.group(0)}"
+            return result
+    
+    # Pattern 4: "Set of N" or "Pack of N" (English)
+    set_of_match = re.search(r'(set|pack)\s+of\s+(\d+)', snippet_lower)
+    if set_of_match:
+        weight_match = re.search(r'(\d+(?:[.,]\d+)?)\s*kg', snippet_lower)
+        if weight_match:
+            result["quantity_in_offer"] = int(set_of_match.group(2))
+            result["unit_weight_kg"] = float(weight_match.group(1).replace(',', '.'))
+            result["pattern_matched"] = f"{set_of_match.group(0)} + {weight_match.group(0)}"
+            return result
+    
+    # Pattern 5: Just weight, no quantity - do NOT assume qty=1!
+    weight_only_match = re.search(r'(\d+(?:[.,]\d+)?)\s*kg', snippet_lower)
+    if weight_only_match:
+        result["unit_weight_kg"] = float(weight_only_match.group(1).replace(',', '.'))
+        result["pattern_matched"] = weight_only_match.group(0)
+    
+    return result
+
+
+def compute_unit_price(total_price: float, quantity_in_offer: int) -> Optional[float]:
+    """
+    v11: Compute unit price from total price and quantity.
+    RULE: Only compute if quantity is explicitly known (not None, not 0).
+    """
+    if not total_price or total_price <= 0:
+        return None
+    if not quantity_in_offer or quantity_in_offer <= 0:
+        return None
+    return round(total_price / quantity_in_offer, 2)
+
+
+def build_web_source_entry(
+    price_item: Dict[str, Any],
+    parsed_qty: Dict[str, Any],
+    included_in_median: bool = True,
+    excluded_reason: str = None
+) -> Dict[str, Any]:
+    """
+    v11: Build complete web_sources entry with full audit trail.
+    """
+    total_price = price_item.get("price", 0)
+    snippet = price_item.get("snippet", "")
+    shop = price_item.get("shop", "unknown")
+    
+    qty = parsed_qty.get("quantity_in_offer")
+    weight = parsed_qty.get("unit_weight_kg")
+    pattern = parsed_qty.get("pattern_matched")
+    
+    unit_price = compute_unit_price(total_price, qty) if qty else None
+    computed_total = round(unit_price * qty, 2) if unit_price and qty else None
+    
+    entry = {
+        "shop": shop,
+        "price": total_price,
+        "snippet": snippet,
+        "quantity_in_offer": qty,
+        "unit_weight_kg": weight,
+        "unit_price": unit_price,
+        "computed_total_price": computed_total,
+        "currency": "CHF",
+        "pattern_matched": pattern,
+        "included_in_median": included_in_median,
+    }
+    
+    if excluded_reason:
+        entry["excluded_reason"] = excluded_reason
+    
+    return entry
+
+
+# ==============================================================================
 # v7.3: BATCH WEB SEARCH WITH RATE LIMIT HANDLING
 # ==============================================================================
 
@@ -353,10 +510,6 @@ def _call_claude_with_retry(
 ) -> Optional[str]:
     """
     v7.3.3: Call Claude with LONG wait on rate limit.
-    
-    Strategy: Wait 120s on first rate limit hit instead of quick retries.
-    This saves money because each retry costs ~$0.08!
-    User prefers waiting over paying multiple times.
     """
     import time
     
@@ -371,10 +524,8 @@ def _call_claude_with_retry(
         except Exception as e:
             error_str = str(e)
             if "429" in error_str or "rate_limit" in error_str.lower():
-                # v7.3.3: Wait 120s on first hit, 180s on second
-                # This avoids paying for multiple failed attempts!
                 wait_time = 120 if attempt == 0 else 180
-                print(f"   ⏳ Rate limit hit, waiting {wait_time}s (saves money vs quick retries)...")
+                print(f"   ⏳ Rate limit hit, waiting {wait_time}s...")
                 time.sleep(wait_time)
             else:
                 print(f"   ⚠️ Claude error: {e}")
@@ -502,7 +653,7 @@ def search_web_batch_for_new_prices(
         
         product_list = "\n".join([f"{idx+1}. {clean}" for idx, vk, clean in cleaned_terms])
         
-        # Compact prompt to minimize tokens
+        # v11: Enhanced prompt - request snippets for qty parsing audit trail
         prompt = f"""Finde Schweizer Neupreise (CHF) für diese {len(batch)} Produkte.
 Kategorie: {category}
 
@@ -511,11 +662,13 @@ PRODUKTE:
 
 Suche in: Digitec.ch, Galaxus.ch, Zalando.ch, Decathlon.ch, Manor.ch
 
-WICHTIG: Finde MEHRERE Preise pro Produkt (bis zu 5 Shops).
+WICHTIG: 
+1. Finde MEHRERE Preise pro Produkt (bis zu 5 Shops)
+2. Inkludiere "snippet" mit Produktbeschreibung (für Mengenangaben wie "2×5kg", "Paar", "Set of 2")
 
 Antworte NUR als JSON-Array:
 [
-  {{"nr": 1, "prices": [{{"price": 199.00, "shop": "Galaxus"}}, {{"price": 205.00, "shop": "Digitec"}}], "conf": 0.9}},
+  {{"nr": 1, "prices": [{{"price": 49.90, "shop": "Galaxus", "snippet": "ATX Bumper 2×5kg Set"}}, {{"price": 52.00, "shop": "Digitec", "snippet": "ATX Bumper 5kg single"}}], "conf": 0.9}},
   {{"nr": 2, "prices": [], "conf": 0.0}},
   ...
 ]
@@ -544,7 +697,12 @@ Bei unbekannt: prices=[], conf=0"""
                 print(f"   ⚠️ No JSON array in batch response")
                 continue
             
-            parsed = json.loads(json_match.group(0))
+            try:
+                parsed = json.loads(json_match.group(0))
+            except json.JSONDecodeError as e:
+                print(f"   ⚠️ Batch web search failed: {e}")
+                print(f"   📄 Raw JSON (first 500 chars): {json_match.group(0)[:500]}")
+                continue
             
             for item in parsed:
                 nr = item.get("nr", 0) - 1  # Convert to 0-indexed
@@ -553,72 +711,125 @@ Bei unbekannt: prices=[], conf=0"""
                     prices_list = item.get("prices", [])
                     conf = item.get("conf", 0.0)
                     
-                    # PROBLEM 1: MULTI-SOURCE WEB PRICE MEDIAN
-                    # Collect multiple prices, remove outliers, compute median
+                    # v11: EXPLICIT QUANTITY PARSING + FULL AUDIT TRAIL
+                    # Parse qty from snippets, compute unit prices, build web_sources
                     if prices_list and conf >= 0.6:
-                        # Extract valid prices (up to 5)
+                        # Build web_sources entries with full audit trail
+                        web_sources = []
                         valid_prices = []
+                        unit_prices = []  # For qty-adjusted median
                         shops = []
+                        has_qty_data = False
+                        
                         for price_item in prices_list[:5]:
                             p = price_item.get("price")
                             s = price_item.get("shop")
-                            if p and p > 0:
-                                valid_prices.append(float(p))
-                                shops.append(s or "unknown")
+                            snippet = price_item.get("snippet", "")
+                            
+                            if not p or p <= 0:
+                                continue
+                            
+                            # Parse quantity from snippet
+                            parsed_qty = parse_quantity_from_snippet(snippet)
+                            
+                            # Build audit entry
+                            entry = build_web_source_entry(
+                                price_item, parsed_qty, 
+                                included_in_median=True
+                            )
+                            web_sources.append(entry)
+                            
+                            # Collect prices
+                            valid_prices.append(float(p))
+                            shops.append(s or "unknown")
+                            
+                            # If qty explicit, use unit price for median
+                            if parsed_qty.get("quantity_in_offer"):
+                                has_qty_data = True
+                                unit_p = entry.get("unit_price")
+                                if unit_p:
+                                    unit_prices.append(unit_p)
+                                    print(f"      📊 {s}: {p:.2f} CHF / {parsed_qty['quantity_in_offer']} = {unit_p:.2f} CHF/Stück")
                         
                         if valid_prices:
-                            # Compute initial median
-                            valid_prices_sorted = sorted(valid_prices)
-                            n = len(valid_prices_sorted)
-                            if n == 1:
-                                median_price = valid_prices_sorted[0]
-                                final_prices = valid_prices_sorted
+                            # Decide which prices to use for median
+                            # If we have unit prices from qty parsing, use those
+                            if unit_prices and len(unit_prices) >= 1:
+                                prices_for_median = unit_prices
+                                use_unit_prices = True
                             else:
-                                # Median calculation
+                                prices_for_median = valid_prices
+                                use_unit_prices = False
+                            
+                            # Compute initial median
+                            prices_sorted = sorted(prices_for_median)
+                            n = len(prices_sorted)
+                            if n == 1:
+                                median_price = prices_sorted[0]
+                                final_prices = prices_sorted
+                            else:
                                 if n % 2 == 0:
-                                    median_price = (valid_prices_sorted[n//2 - 1] + valid_prices_sorted[n//2]) / 2
+                                    median_price = (prices_sorted[n//2 - 1] + prices_sorted[n//2]) / 2
                                 else:
-                                    median_price = valid_prices_sorted[n//2]
+                                    median_price = prices_sorted[n//2]
                                 
-                                # Remove outliers: keep prices within ±40% of median
+                                # Remove outliers: ±40% of median
                                 lower_bound = median_price * 0.6
                                 upper_bound = median_price * 1.4
-                                final_prices = [p for p in valid_prices if lower_bound <= p <= upper_bound]
+                                final_prices = []
+                                
+                                for i, p in enumerate(prices_for_median):
+                                    if lower_bound <= p <= upper_bound:
+                                        final_prices.append(p)
+                                        if i < len(web_sources):
+                                            web_sources[i]["included_in_median"] = True
+                                    else:
+                                        if i < len(web_sources):
+                                            web_sources[i]["included_in_median"] = False
+                                            if p < lower_bound:
+                                                web_sources[i]["excluded_reason"] = "outlier_below_40pct"
+                                            else:
+                                                web_sources[i]["excluded_reason"] = "outlier_above_40pct"
                                 
                                 # Recompute median after outlier removal
                                 if final_prices:
-                                    final_prices_sorted = sorted(final_prices)
-                                    n_final = len(final_prices_sorted)
+                                    final_sorted = sorted(final_prices)
+                                    n_final = len(final_sorted)
                                     if n_final % 2 == 0:
-                                        median_price = (final_prices_sorted[n_final//2 - 1] + final_prices_sorted[n_final//2]) / 2
+                                        median_price = (final_sorted[n_final//2 - 1] + final_sorted[n_final//2]) / 2
                                     else:
-                                        median_price = final_prices_sorted[n_final//2]
+                                        median_price = final_sorted[n_final//2]
                                 else:
-                                    # All outliers - use original median
-                                    final_prices = valid_prices_sorted
+                                    final_prices = prices_sorted
                             
-                            # Determine price_source based on sample size
-                            if len(final_prices) >= 2:
-                                price_source = "web_median"
+                            # Determine price_source
+                            if use_unit_prices:
+                                price_source = PRICE_SOURCE_WEB_QTY_ADJUSTED if len(final_prices) >= 2 else PRICE_SOURCE_WEB_SINGLE
+                            elif len(final_prices) >= 2:
+                                price_source = PRICE_SOURCE_WEB_MEDIAN
                             else:
-                                price_source = f"web_{shops[0].lower()}" if shops else "web_single"
+                                price_source = PRICE_SOURCE_WEB_SINGLE
                             
                             result = {
                                 "new_price": round(median_price, 2),
                                 "price_source": price_source,
-                                "shop_name": ", ".join(shops[:3]),  # First 3 shops
+                                "shop_name": ", ".join(shops[:3]),
                                 "confidence": conf,
                                 "market_sample_size": len(final_prices),
                                 "market_value": round(median_price, 2),
                                 "market_based": True,
+                                "web_sources": web_sources,  # v11: Full audit trail
                             }
                             
                             # Cache it
                             set_cached_web_price(vk, result["new_price"], price_source, result["shop_name"])
                             results[vk] = result
                             
-                            if len(final_prices) >= 2:
-                                print(f"   ✅ {vk[:40]}... = {median_price:.2f} CHF (median of {len(final_prices)} prices: {shops[:3]})")
+                            # Enhanced logging
+                            if use_unit_prices:
+                                print(f"   ✅ {vk[:40]}... = {median_price:.2f} CHF/Stück (qty-adjusted median of {len(final_prices)})")
+                            elif len(final_prices) >= 2:
+                                print(f"   ✅ {vk[:40]}... = {median_price:.2f} CHF (median of {len(final_prices)} prices)")
                             else:
                                 print(f"   ✅ {vk[:40]}... = {median_price:.2f} CHF ({shops[0]})")
                         else:
@@ -1535,7 +1746,7 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
             
             if web_result and web_result.get("new_price"):
                 new_price = web_result["new_price"]
-                price_source = web_result.get("price_source", "web_batch")
+                price_source = web_result.get("price_source", PRICE_SOURCE_WEB_SINGLE)
                 
                 # Calculate resale with sanity checks
                 resale_price = new_price * resale_rate
@@ -1572,7 +1783,7 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
                         "resale_price": None,
                         "market_based": False,
                         "market_sample_size": 0,
-                        "price_source": "unknown",
+                        "price_source": PRICE_SOURCE_UNKNOWN,
                     }
     
     # Final pass: AI estimation for variants still missing prices
@@ -1586,7 +1797,7 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
             if vk in results:
                 if results[vk].get("new_price") is None:
                     results[vk]["new_price"] = info.get("new_price")
-                    results[vk]["price_source"] = "ai_estimate"
+                    results[vk]["price_source"] = PRICE_SOURCE_AI_ESTIMATE
             else:
                 results[vk] = info
     
@@ -1680,7 +1891,7 @@ Antworte NUR als JSON:
                                     "resale_price": resale_price if resale_price > 0 else new_price * resale_rate,
                                     "market_based": False,
                                     "market_sample_size": 0,
-                                    "price_source": "ai_estimate",
+                                    "price_source": PRICE_SOURCE_AI_ESTIMATE,
                                 }
                                 set_cached_variant_info(vk, new_price, transport, resale_price, False, 0)
                         except:
@@ -1856,13 +2067,13 @@ def price_bundle_components(
         web_result = web_prices.get(name)
         if web_result and web_result.get("new_price"):
             est_new = web_result["new_price"]
-            price_source = "pre_fetched"
+            price_source = PRICE_SOURCE_WEB_SINGLE  # Pre-fetched from web search
             print(f"      {name}: {est_new} CHF (pre-fetched)")
         else:
             # Fallback: AI estimation
             est_new = _estimate_component_price(name, category, query_analysis)
             est_new = _adjust_price_for_model_year(name, est_new, category)
-            price_source = "ai_estimate"
+            price_source = PRICE_SOURCE_AI_ESTIMATE
             print(f"      {name}: {est_new} CHF (AI fallback)")
         
         # Guard: Skip component if price estimation failed
@@ -2215,7 +2426,7 @@ def evaluate_listing_with_ai(
         "market_based_resale": False,
         "market_sample_size": 0,
         "market_value": None,
-        "price_source": "unknown",
+        "price_source": PRICE_SOURCE_UNKNOWN,
         "buy_now_ceiling": None,
     }
     
@@ -2227,7 +2438,7 @@ def evaluate_listing_with_ai(
         result["market_sample_size"] = variant_info.get("market_sample_size", 0)
         result["market_value"] = variant_info.get("market_value")
         result["buy_now_ceiling"] = variant_info.get("buy_now_ceiling")
-        result["price_source"] = variant_info.get("price_source", "unknown")
+        result["price_source"] = variant_info.get("price_source", PRICE_SOURCE_UNKNOWN)
         
         if variant_info.get("resale_price"):
             result["resale_price_est"] = variant_info["resale_price"]
@@ -2235,7 +2446,7 @@ def evaluate_listing_with_ai(
     # v7.2.1: Fallback new_price to buy_now_price if web search failed
     if not result["new_price"] and buy_now_price and buy_now_price > 0:
         result["new_price"] = buy_now_price * 1.1  # Conservative estimate: assume 10% markup
-        result["price_source"] = "buy_now_fallback"
+        result["price_source"] = PRICE_SOURCE_BUY_NOW_FALLBACK
         print(f"   Using buy_now_price as new_price fallback: {result['new_price']:.2f} CHF")
     
     # v7.2.1: Calculate resale_price_est from new_price if missing
@@ -2249,8 +2460,8 @@ def evaluate_listing_with_ai(
         # Reverse calculate: new_price = resale_price / resale_rate
         estimated_new = result["resale_price_est"] / resale_rate if resale_rate > 0 else result["resale_price_est"] * 2
         result["new_price"] = round(estimated_new, 2)
-        if result["price_source"] == "unknown":
-            result["price_source"] = "estimated_from_resale"
+        if result["price_source"] == PRICE_SOURCE_UNKNOWN:
+            result["price_source"] = PRICE_SOURCE_AI_ESTIMATE  # Estimated from resale
     
     # QUANTITY-AWARE RESALE: Apply quantity multiplication for single products
     # CRITICAL: This must happen AFTER unit resale is calculated but BEFORE profit calculation
@@ -2318,7 +2529,7 @@ def evaluate_listing_with_ai(
             result["resale_price_bundle"] = bundle_resale
             result["resale_price_est"] = bundle_resale
             result["new_price"] = bundle_new
-            result["price_source"] = "bundle_calculation"
+            result["price_source"] = PRICE_SOURCE_BUNDLE_AGGREGATE
     
     # FIX #1: QUERY BASELINE FALLBACK - Final safety net to prevent NULL/0 resale prices
     # If ALL price sources failed (web, AI, market, buy_now, bundle), use query baseline
@@ -2336,7 +2547,7 @@ def evaluate_listing_with_ai(
             result["new_price"] = round(baseline_new, 2)
             result["resale_price_est"] = round(baseline_new * baseline_resale_rate, 2)
         
-        result["price_source"] = "query_baseline"
+        result["price_source"] = PRICE_SOURCE_QUERY_BASELINE
         print(f"   ⚠️ Query baseline fallback: new={result['new_price']:.2f}, resale={result['resale_price_est']:.2f} CHF")
     
     # Calculate profit
@@ -2385,7 +2596,7 @@ def evaluate_listing_with_ai(
     
     # market_sample_size: Set based on price_source if not already set
     if result["market_sample_size"] == 0:
-        if result["price_source"] == "web_median":
+        if result["price_source"] == PRICE_SOURCE_WEB_MEDIAN:
             # Already set from websearch, keep it
             pass
         elif result["price_source"].startswith("web_"):

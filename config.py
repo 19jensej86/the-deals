@@ -28,6 +28,12 @@ class PGConf:
 
 
 @dataclass
+class RuntimeConf:
+    """Runtime mode settings"""
+    mode: str = "testing"  # "testing" or "normal"
+
+
+@dataclass
 class DBConf:
     """Database behavior settings"""
     clear_on_start: bool = True
@@ -118,6 +124,7 @@ class Cfg:
     """Main configuration container"""
     general: GeneralConf
     pg: PGConf
+    runtime: RuntimeConf
     db: DBConf
     cache: CacheConf
     profit: ProfitConf
@@ -158,6 +165,7 @@ def load_config() -> Cfg:
     # Parse sections
     general = y.get("general", {})
     pg = y.get("postgres", {})
+    runtime = y.get("runtime", {})
     db = y.get("db", {})
     cache = y.get("cache", {})
     profit = y.get("profit", {})
@@ -184,6 +192,9 @@ def load_config() -> Cfg:
             db=pg.get("db", "dealfinder"),
             user=pg.get("user", "dealuser"),
             password=pg.get("password", ""),
+        ),
+        runtime=RuntimeConf(
+            mode=runtime.get("mode", "testing"),
         ),
         db=DBConf(
             clear_on_start=db.get("clear_on_start", False),
@@ -245,6 +256,7 @@ def print_config_summary(cfg: Cfg):
     print(f"  Car model:        {cfg.general.car_model}")
     print(f"  Max pages:        {cfg.general.max_pages_list}")
     print(f"  Max per query:    {cfg.general.max_listings_per_query}")
+    print(f"  Runtime mode:     {cfg.runtime.mode.upper()}")
     print(f"  DB clear start:   {cfg.db.clear_on_start}")
     print(f"  Cache enabled:    {cfg.cache.enabled}")
     print(f"  Cache clear:      {cfg.cache.clear_on_start}")
