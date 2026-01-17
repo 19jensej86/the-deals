@@ -48,10 +48,6 @@ from decimal import Decimal
 
 from dotenv import load_dotenv
 
-# PROBLEM 2: WEIGHT-BASED MONOTONIC PRICING CONSISTENCY
-# Global tracker for weight-based pricing within current run
-_weight_pricing_tracker: Dict[str, Dict[float, float]] = {}  # {product_type: {weight_kg: price_per_kg}}
-
 load_dotenv()
 
 # v7.3.5: Import cache statistics tracking
@@ -719,7 +715,12 @@ def get_weight_type(text: str) -> str:
 
 
 def validate_weight_price(text: str, price: float, is_resale: bool = True) -> Tuple[float, str]:
-    """Validate and potentially adjust weight plate pricing."""
+    """
+    Validate weight plate pricing - ONLY for single-source fallbacks.
+    
+    MEDIAN-FIRST RULE: This is NOT applied to web_median prices.
+    Only used for: web_single, ai_estimate, query_baseline
+    """
     if not is_weight_plate(text):
         return price, "not_weight_plate"
 
@@ -741,66 +742,6 @@ def validate_weight_price(text: str, price: float, is_resale: bool = True) -> Tu
         return typical_price, f"capped_to_{weight_type}_{weight_kg}kg"
 
     return price, f"valid_{weight_type}_{weight_kg}kg"
-
-
-def enforce_weight_monotonic_pricing(title: str, new_price: float, product_type: str) -> Tuple[float, bool]:
-    """
-    PROBLEM 2: WEIGHT-BASED MONOTONIC PRICING CONSISTENCY
-    
-    Ensures heavier weights don't have lower price_per_kg than lighter weights.
-    Tracks price_per_kg across the run and enforces monotonic consistency.
-    
-    Rules:
-    - If 10kg price_per_kg > 5kg * 1.2 → clamp to 5kg * 1.2
-    - If 2.5kg price_per_kg > 5kg * 1.5 → clamp to 5kg * 1.5
-    
-    Returns:
-        (adjusted_price, was_adjusted)
-    """
-    global _weight_pricing_tracker
-    
-    # Only apply to fitness weight products
-    if product_type.lower() not in ["hantelscheibe", "kettlebell", "gewichtsscheibe", "hantel"]:
-        return new_price, False
-    
-    weight_kg = extract_weight_kg(title)
-    if not weight_kg or weight_kg <= 0:
-        return new_price, False
-    
-    price_per_kg = new_price / weight_kg
-    
-    # Initialize tracker for this product type
-    if product_type not in _weight_pricing_tracker:
-        _weight_pricing_tracker[product_type] = {}
-    
-    tracker = _weight_pricing_tracker[product_type]
-    adjusted = False
-    adjusted_price = new_price
-    
-    # Check against lighter weights (should have higher price_per_kg)
-    for tracked_weight, tracked_price_per_kg in tracker.items():
-        if tracked_weight < weight_kg:
-            # Heavier weight should NOT have higher price_per_kg than lighter weight
-            # Allow some tolerance based on weight ratio
-            if tracked_weight <= weight_kg / 2:
-                # Very light (e.g., 2.5kg vs 10kg) - allow 1.5x
-                max_allowed_price_per_kg = tracked_price_per_kg * 1.5
-            else:
-                # Similar weight (e.g., 5kg vs 10kg) - allow 1.2x
-                max_allowed_price_per_kg = tracked_price_per_kg * 1.2
-            
-            if price_per_kg > max_allowed_price_per_kg:
-                adjusted_price = round(max_allowed_price_per_kg * weight_kg, 2)
-                adjusted = True
-                print(f"   ⚖️ Weight consistency: {weight_kg}kg price clamped from {new_price:.2f} to {adjusted_price:.2f} CHF")
-                print(f"      Reason: {weight_kg}kg had {price_per_kg:.2f} CHF/kg > {tracked_weight}kg * 1.2-1.5 ({max_allowed_price_per_kg:.2f} CHF/kg)")
-                price_per_kg = max_allowed_price_per_kg
-                break
-    
-    # Record this weight's price_per_kg for future comparisons
-    tracker[weight_kg] = price_per_kg
-    
-    return adjusted_price, adjusted
 
 
 # ==============================================================================
@@ -1595,13 +1536,6 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
             if web_result and web_result.get("new_price"):
                 new_price = web_result["new_price"]
                 price_source = web_result.get("price_source", "web_batch")
-                
-                # PROBLEM 2: Apply weight monotonic pricing consistency
-                # Extract product_type from variant_key for weight-based products
-                product_type = vk.split("|")[0] if "|" in vk else vk.split()[0] if vk else ""
-                adjusted_price, was_adjusted = enforce_weight_monotonic_pricing(vk, new_price, product_type)
-                if was_adjusted:
-                    new_price = adjusted_price
                 
                 # Calculate resale with sanity checks
                 resale_price = new_price * resale_rate

@@ -1,58 +1,64 @@
 {
-  "export_time": "2026-01-17T13:56:41.817719",
-  "quality_score": 52.0,
+  "export_time": "2026-01-17T14:49:29.211891",
+  "quality_score": 42.0,
   "summary": {
     "total_listings": 24,
-    "profitable_deals": 8,
+    "profitable_deals": 11,
     "bundles_detected": 1,
-    "web_searches_used": 6,
+    "web_searches_used": 4,
     "web_search_api_calls": 1,
-    "run_cost_usd": 0.359
+    "run_cost_usd": 0.356
   },
   "price_sources": {
     "ai_estimate": 12,
-    "query_baseline": 5,
-    "web_decathlon": 2,
-    "web_digitec": 2,
-    "bundle_calculation": 1,
-    "web_manor": 2
+    "query_baseline": 7,
+    "auction_demand": 4,
+    "buy_now_fallback": 1
   },
   "strategies": {
-    "bid": 7,
-    "buy_now": 1,
-    "skip": 16
+    "watch": 3,
+    "bid": 8,
+    "skip": 13
   },
   "profit_stats": {
-    "max": 111.65,
-    "min": -312.4,
-    "avg": -21.198333333333334,
-    "profitable_count": 8
+    "max": 112.1,
+    "min": -439.54,
+    "avg": -36.505833333333335,
+    "profitable_count": 11
   },
   "issues": {
     "bundle_default_prices": [],
     "suspicious_prices": [
       {
         "title": "Kettler Hantelscheiben, 2 Stk. à 2.5kg",
-        "issue": "22.0 CHF/kg is too high for weight plates"
+        "issue": "32.0 CHF/kg is too high for weight plates"
       },
       {
         "title": "Kettler Hantelscheiben, 2 Stk. à 2.5kg",
-        "issue": "22.0 CHF/kg is too high for weight plates"
+        "issue": "32.0 CHF/kg is too high for weight plates"
       },
       {
         "title": "Kettler Hantelscheiben, 2 Stk. à 2.5kg",
-        "issue": "22.0 CHF/kg is too high for weight plates"
+        "issue": "32.0 CHF/kg is too high for weight plates"
       },
       {
         "title": "Kettler Hantelscheiben, 2 Stk. à 2.5kg",
-        "issue": "22.0 CHF/kg is too high for weight plates"
+        "issue": "32.0 CHF/kg is too high for weight plates"
       },
       {
-        "title": "Kettler Hantelscheibe, 5kg",
-        "issue": "22.0 CHF/kg is too high for weight plates"
+        "title": "Body Shape Hantelscheiben, 2 Stk. à 5kg",
+        "issue": "32.0 CHF/kg is too high for weight plates"
+      },
+      {
+        "title": "Body Shape Hantelscheiben, 2 Stk. à 10kg",
+        "issue": "16.0 CHF/kg is too high for weight plates"
+      },
+      {
+        "title": "Hantelscheiben Set 107,5kg (neu)",
+        "issue": "32.0 CHF/kg is too high for weight plates"
       }
     ],
-    "total_issues": 5
+    "total_issues": 7
   },
   "recommendations": [
     "Some prices appear unrealistic - check AI fallback logic"
