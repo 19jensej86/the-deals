@@ -441,6 +441,14 @@ def run_v10_pipeline(
                 listing["_bundle_type"] = extracted.bundle_type
                 listing["_extraction_confidence"] = extracted.overall_confidence
                 
+                # CRITICAL: Store final_search_name as stable join key for price mapping
+                final_search_name_extracted = first_product.final_search_name or identity.websearch_base
+                listing["_final_search_name"] = final_search_name_extracted
+                
+                # DEFENSIVE: Log if final_search_name differs from websearch_base (potential mapping issue)
+                if first_product.final_search_name and first_product.final_search_name != identity.websearch_base:
+                    print(f"   ℹ️ final_search_name='{first_product.final_search_name}' differs from websearch_base='{identity.websearch_base}'")
+                
                 # CRITICAL: Store detail data if available
                 if hasattr(extracted, 'detail_data') and extracted.detail_data:
                     listing["_detail_data"] = extracted.detail_data
@@ -449,6 +457,8 @@ def run_v10_pipeline(
                 listing["_cleaned_title"] = None
                 listing["_products"] = []
                 listing["_is_bundle"] = False
+                listing["_final_search_name"] = None
+                listing["_quantity"] = 1
     
     # Count valid extractions
     valid_extractions = len([ep for ep in extracted_products if ep.products])
@@ -478,6 +488,7 @@ def run_v10_pipeline(
     # Generate websearch queries for all extracted products
     websearch_queries = []
     product_key_to_query = {}
+    final_search_name_to_product_key = {}  # CRITICAL: Map final_search_name -> product_key for price lookup
     
     for extracted in extracted_products:
         if not extracted.products or not extracted.can_price:
@@ -486,9 +497,11 @@ def run_v10_pipeline(
         for product in extracted.products:
             query = generate_websearch_query(product)
             identity = ProductIdentity.from_product_spec(product)
+            final_search_name = product.final_search_name or identity.websearch_base
             
             websearch_queries.append(query.primary_query)
             product_key_to_query[identity.product_key] = query
+            final_search_name_to_product_key[final_search_name] = identity.product_key
     
     # Deduplicate queries
     unique_queries = list(set(websearch_queries))
@@ -566,13 +579,23 @@ def run_v10_pipeline(
         query_analysis=first_analysis,
     )
     
-    # Map results to product keys
-    variant_info_by_key = {}
+    # CRITICAL FIX: Build price_map keyed by final_search_name for stable lookup
+    # Old mapping: query_str -> product_key (BROKEN - query_str != product_key)
+    # New mapping: final_search_name -> price_info (STABLE - AI-generated join key)
+    price_map_by_final_search_name = {}
+    variant_info_by_key = {}  # Keep for backward compatibility
+    
     for query_str, info in variant_info_map.items():
-        # Find matching product key
+        # Find matching product key via query object
         for pk, query_obj in product_key_to_query.items():
             if query_obj.primary_query == query_str:
                 variant_info_by_key[pk] = info
+                
+                # CRITICAL: Also map by final_search_name for stable price lookup
+                for final_search_name, mapped_pk in final_search_name_to_product_key.items():
+                    if mapped_pk == pk:
+                        price_map_by_final_search_name[final_search_name] = info
+                        break
                 break
     
     web_found = sum(1 for v in variant_info_by_key.values() if v.get("new_price"))
@@ -627,19 +650,47 @@ def run_v10_pipeline(
         for listing in listings:
             title = listing.get("title", "")
             variant_key = listing.get("variant_key")
+            final_search_name = listing.get("_final_search_name")
             
             current_price = listing.get("current_price_ricardo")
             buy_now = listing.get("buy_now_price")
             bids_count = listing.get("bids_count")
             hours_remaining = listing.get("hours_remaining")
             
-            # Get variant info from global cache (use variant_info_by_key from v10 pipeline)
-            variant_info = variant_info_by_key.get(variant_key) if variant_key else None
+            # CRITICAL FIX: Lookup price by final_search_name (stable join key)
+            # Old: variant_info_by_key.get(variant_key) - BROKEN mapping
+            # New: price_map_by_final_search_name.get(final_search_name) - STABLE mapping
+            variant_info = None
+            if final_search_name:
+                variant_info = price_map_by_final_search_name.get(final_search_name)
+                if not variant_info:
+                    print(f"   ⚠️ DB persist: no price found for final_search_name='{final_search_name}'")
+            
+            # Fallback to old mapping for backward compatibility
+            if not variant_info and variant_key:
+                variant_info = variant_info_by_key.get(variant_key)
+                if not variant_info:
+                    print(f"   ⚠️ DB persist: no price found for variant_key='{variant_key}'")
+            
+            # DEFENSIVE INTEGRITY GUARD: If variant_info is still None AND buy_now_price exists
+            # Create minimal variant_info to GUARANTEE new_price is populated
+            # NOTE: Fallback also exists in ai_filter.py:2163-2166, but artifacts prove it's not reliably executed
+            # This is intentionally redundant until root cause is identified and hardened
+            if not variant_info and buy_now:
+                variant_info = {
+                    "new_price": buy_now * 1.1,  # Conservative estimate: 10% markup
+                    "price_source": "buy_now_fallback",
+                    "transport_car": True,
+                    "market_based": False,
+                    "market_sample_size": 0,
+                }
+                print(f"   💰 Using buy_now_price as fallback: {variant_info['new_price']:.2f} CHF")
             
             # v10: Use query-agnostic bundle detection result
             is_bundle = listing.get("_is_bundle", False)
             bundle_type = listing.get("_bundle_type", BundleType.SINGLE_PRODUCT)
             products = listing.get("_products", [])
+            quantity = listing.get("_quantity", 1)
             
             # Create batch_bundle_result from query-agnostic detection
             batch_bundle_result = None
@@ -672,6 +723,7 @@ def run_v10_pipeline(
                 query_analysis=query_analysis,
                 batch_bundle_result=batch_bundle_result,
                 variant_info_by_key=variant_info_by_key,
+                quantity=quantity,
             )
             
             # Log result
@@ -713,6 +765,27 @@ def run_v10_pipeline(
             if resale and not new_price:
                 new_price = resale / 0.40  # Assume 40% resale rate
                 ai_result["new_price"] = round(new_price, 2)
+            
+            # FIX #2: BAN price_source='unknown' - Hard safety net at DB persistence
+            # If price_source is still 'unknown', this is data corruption - replace with query_baseline
+            # This should NEVER happen after FIX #1, but acts as final defense layer
+            if price_source == "unknown":
+                print(f"   🚨 SAFETY NET: Replacing price_source='unknown' with 'query_baseline' for {listing['listing_id']}")
+                price_source = "query_baseline"
+                
+                # Ensure prices are not NULL - use query baseline if needed
+                if not ai_result.get("new_price") or not ai_result.get("resale_price_est"):
+                    from ai_filter import _get_new_price_estimate, _get_resale_rate
+                    baseline_new = _get_new_price_estimate(query_analysis)
+                    baseline_resale_rate = _get_resale_rate(query_analysis)
+                    quantity = listing.get("_quantity", 1)
+                    
+                    if not ai_result.get("new_price"):
+                        ai_result["new_price"] = round(baseline_new, 2)
+                    if not ai_result.get("resale_price_est"):
+                        ai_result["resale_price_est"] = round(baseline_new * baseline_resale_rate * quantity, 2)
+                    
+                    print(f"      Applied baseline: new={ai_result['new_price']:.2f}, resale={ai_result['resale_price_est']:.2f} CHF")
             
             data = {
                 "platform": "ricardo",

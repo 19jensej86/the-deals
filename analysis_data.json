@@ -1,39 +1,60 @@
 {
-  "export_time": "2026-01-15T23:31:53.819205",
-  "quality_score": 69.0,
+  "export_time": "2026-01-17T13:56:41.817719",
+  "quality_score": 52.0,
   "summary": {
     "total_listings": 24,
-    "profitable_deals": 6,
-    "bundles_detected": 4,
-    "web_searches_used": 7,
+    "profitable_deals": 8,
+    "bundles_detected": 1,
+    "web_searches_used": 6,
     "web_search_api_calls": 1,
     "run_cost_usd": 0.359
   },
   "price_sources": {
-    "ai_estimate": 9,
-    "web_galaxus": 1,
-    "web_manor": 2,
-    "bundle_calculation": 4,
-    "unknown": 4,
-    "web_decathlon": 1,
-    "buy_now_fallback": 1,
-    "web_toppreise": 1,
-    "web_digitec": 1
+    "ai_estimate": 12,
+    "query_baseline": 5,
+    "web_decathlon": 2,
+    "web_digitec": 2,
+    "bundle_calculation": 1,
+    "web_manor": 2
   },
   "strategies": {
-    "watch": 6,
-    "skip": 18
+    "bid": 7,
+    "buy_now": 1,
+    "skip": 16
   },
   "profit_stats": {
-    "max": 32.24,
-    "min": -247.9,
-    "avg": -25.13208333333333,
-    "profitable_count": 6
+    "max": 111.65,
+    "min": -312.4,
+    "avg": -21.198333333333334,
+    "profitable_count": 8
   },
   "issues": {
     "bundle_default_prices": [],
-    "suspicious_prices": [],
-    "total_issues": 0
+    "suspicious_prices": [
+      {
+        "title": "Kettler Hantelscheiben, 2 Stk. à 2.5kg",
+        "issue": "22.0 CHF/kg is too high for weight plates"
+      },
+      {
+        "title": "Kettler Hantelscheiben, 2 Stk. à 2.5kg",
+        "issue": "22.0 CHF/kg is too high for weight plates"
+      },
+      {
+        "title": "Kettler Hantelscheiben, 2 Stk. à 2.5kg",
+        "issue": "22.0 CHF/kg is too high for weight plates"
+      },
+      {
+        "title": "Kettler Hantelscheiben, 2 Stk. à 2.5kg",
+        "issue": "22.0 CHF/kg is too high for weight plates"
+      },
+      {
+        "title": "Kettler Hantelscheibe, 5kg",
+        "issue": "22.0 CHF/kg is too high for weight plates"
+      }
+    ],
+    "total_issues": 5
   },
-  "recommendations": []
+  "recommendations": [
+    "Some prices appear unrealistic - check AI fallback logic"
+  ]
 }

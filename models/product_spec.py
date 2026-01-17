@@ -28,6 +28,11 @@ class ProductSpec:
     model: Optional[str] = None              # "Forerunner 970", "Fenix 7"
     product_type: str = ""                   # "Smartwatch", "Hantelscheibe", "Schal"
     
+    # === WEBSEARCH & RESALE (AI-generated) ===
+    final_search_name: Optional[str] = None  # Optimized singular name for websearch pricing
+    category: Optional[str] = None           # High-level category: fitness, electronics, clothing, tools, collectibles, other
+    expected_resale_rate: Optional[float] = None  # Expected resale value relative to new price (0.0-1.0)
+    
     # === SPECIFICATIONS (ONLY if explicitly mentioned) ===
     # IMPORTANT: No derivations! Only explicit mentions.
     specs: Dict[str, Any] = field(default_factory=dict)
@@ -62,6 +67,9 @@ class ProductSpec:
             "brand": self.brand,
             "model": self.model,
             "product_type": self.product_type,
+            "final_search_name": self.final_search_name,
+            "category": self.category,
+            "expected_resale_rate": self.expected_resale_rate,
             "specs": self.specs,
             "price_relevant_attrs": self.price_relevant_attrs,
             "confidence": self.confidence,
@@ -77,6 +85,9 @@ class ProductSpec:
             brand=data.get("brand"),
             model=data.get("model"),
             product_type=data.get("product_type", ""),
+            final_search_name=data.get("final_search_name"),
+            category=data.get("category"),
+            expected_resale_rate=data.get("expected_resale_rate"),
             specs=data.get("specs", {}),
             price_relevant_attrs=data.get("price_relevant_attrs", []),
             confidence=data.get("confidence", 0.0),

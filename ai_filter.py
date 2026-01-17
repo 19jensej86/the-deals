@@ -48,6 +48,10 @@ from decimal import Decimal
 
 from dotenv import load_dotenv
 
+# PROBLEM 2: WEIGHT-BASED MONOTONIC PRICING CONSISTENCY
+# Global tracker for weight-based pricing within current run
+_weight_pricing_tracker: Dict[str, Dict[float, float]] = {}  # {product_type: {weight_kg: price_per_kg}}
+
 load_dotenv()
 
 # v7.3.5: Import cache statistics tracking
@@ -482,6 +486,16 @@ def search_web_batch_for_new_prices(
             
             # Step 5: Apply clean_search_term for additional normalization
             clean = clean_search_term(vk_str, query_analysis)
+            
+            # FIX #3: DE-DUPLICATE TRAILING TOKENS - Remove duplicate words at end
+            # Example: "Garmin fenix 6 Pro Pro" → "Garmin fenix 6 Pro"
+            # Example: "Forerunner 255 Music Music" → "Forerunner 255 Music"
+            tokens = clean.split()
+            if len(tokens) >= 2 and tokens[-1].lower() == tokens[-2].lower():
+                tokens = tokens[:-1]
+                clean = " ".join(tokens)
+                print(f"   🔧 Deduplicated: removed duplicate '{tokens[-1]}'")
+            
             cleaned_terms.append((idx, vk_str, clean))
             if clean != vk_str:
                 print(f"   🔧 Cleaned: '{vk_str[:40]}' → '{clean}'")
@@ -501,14 +515,16 @@ PRODUKTE:
 
 Suche in: Digitec.ch, Galaxus.ch, Zalando.ch, Decathlon.ch, Manor.ch
 
+WICHTIG: Finde MEHRERE Preise pro Produkt (bis zu 5 Shops).
+
 Antworte NUR als JSON-Array:
 [
-  {{"nr": 1, "price": 199.00, "shop": "Galaxus", "conf": 0.9}},
-  {{"nr": 2, "price": null, "shop": null, "conf": 0.0}},
+  {{"nr": 1, "prices": [{{"price": 199.00, "shop": "Galaxus"}}, {{"price": 205.00, "shop": "Digitec"}}], "conf": 0.9}},
+  {{"nr": 2, "prices": [], "conf": 0.0}},
   ...
 ]
 
-Bei unbekannt: price=null, conf=0"""
+Bei unbekannt: prices=[], conf=0"""
 
         try:
             raw = _call_claude_with_retry(
@@ -538,24 +554,79 @@ Bei unbekannt: price=null, conf=0"""
                 nr = item.get("nr", 0) - 1  # Convert to 0-indexed
                 if 0 <= nr < len(batch):
                     vk = batch[nr]
-                    price = item.get("price")
-                    shop = item.get("shop")
+                    prices_list = item.get("prices", [])
                     conf = item.get("conf", 0.0)
                     
-                    if price and price > 0 and conf >= 0.6:
-                        price_source = f"web_{shop.lower()}" if shop else "web_batch"
+                    # PROBLEM 1: MULTI-SOURCE WEB PRICE MEDIAN
+                    # Collect multiple prices, remove outliers, compute median
+                    if prices_list and conf >= 0.6:
+                        # Extract valid prices (up to 5)
+                        valid_prices = []
+                        shops = []
+                        for price_item in prices_list[:5]:
+                            p = price_item.get("price")
+                            s = price_item.get("shop")
+                            if p and p > 0:
+                                valid_prices.append(float(p))
+                                shops.append(s or "unknown")
                         
-                        result = {
-                            "new_price": float(price),
-                            "price_source": price_source,
-                            "shop_name": shop,
-                            "confidence": conf,
-                        }
-                        
-                        # Cache it
-                        set_cached_web_price(vk, result["new_price"], price_source, shop or "unknown")
-                        results[vk] = result
-                        print(f"   ✅ {vk[:40]}... = {price} CHF ({shop})")
+                        if valid_prices:
+                            # Compute initial median
+                            valid_prices_sorted = sorted(valid_prices)
+                            n = len(valid_prices_sorted)
+                            if n == 1:
+                                median_price = valid_prices_sorted[0]
+                                final_prices = valid_prices_sorted
+                            else:
+                                # Median calculation
+                                if n % 2 == 0:
+                                    median_price = (valid_prices_sorted[n//2 - 1] + valid_prices_sorted[n//2]) / 2
+                                else:
+                                    median_price = valid_prices_sorted[n//2]
+                                
+                                # Remove outliers: keep prices within ±40% of median
+                                lower_bound = median_price * 0.6
+                                upper_bound = median_price * 1.4
+                                final_prices = [p for p in valid_prices if lower_bound <= p <= upper_bound]
+                                
+                                # Recompute median after outlier removal
+                                if final_prices:
+                                    final_prices_sorted = sorted(final_prices)
+                                    n_final = len(final_prices_sorted)
+                                    if n_final % 2 == 0:
+                                        median_price = (final_prices_sorted[n_final//2 - 1] + final_prices_sorted[n_final//2]) / 2
+                                    else:
+                                        median_price = final_prices_sorted[n_final//2]
+                                else:
+                                    # All outliers - use original median
+                                    final_prices = valid_prices_sorted
+                            
+                            # Determine price_source based on sample size
+                            if len(final_prices) >= 2:
+                                price_source = "web_median"
+                            else:
+                                price_source = f"web_{shops[0].lower()}" if shops else "web_single"
+                            
+                            result = {
+                                "new_price": round(median_price, 2),
+                                "price_source": price_source,
+                                "shop_name": ", ".join(shops[:3]),  # First 3 shops
+                                "confidence": conf,
+                                "market_sample_size": len(final_prices),
+                                "market_value": round(median_price, 2),
+                                "market_based": True,
+                            }
+                            
+                            # Cache it
+                            set_cached_web_price(vk, result["new_price"], price_source, result["shop_name"])
+                            results[vk] = result
+                            
+                            if len(final_prices) >= 2:
+                                print(f"   ✅ {vk[:40]}... = {median_price:.2f} CHF (median of {len(final_prices)} prices: {shops[:3]})")
+                            else:
+                                print(f"   ✅ {vk[:40]}... = {median_price:.2f} CHF ({shops[0]})")
+                        else:
+                            print(f"   ⚠️ {vk[:40]}... = no valid prices")
                     else:
                         print(f"   ⚠️ {vk[:40]}... = no price found")
                         
@@ -670,6 +741,66 @@ def validate_weight_price(text: str, price: float, is_resale: bool = True) -> Tu
         return typical_price, f"capped_to_{weight_type}_{weight_kg}kg"
 
     return price, f"valid_{weight_type}_{weight_kg}kg"
+
+
+def enforce_weight_monotonic_pricing(title: str, new_price: float, product_type: str) -> Tuple[float, bool]:
+    """
+    PROBLEM 2: WEIGHT-BASED MONOTONIC PRICING CONSISTENCY
+    
+    Ensures heavier weights don't have lower price_per_kg than lighter weights.
+    Tracks price_per_kg across the run and enforces monotonic consistency.
+    
+    Rules:
+    - If 10kg price_per_kg > 5kg * 1.2 → clamp to 5kg * 1.2
+    - If 2.5kg price_per_kg > 5kg * 1.5 → clamp to 5kg * 1.5
+    
+    Returns:
+        (adjusted_price, was_adjusted)
+    """
+    global _weight_pricing_tracker
+    
+    # Only apply to fitness weight products
+    if product_type.lower() not in ["hantelscheibe", "kettlebell", "gewichtsscheibe", "hantel"]:
+        return new_price, False
+    
+    weight_kg = extract_weight_kg(title)
+    if not weight_kg or weight_kg <= 0:
+        return new_price, False
+    
+    price_per_kg = new_price / weight_kg
+    
+    # Initialize tracker for this product type
+    if product_type not in _weight_pricing_tracker:
+        _weight_pricing_tracker[product_type] = {}
+    
+    tracker = _weight_pricing_tracker[product_type]
+    adjusted = False
+    adjusted_price = new_price
+    
+    # Check against lighter weights (should have higher price_per_kg)
+    for tracked_weight, tracked_price_per_kg in tracker.items():
+        if tracked_weight < weight_kg:
+            # Heavier weight should NOT have higher price_per_kg than lighter weight
+            # Allow some tolerance based on weight ratio
+            if tracked_weight <= weight_kg / 2:
+                # Very light (e.g., 2.5kg vs 10kg) - allow 1.5x
+                max_allowed_price_per_kg = tracked_price_per_kg * 1.5
+            else:
+                # Similar weight (e.g., 5kg vs 10kg) - allow 1.2x
+                max_allowed_price_per_kg = tracked_price_per_kg * 1.2
+            
+            if price_per_kg > max_allowed_price_per_kg:
+                adjusted_price = round(max_allowed_price_per_kg * weight_kg, 2)
+                adjusted = True
+                print(f"   ⚖️ Weight consistency: {weight_kg}kg price clamped from {new_price:.2f} to {adjusted_price:.2f} CHF")
+                print(f"      Reason: {weight_kg}kg had {price_per_kg:.2f} CHF/kg > {tracked_weight}kg * 1.2-1.5 ({max_allowed_price_per_kg:.2f} CHF/kg)")
+                price_per_kg = max_allowed_price_per_kg
+                break
+    
+    # Record this weight's price_per_kg for future comparisons
+    tracker[weight_kg] = price_per_kg
+    
+    return adjusted_price, adjusted
 
 
 # ==============================================================================
@@ -1465,6 +1596,13 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
                 new_price = web_result["new_price"]
                 price_source = web_result.get("price_source", "web_batch")
                 
+                # PROBLEM 2: Apply weight monotonic pricing consistency
+                # Extract product_type from variant_key for weight-based products
+                product_type = vk.split("|")[0] if "|" in vk else vk.split()[0] if vk else ""
+                adjusted_price, was_adjusted = enforce_weight_monotonic_pricing(vk, new_price, product_type)
+                if was_adjusted:
+                    new_price = adjusted_price
+                
                 # Calculate resale with sanity checks
                 resale_price = new_price * resale_rate
                 max_resale = new_price * MAX_RESALE_PERCENT_OF_NEW
@@ -2111,6 +2249,7 @@ def evaluate_listing_with_ai(
     query_analysis: Optional[Dict] = None,
     batch_bundle_result: Optional[Dict] = None,
     variant_info_by_key: Optional[Dict[str, Dict]] = None,
+    quantity: int = 1,
 ) -> Dict[str, Any]:
     """
     v7.0: Main evaluation function with Claude-based AI.
@@ -2179,6 +2318,14 @@ def evaluate_listing_with_ai(
         if result["price_source"] == "unknown":
             result["price_source"] = "estimated_from_resale"
     
+    # QUANTITY-AWARE RESALE: Apply quantity multiplication for single products
+    # CRITICAL: This must happen AFTER unit resale is calculated but BEFORE profit calculation
+    # Bundles handle quantity per-component, so we skip this for bundles
+    # Example: resale_unit=10, quantity=5 → resale_total=50
+    if quantity > 1 and result["resale_price_est"] and not result.get("is_bundle"):
+        unit_resale = result["resale_price_est"]
+        result["resale_price_est"] = round(unit_resale * quantity, 2)
+    
     # Determine effective purchase price
     is_auction = current_price is not None and buy_now_price is None
     has_buy_now = buy_now_price is not None
@@ -2239,6 +2386,25 @@ def evaluate_listing_with_ai(
             result["new_price"] = bundle_new
             result["price_source"] = "bundle_calculation"
     
+    # FIX #1: QUERY BASELINE FALLBACK - Final safety net to prevent NULL/0 resale prices
+    # If ALL price sources failed (web, AI, market, buy_now, bundle), use query baseline
+    # This ensures data quality: prefer rough but realistic values over NULL/0
+    if not result["resale_price_est"] or result["resale_price_est"] <= 0:
+        baseline_new = _get_new_price_estimate(query_analysis)
+        baseline_resale_rate = _get_resale_rate(query_analysis)
+        
+        # Apply quantity for single products (bundles already handled)
+        if not result.get("is_bundle"):
+            result["new_price"] = round(baseline_new, 2)
+            result["resale_price_est"] = round(baseline_new * baseline_resale_rate * quantity, 2)
+        else:
+            # For bundles, use baseline without quantity multiplication
+            result["new_price"] = round(baseline_new, 2)
+            result["resale_price_est"] = round(baseline_new * baseline_resale_rate, 2)
+        
+        result["price_source"] = "query_baseline"
+        print(f"   ⚠️ Query baseline fallback: new={result['new_price']:.2f}, resale={result['resale_price_est']:.2f} CHF")
+    
     # Calculate profit
     if result["resale_price_est"] and purchase_price:
         result["expected_profit"] = calculate_profit(result["resale_price_est"], purchase_price)
@@ -2267,6 +2433,32 @@ def evaluate_listing_with_ai(
         market_based_resale=result["market_based_resale"],
         is_bundle=result["is_bundle"],
     )
+    
+    # PROBLEM 3: POPULATE MARKET ANALYTICS FIELDS - Ensure no NULL values
+    # Always populate market_value, buy_now_ceiling, market_based_resale, market_sample_size
+    
+    # market_value: Use resale_price_est as market value if not already set
+    if not result.get("market_value") and result.get("resale_price_est"):
+        result["market_value"] = result["resale_price_est"]
+    
+    # buy_now_ceiling: 85% of resale price (max we'd pay in buy-now)
+    if not result.get("buy_now_ceiling") and result.get("resale_price_est"):
+        result["buy_now_ceiling"] = round(result["resale_price_est"] * 0.85, 2)
+    
+    # market_based_resale: True if price_source is web-based
+    if result["price_source"].startswith("web_"):
+        result["market_based_resale"] = True
+    
+    # market_sample_size: Set based on price_source if not already set
+    if result["market_sample_size"] == 0:
+        if result["price_source"] == "web_median":
+            # Already set from websearch, keep it
+            pass
+        elif result["price_source"].startswith("web_"):
+            result["market_sample_size"] = 1
+        else:
+            # ai_estimate, query_baseline, buy_now_fallback
+            result["market_sample_size"] = 0
     
     # Build AI notes
     notes = []

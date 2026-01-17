@@ -148,6 +148,34 @@ CRITICAL RULE FOR WEBSEARCH PRICING:
 
 10. needs_detail - true if title/description insufficient for pricing
 
+11. final_search_name - CRITICAL for websearch pricing
+    This is the ONLY string used for new-price websearch.
+    Rules:
+    - MUST be singular (one unit)
+    - Use the most common merchant/shop terminology
+    - Must NOT change the actual product
+    - Must NOT broaden or narrow the product category
+    - Ignore quantity words (2x, Set, Lot, Stück, Konvolut)
+    Examples:
+    - "4x 10kg Hantelscheiben Pro" → "Gewichtsscheibe 10kg"
+    - "Kurzhanteln Set" → "Kurzhantel"
+    - "Garmin Fenix 7 Sapphire" → "Garmin Fenix 7 Sapphire"
+    - "Tommy Hilfiger Winterjacke Herren" → "Tommy Hilfiger Winterjacke"
+
+12. category - High-level resale category
+    One of: fitness, electronics, clothing, tools, collectibles, other
+    No subcategories. No hybrids.
+
+13. expected_resale_rate - Expected resale value relative to new price
+    Range: 0.0 - 1.0
+    Category-based, not listing-condition-based
+    Typical ranges (guidance only):
+    - fitness: 0.55 - 0.70
+    - tools: 0.50 - 0.65
+    - electronics: 0.35 - 0.55
+    - clothing: 0.20 - 0.45
+    - collectibles: 0.60 - 0.90
+
 EXAMPLES (ILLUSTRATIVE - DO NOT ASSUME DOMAIN):
 
 --- Example 1: Clear Single Product ---
@@ -181,6 +209,9 @@ Output:
   "confidence": 0.90,
   "uncertainty_fields": [],
   "needs_detail": false,
+  "final_search_name": "Bosch GSR 18V-28",
+  "category": "tools",
+  "expected_resale_rate": 0.55,
   "extraction_notes": "Explicit quantity '2 Stück', voltage mentioned"
 }}
 
@@ -215,7 +246,50 @@ Output:
   "confidence": 0.95,
   "uncertainty_fields": [],
   "needs_detail": false,
+  "final_search_name": "Garmin Fenix 7 Sapphire Solar",
+  "category": "electronics",
+  "expected_resale_rate": 0.45,
   "extraction_notes": "'Sapphire' and 'Solar' are price-relevant variants"
+}}
+
+--- Example 5: Fitness Equipment with Quantity ---
+Input: "4x 10kg Hantelscheiben Pro"
+Output:
+{{
+  "brand": null,
+  "model": "Pro",
+  "product_type": "Hantelscheibe",
+  "quantity": 4,
+  "specs": {{"weight_kg": 10}},
+  "price_relevant_attrs": [],
+  "bundle_type": "quantity",
+  "confidence": 0.85,
+  "uncertainty_fields": [],
+  "needs_detail": false,
+  "final_search_name": "Gewichtsscheibe 10kg",
+  "category": "fitness",
+  "expected_resale_rate": 0.60,
+  "extraction_notes": "Explicit quantity '4x', weight '10kg' mentioned, using common merchant term 'Gewichtsscheibe'"
+}}
+
+--- Example 6: Clothing ---
+Input: "Tommy Hilfiger Winterjacke Herren"
+Output:
+{{
+  "brand": "Tommy Hilfiger",
+  "model": null,
+  "product_type": "Winterjacke",
+  "quantity": 1,
+  "specs": {{}},
+  "price_relevant_attrs": [],
+  "bundle_type": "single_product",
+  "confidence": 0.90,
+  "uncertainty_fields": [],
+  "needs_detail": false,
+  "final_search_name": "Tommy Hilfiger Winterjacke",
+  "category": "clothing",
+  "expected_resale_rate": 0.30,
+  "extraction_notes": "Clear brand and product type, 'Herren' is target group not price-relevant"
 }}
 
 Return ONLY valid JSON (no explanation).
