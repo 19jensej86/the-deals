@@ -73,6 +73,14 @@ def process_listing(
         print(f"      brand: {spec.brand or 'null'}")
         print(f"      model: {spec.model or 'null'}")
         print(f"      confidence: {spec.confidence:.2f}")
+        print(f"      is_accessory: {extracted.is_accessory_only}")
+    
+    # v12: EARLY EXIT for accessories (detected by AI in same extraction call)
+    if extracted.is_accessory_only:
+        print(f"   🚫 AI Filter: Accessory detected → skipping")
+        log.log_step("accessory_filtered", reason="ai_detected_accessory_only")
+        run_logger.increment_stat("skipped_ai_accessory")
+        return None  # Skip this listing
     
     log.log_step("extraction_result",
                  confidence=extracted.overall_confidence,

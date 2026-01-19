@@ -291,13 +291,22 @@ Analysiere JEDEN Suchbegriff und gib mir folgende Informationen:
 
 7. **spelling_variants**: Liste von alternativen Schreibweisen/Begriffen
 
-8. **accessory_keywords**: Wörter die auf ZUBEHÖR hindeuten (diese Listings ausfiltern!)
+8. **accessory_keywords**: Wörter die auf ZUBEHÖR hindeuten (für einfache Regex-Filter)
 
 9. **defect_keywords**: Wörter die auf DEFEKTE hindeuten
 
 10. **auction_typical_multiplier**: Um welchen Faktor steigt ein Auktionspreis typischerweise?
 
-11. **search_term_cleanup**: Regeln zum Bereinigen von Listing-Titeln für die Web-Suche:
+11. **accessory_examples**: Beispiele von Titeln die NUR Zubehör sind (ausfiltern!):
+    - Beispiel: "Armband für Garmin Fenix" → NUR Zubehör, ausfiltern
+    - Beispiel: "Ladekabel für iPhone" → NUR Zubehör, ausfiltern
+    - Beispiel: "Hülle für AirPods" → NUR Zubehör, ausfiltern
+    ABER:
+    - "Garmin Fenix 7 mit Armband" → Hauptprodukt + Accessory = OK (Bundle oder Single)
+    - "iPhone 13 + Hülle" → Hauptprodukt + Accessory = OK (Bundle)
+    - "AirPods Pro mit Ladekabel" → Hauptprodukt + Accessory = OK (Single, Kabel unwichtig)
+
+12. **search_term_cleanup**: Regeln zum Bereinigen von Listing-Titeln für die Web-Suche:
     - "remove_after": Liste von Wörtern, nach denen der Rest abgeschnitten wird (z.B. ["inkl", "mit", "+", "und", "NEU", "OVP"])
     - "remove_words": Wörter die komplett entfernt werden sollen (z.B. ["gebraucht", "neuwertig", "Top-Zustand"])
     - "keep_parts": Welche Teile behalten? (z.B. "brand_model" = nur Marke+Modell)

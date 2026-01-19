@@ -39,6 +39,9 @@ class ExtractedProduct:
     needs_vision: bool = False
     skip_reason: Optional[str] = None
     
+    # === v12: ACCESSORY DETECTION (combined AI call) ===
+    is_accessory_only: bool = False  # True if listing is ONLY an accessory (should be filtered)
+    
     # === METADATA ===
     extraction_method: str = "ai_structured"  # "ai_structured", "ai_with_detail", "ai_with_vision"
     ai_cost_usd: float = 0.0

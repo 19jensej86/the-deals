@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS listings (
     -- QUANTITY & BUNDLE LOGIC
     -- ========================================================================
     quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity >= 1),
-    bundle_id TEXT,  -- NULL = single product, same value = bundle components
+    bundle_id INTEGER,  -- NULL = single product, unique ID = bundle group
     is_bundle_component BOOLEAN DEFAULT FALSE,
     
     -- ========================================================================

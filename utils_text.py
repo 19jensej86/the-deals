@@ -178,8 +178,9 @@ ACCESSORY_KEYWORDS = [
     
     # Uhren/Smartwatch-Zubehör (KRITISCH für Garmin!)
     "armband", "ersatzarmband", "uhrenarmband",
-    "band", "strap", "bracelet",
-    "silikon",  # "Silikon Band" etc.
+    "uhrenband", "watchband", "strap", "bracelet",
+    # NOTE: "band" removed - too generic (matches "Forerunner Band" in titles)
+    # Use compound words instead: armband, uhrenband, etc.
     
     # Sonstiges Zubehör
     "ersatzteil", "ersatzteile",

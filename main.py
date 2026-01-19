@@ -73,7 +73,6 @@ from utils_time import parse_ricardo_end_time
 from utils_text import (
     contains_excluded_terms, 
     normalize_whitespace,
-    is_accessory_title,
     detect_category,
 )
 
@@ -251,34 +250,8 @@ def run_v10_pipeline(
                     skipped_count += 1
                     continue
                 
-                if is_accessory_title(normalized_title, query=query, category=category):
-                    global_stats["skipped_hardcoded_accessory"] += 1
-                    skipped_count += 1
-                    continue
-                
-                # AI accessory keywords filter
-                ai_accessory_kw = get_accessory_keywords(query_analysis)
-                if ai_accessory_kw:
-                    if category.lower() in ["fitness", "sport"]:
-                        ai_accessory_kw = [kw for kw in ai_accessory_kw 
-                                           if kw.lower() not in ["set", "stange", "scheibe", "halterung"]]
-                    
-                    # Check bundle indicator
-                    is_bundle_with_acc = False
-                    for indicator in ["inkl.", "inkl ", "inklusive", " mit ", "+ ", "samt ", "plus "]:
-                        if indicator in title_lower:
-                            indicator_pos = title_lower.find(indicator)
-                            for kw in ai_accessory_kw:
-                                if title_lower.find(kw.lower()) > indicator_pos:
-                                    is_bundle_with_acc = True
-                                    break
-                        if is_bundle_with_acc:
-                            break
-                    
-                    if not is_bundle_with_acc and contains_excluded_terms(title_lower, ai_accessory_kw):
-                        global_stats["skipped_ai_accessory"] += 1
-                        skipped_count += 1
-                        continue
+                # v12: Accessory filter now integrated in AI extraction (no separate call needed)
+                # Filtering happens in pipeline_runner.py after extraction
                 
                 # Defect filter
                 defect_kw = get_defect_keywords(query_analysis)
@@ -434,6 +407,11 @@ def run_v10_pipeline(
         for listing in listings:
             listing_id = listing.get("listing_id")
             extracted = listing_id_to_extracted.get(listing_id)
+            
+            # FIX #1: SKIP ACCESSORIES - Don't process listings marked as accessory-only
+            if extracted and extracted.is_accessory_only:
+                print(f"   🚫 Skipping accessory: {listing.get('title', '')[:60]}...")
+                continue
             
             if extracted and extracted.products:
                 # Use first product for variant_key
@@ -733,14 +711,24 @@ def run_v10_pipeline(
                 quantity=quantity,
             )
             
-            # Log result
+            # Log result with comprehensive details for analysis
             profit = ai_result.get("expected_profit", 0)
             score = ai_result.get("deal_score", 0)
             strategy = ai_result.get("recommended_strategy", 'skip')
+            price_source = ai_result.get("price_source", "unknown")
+            is_bundle = ai_result.get("is_bundle", False)
+            new_price = ai_result.get("new_price", 0)
+            resale_price = ai_result.get("resale_price_est", 0)
             
             strategy_icon = {'buy_now': '🔥', 'bid_now': '🔥', 'bid': '💰', 'watch': '👀', 'skip': '⏭️'}.get(strategy, '❓')
-            # FIX 3: Show full title, no truncation
-            print(f"   {strategy_icon} {title} | Profit: {profit or 0:.0f} CHF")
+            # Enhanced logging for perfect analysis
+            print(f"   {strategy_icon} {title}")
+            print(f"      💰 Profit: {profit or 0:.2f} CHF | 📊 Score: {score:.1f}/10 | 🏷️ Source: {price_source}")
+            print(f"      💵 New: {new_price:.2f} CHF | 🔄 Resale: {resale_price:.2f} CHF | 📦 Bundle: {'Yes' if is_bundle else 'No'}")
+            if variant_info and variant_info.get("shop_name"):
+                print(f"      🏪 Shops: {variant_info.get('shop_name')}")
+            if is_bundle and ai_result.get("bundle_components"):
+                print(f"      📦 Components: {len(ai_result.get('bundle_components', []))} items")
             
             # Save to database
             end_time = parse_ricardo_end_time(listing.get("end_time_text"))
@@ -794,6 +782,28 @@ def run_v10_pipeline(
                     
                     print(f"      Applied baseline: new={ai_result['new_price']:.2f}, resale={ai_result['resale_price_est']:.2f} CHF")
             
+            # CRITICAL: Normalize bundle_components to JSON string if it's a dict/list
+            import json
+            bundle_components_raw = ai_result.get("bundle_components")
+            if isinstance(bundle_components_raw, (dict, list)):
+                bundle_components_json = json.dumps(bundle_components_raw, ensure_ascii=False)
+            else:
+                bundle_components_json = bundle_components_raw
+            
+            # CRITICAL: Generate unique INTEGER bundle_id for TRUE bundles
+            # TRUE bundle = different products (e.g., Hantel + Scheiben)
+            # NOT bundle = quantity products (e.g., 2x Hantelscheibe)
+            # IMPORTANT: 1 bundle = 1 listing! Different listings must have different IDs
+            bundle_id = None
+            if ai_result.get("is_bundle"):
+                # Use listing_id to generate unique bundle_id per listing
+                # This ensures each bundle listing has its own unique ID
+                import hashlib
+                listing_id_str = str(listing.get("listing_id", ""))
+                bundle_hash = hashlib.md5(listing_id_str.encode()).hexdigest()[:8]
+                # Convert hex to integer (max 8 hex digits = 32-bit int)
+                bundle_id = int(bundle_hash, 16)
+            
             data = {
                 "platform": "ricardo",
                 "listing_id": listing["listing_id"],
@@ -818,7 +828,8 @@ def run_v10_pipeline(
                 "predicted_final_price": ai_result.get("predicted_final_price"),
                 "prediction_confidence": ai_result.get("prediction_confidence"),
                 "is_bundle": ai_result.get("is_bundle", False),
-                "bundle_components": ai_result.get("bundle_components"),
+                "bundle_components": bundle_components_json,
+                "bundle_id": bundle_id,
                 "resale_price_bundle": ai_result.get("resale_price_bundle"),
                 "recommended_strategy": ai_result.get("recommended_strategy"),
                 "strategy_reason": ai_result.get("strategy_reason"),
@@ -826,6 +837,8 @@ def run_v10_pipeline(
                 "market_sample_size": ai_result.get("market_sample_size"),
                 "market_value": ai_result.get("market_value"),
                 "price_source": price_source,
+                "shop_name": variant_info.get("shop_name") if variant_info else None,
+                "web_sources": variant_info.get("web_sources") if variant_info else None,
                 "buy_now_ceiling": ai_result.get("buy_now_ceiling"),
                 "hours_remaining": round(hours_remaining, 1) if hours_remaining is not None else None,
                 # v9: Metadata fields
@@ -844,11 +857,46 @@ def run_v10_pipeline(
             # CRITICAL: Add detail data if available
             detail_data = listing.get("_detail_data")
             if detail_data:
-                data["description"] = detail_data.get("full_description", "")
+                # Normalize dict values to JSON strings to prevent DB warnings
+                desc = detail_data.get("full_description", "")
+                if isinstance(desc, dict):
+                    desc = json.dumps(desc, ensure_ascii=False)
+                data["description"] = desc
                 data["shipping"] = detail_data.get("shipping_cost")
                 data["pickup_available"] = detail_data.get("pickup_available")
                 data["seller_rating"] = detail_data.get("seller_rating")
                 data["location"] = detail_data.get("location")
+            
+            # Track metrics for analysis
+            if not hasattr(upsert_listing, 'run_metrics'):
+                upsert_listing.run_metrics = {
+                    'total': 0,
+                    'bundles': 0,
+                    'price_sources': {},
+                    'strategies': {},
+                    'errors': [],
+                    'websearch_hits': 0,
+                    'websearch_misses': 0,
+                }
+            
+            upsert_listing.run_metrics['total'] += 1
+            if is_bundle:
+                upsert_listing.run_metrics['bundles'] += 1
+            
+            # Track price sources
+            ps = data.get('price_source', 'unknown')
+            upsert_listing.run_metrics['price_sources'][ps] = upsert_listing.run_metrics['price_sources'].get(ps, 0) + 1
+            
+            # Track strategies
+            strat = data.get('recommended_strategy', 'unknown')
+            upsert_listing.run_metrics['strategies'][strat] = upsert_listing.run_metrics['strategies'].get(strat, 0) + 1
+            
+            # Track websearch success
+            if data.get('web_search_used'):
+                if data.get('shop_name'):
+                    upsert_listing.run_metrics['websearch_hits'] += 1
+                else:
+                    upsert_listing.run_metrics['websearch_misses'] += 1
             
             upsert_listing(conn, data)
             
@@ -996,6 +1044,47 @@ def export_listings_to_file(conn, filename: str = "last_run_listings.json"):
         
         # Also create analysis export with quality metrics
         export_analysis_data(listings, "analysis_data.json")
+        
+        # Print comprehensive run summary for analysis
+        print("\n" + "="*80)
+        print("📊 RUN ANALYSIS SUMMARY")
+        print("="*80)
+        
+        if hasattr(upsert_listing, 'run_metrics'):
+            metrics = upsert_listing.run_metrics
+            total = metrics['total']
+            
+            print(f"\n📈 LISTINGS PROCESSED: {total}")
+            print(f"   📦 Bundles detected: {metrics['bundles']} ({metrics['bundles']/total*100:.1f}%)")
+            
+            print(f"\n💰 PRICE SOURCES:")
+            for source, count in sorted(metrics['price_sources'].items(), key=lambda x: x[1], reverse=True):
+                pct = count/total*100 if total > 0 else 0
+                print(f"   • {source}: {count} ({pct:.1f}%)")
+            
+            print(f"\n🎯 STRATEGIES:")
+            for strategy, count in sorted(metrics['strategies'].items(), key=lambda x: x[1], reverse=True):
+                pct = count/total*100 if total > 0 else 0
+                icon = {'buy_now': '🔥', 'bid': '💰', 'watch': '👀', 'skip': '⏭️'}.get(strategy, '❓')
+                print(f"   {icon} {strategy}: {count} ({pct:.1f}%)")
+            
+            print(f"\n🌐 WEBSEARCH PERFORMANCE:")
+            ws_total = metrics['websearch_hits'] + metrics['websearch_misses']
+            if ws_total > 0:
+                hit_rate = metrics['websearch_hits']/ws_total*100
+                print(f"   ✅ Successful: {metrics['websearch_hits']}/{ws_total} ({hit_rate:.1f}%)")
+                print(f"   ❌ Failed: {metrics['websearch_misses']}/{ws_total} ({100-hit_rate:.1f}%)")
+            else:
+                print(f"   ℹ️ No websearch used this run")
+            
+            print(f"\n⚠️ ERRORS & WARNINGS:")
+            if metrics['errors']:
+                for error in metrics['errors']:
+                    print(f"   • {error}")
+            else:
+                print(f"   ✅ No errors tracked")
+        
+        print("\n" + "="*80)
         
     except Exception as e:
         print(f"⚠️ Failed to export listings: {e}")
@@ -1223,23 +1312,24 @@ def run_once():
     # --------------------------------------------------------------------------
     # 3) DATA CLEARING BASED ON RUNTIME MODE
     # --------------------------------------------------------------------------
-    if cfg.runtime.mode == "testing":
-        # Testing mode: Clear data for this run_id only
-        print(f"\n🧪 Testing mode: Clearing data for run_id={run_id}...")
-        clear_listings(conn, run_id=run_id)
-        
-        # Also clear legacy table if configured
-        if cfg.db.clear_on_start:
-            print("   🧹 Also clearing legacy listings table...")
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("DELETE FROM listings WHERE run_id = %s OR run_id IS NULL", (run_id,))
-                    conn.commit()
-            except Exception as e:
-                print(f"   ⚠️ Legacy clear failed: {e}")
+    # FIX #4: Use centralized runtime mode config for DB truncation
+    from runtime_mode import get_mode_config, should_truncate_db
+    
+    mode_config = get_mode_config(cfg.runtime.mode)
+    
+    if should_truncate_db(mode_config):
+        print(f"\n🧪 {mode_config.mode.value.upper()} mode: Truncating ALL tables for clean test...")
+        try:
+            with conn.cursor() as cur:
+                for table in mode_config.truncate_tables:
+                    cur.execute(f"DELETE FROM {table}")
+                    deleted = cur.rowcount
+                    print(f"   🧹 Cleared {table} ({deleted} rows)")
+                conn.commit()
+        except Exception as e:
+            print(f"   ⚠️ Truncate failed: {e}")
     else:
-        # Normal mode: Data persists across runs
-        print(f"\n💾 Normal mode: Data will persist (run_id={run_id})")
+        print(f"\n💾 {mode_config.mode.value.upper()} mode: Data will persist (run_id={run_id})")
 
     # --------------------------------------------------------------------------
     # 4) CLEAR CACHES IF CONFIGURED

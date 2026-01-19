@@ -176,6 +176,50 @@ CRITICAL RULE FOR WEBSEARCH PRICING:
     - clothing: 0.20 - 0.45
     - collectibles: 0.60 - 0.90
 
+14. is_accessory_only - Is this listing ONLY an accessory/Zubehör? (true/false)
+    
+    Du bist Experte darin, Marketplace-Inserate zu analysieren und zu verstehen, was das Hauptprodukt ist.
+    
+    DEINE AUFGABE:
+    Entscheide, ob dieses Inserat sich um ein HAUPTPRODUKT handelt oder nur um ZUBEHÖR.
+    
+    HAUPTPRODUKT = Das eigentliche Gerät/Produkt, das eigenständig funktioniert
+    Beispiele: Smartwatch, Smartphone, Kopfhörer, Fitnessgerät, Werkzeug, Kleidung
+    
+    ZUBEHÖR = Ergänzende Teile, die NUR mit einem Hauptprodukt funktionieren
+    Beispiele: Armband (für Smartwatch), Ladekabel (für Smartphone), Hülle (für Handy), 
+              Displayschutz, Adapter, Halterung
+    
+    ENTSCHEIDUNGSLOGIK:
+    
+    ✅ is_accessory_only = false (BEHALTEN):
+    - Inserat verkauft das Hauptprodukt selbst
+    - Hauptprodukt wird im Titel zuerst genannt
+    - Hauptprodukt + Zubehör als Bundle
+    - Beispiele:
+      * "Garmin Fenix 7 Smartwatch" → Hauptprodukt
+      * "iPhone 12 mit Hülle" → Hauptprodukt + Bonus
+      * "AirPods Pro 2. Gen" → Hauptprodukt
+      * "Bosch Akkuschrauber mit Koffer" → Hauptprodukt + Zubehör
+    
+    ❌ is_accessory_only = true (FILTERN):
+    - Inserat verkauft NUR Zubehör, KEIN Hauptprodukt
+    - Zubehör wird im Titel zuerst genannt
+    - "für/for" Pattern deutet auf Zubehör hin
+    - Beispiele:
+      * "Armband für Garmin Fenix" → NUR Zubehör
+      * "Ladekabel iPhone USB-C" → NUR Zubehör
+      * "Hülle AirPods Pro Silikon" → NUR Zubehör
+      * "Displayschutz Samsung Galaxy" → NUR Zubehör
+    
+    WICHTIG:
+    - Nutze dein Verständnis von Produktkategorien
+    - Achte auf die Reihenfolge im Titel (was kommt zuerst?)
+    - Bei Zweifel → false (lieber behalten als fälschlich filtern)
+    - Denke: "Würde jemand dieses Inserat kaufen, um das Hauptprodukt zu bekommen?"
+      → Ja = false (behalten)
+      → Nein, nur Zubehör = true (filtern)
+
 EXAMPLES (ILLUSTRATIVE - DO NOT ASSUME DOMAIN):
 
 --- Example 1: Clear Single Product ---
@@ -192,6 +236,10 @@ Output:
   "confidence": 0.95,
   "uncertainty_fields": [],
   "needs_detail": false,
+  "final_search_name": "Apple iPhone 12 Mini 64GB",
+  "category": "electronics",
+  "expected_resale_rate": 0.45,
+  "is_accessory_only": false,
   "extraction_notes": "Clear brand, model, and storage capacity"
 }}
 
@@ -212,6 +260,7 @@ Output:
   "final_search_name": "Bosch GSR 18V-28",
   "category": "tools",
   "expected_resale_rate": 0.55,
+  "is_accessory_only": false,
   "extraction_notes": "Explicit quantity '2 Stück', voltage mentioned"
 }}
 
@@ -229,6 +278,10 @@ Output:
   "confidence": 0.30,
   "uncertainty_fields": ["bundle_composition", "included_items", "quantity"],
   "needs_detail": true,
+  "final_search_name": "Playmobil Ritterburg",
+  "category": "collectibles",
+  "expected_resale_rate": 0.40,
+  "is_accessory_only": false,
   "extraction_notes": "'Set mit Zubehör' is vague, need detail page to understand composition"
 }}
 
@@ -269,10 +322,53 @@ Output:
   "final_search_name": "Gewichtsscheibe 10kg",
   "category": "fitness",
   "expected_resale_rate": 0.60,
+  "is_accessory_only": false,
   "extraction_notes": "Explicit quantity '4x', weight '10kg' mentioned, using common merchant term 'Gewichtsscheibe'"
 }}
 
---- Example 6: Clothing ---
+--- Example 6: Accessory Only (FILTER OUT!) ---
+Input: "Armband Bracelet Silikon Sport für Garmin Fenix 5 6 7 8"
+Output:
+{{
+  "brand": "Garmin",
+  "model": null,
+  "product_type": "Armband",
+  "quantity": 1,
+  "specs": {{}},
+  "price_relevant_attrs": [],
+  "bundle_type": "single_product",
+  "confidence": 0.85,
+  "uncertainty_fields": [],
+  "needs_detail": false,
+  "final_search_name": "Garmin Armband",
+  "category": "electronics",
+  "expected_resale_rate": 0.30,
+  "is_accessory_only": true,
+  "extraction_notes": "Title starts with 'Armband' and has 'für' pattern - this is ONLY an accessory, not a main product"
+}}
+
+--- Example 7: Main Product with Accessory (KEEP!) ---
+Input: "Garmin Fenix 7 Sapphire Solar mit Armband"
+Output:
+{{
+  "brand": "Garmin",
+  "model": "Fenix 7",
+  "product_type": "Smartwatch",
+  "quantity": 1,
+  "specs": {{}},
+  "price_relevant_attrs": ["Sapphire", "Solar"],
+  "bundle_type": "single_product",
+  "confidence": 0.95,
+  "uncertainty_fields": [],
+  "needs_detail": false,
+  "final_search_name": "Garmin Fenix 7 Sapphire Solar",
+  "category": "electronics",
+  "expected_resale_rate": 0.45,
+  "is_accessory_only": false,
+  "extraction_notes": "Main product (Garmin Fenix 7) mentioned first, armband is just a bonus - keep this listing"
+}}
+
+--- Example 8: Clothing ---
 Input: "Tommy Hilfiger Winterjacke Herren"
 Output:
 {{
@@ -289,6 +385,7 @@ Output:
   "final_search_name": "Tommy Hilfiger Winterjacke",
   "category": "clothing",
   "expected_resale_rate": 0.30,
+  "is_accessory_only": false,
   "extraction_notes": "Clear brand and product type, 'Herren' is target group not price-relevant"
 }}
 

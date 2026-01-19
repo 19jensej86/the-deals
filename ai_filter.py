@@ -558,18 +558,35 @@ def search_web_batch_for_new_prices(
     if not variant_keys:
         return {}
     
-    # v7.3.2: Check if web search is enabled
-    if not WEB_SEARCH_ENABLED:
-        print("   ℹ️ Web search DISABLED (config.yaml) - using AI estimation only")
-        return {}
-    
-    # Check budget
-    if is_budget_exceeded():
-        return {}
-    
-    if WEB_SEARCH_COUNT_TODAY >= DAILY_WEB_SEARCH_LIMIT:
-        print("🚫 Daily web search limit reached")
-        return {}
+    # FIX #3: Check runtime mode and budget BEFORE websearch
+    try:
+        from runtime_mode import get_mode_config, is_budget_exceeded as mode_budget_check, should_use_websearch
+        from config import load_config
+        cfg = load_config()
+        mode_config = get_mode_config(cfg.runtime.mode)
+        
+        # Check if websearch allowed in this mode
+        if not should_use_websearch(mode_config, WEB_SEARCH_COUNT_TODAY):
+            print(f"   🚫 Websearch limit reached ({WEB_SEARCH_COUNT_TODAY}/{mode_config.max_websearch_calls}) - using AI fallback")
+            return {}
+        
+        # Check budget
+        current_cost = get_run_cost_summary().get("total_usd", 0.0)
+        if mode_budget_check(mode_config, current_cost):
+            print(f"   🚫 Budget exceeded (${current_cost:.2f}/${mode_config.max_run_cost_usd:.2f}) - stopping websearch")
+            return {}
+    except ImportError:
+        # Fallback to old logic if runtime_mode not available
+        if not WEB_SEARCH_ENABLED:
+            print("   ℹ️ Web search DISABLED (config.yaml) - using AI estimation only")
+            return {}
+        
+        if is_budget_exceeded():
+            return {}
+        
+        if WEB_SEARCH_COUNT_TODAY >= DAILY_WEB_SEARCH_LIMIT:
+            print("🚫 Daily web search limit reached")
+            return {}
     
     # Claude with web search required
     if not _claude_client:
@@ -600,12 +617,23 @@ def search_web_batch_for_new_prices(
     print(f"   ⏳ Waiting 120s upfront (proactive rate limit prevention)...")
     time.sleep(120)
     
-    # Process all uncached products in ONE batch (max 30 = ~25k tokens, safe under 30k limit)
-    batch_size = 30
+    # v12: DYNAMIC BATCH SIZING - Calculate optimal batch size based on token limits
+    # Claude Sonnet max_tokens = 8000 (response) + input budget ~22k = 30k total safe limit
+    # Estimated tokens per product in response: ~250 tokens (5 prices × 50 tokens each)
+    # Safety margin: Use 200 tokens per product to avoid truncation
+    MAX_RESPONSE_TOKENS = 8000
+    ESTIMATED_TOKENS_PER_PRODUCT = 200
+    max_products_per_batch = MAX_RESPONSE_TOKENS // ESTIMATED_TOKENS_PER_PRODUCT  # ~40 products
+    
+    # Apply safety margin (80% of theoretical max)
+    batch_size = int(max_products_per_batch * 0.8)  # ~32 products
+    
+    print(f"   📊 Dynamic batch sizing: {batch_size} products/batch (max capacity: {max_products_per_batch})")
+    
     for i in range(0, len(uncached), batch_size):
         batch = uncached[i:i + batch_size]
         
-        print(f"\n   🌐 Web search batch: {len(batch)} products...")
+        print(f"\n   🌐 Web search batch {i//batch_size + 1}/{(len(uncached)-1)//batch_size + 1}: {len(batch)} products...")
         
         # v7.3.3: Clean search terms for better results
         # "Garmin Fenix 6 Smartwatch inkl. Zubehör" → "Garmin Fenix 6"
@@ -643,6 +671,19 @@ def search_web_batch_for_new_prices(
                 clean = " ".join(tokens)
                 print(f"   🔧 Deduplicated: removed duplicate '{tokens[-1]}'")
             
+            # WEBSEARCH QUERY GUARD: Skip too short or generic queries
+            # These waste money and produce poor results → fallback to AI estimate
+            # Examples: "Pro", "Set", "Band", single words < 4 chars
+            if len(clean) < 4 or (len(tokens) == 1 and len(clean) < 8):
+                print(f"   ⚠️ Skipping websearch for too short/generic query: '{clean}' → will use AI estimate")
+                continue
+            
+            # Skip common generic terms that won't produce good web results
+            generic_terms = {'pro', 'set', 'band', 'kit', 'pack', 'bundle', 'lot'}
+            if len(tokens) == 1 and clean.lower() in generic_terms:
+                print(f"   ⚠️ Skipping websearch for generic term: '{clean}' → will use AI estimate")
+                continue
+            
             cleaned_terms.append((idx, vk_str, clean))
             if clean != vk_str:
                 print(f"   🔧 Cleaned: '{vk_str[:40]}' → '{clean}'")
@@ -653,6 +694,45 @@ def search_web_batch_for_new_prices(
         
         product_list = "\n".join([f"{idx+1}. {clean}" for idx, vk, clean in cleaned_terms])
         
+        # v12: AI-based shop suggestions per product category
+        # First, ask AI which shops are relevant for this product category
+        shop_prompt = f"""Welche Schweizer Online-Shops sind am besten für diese Produktkategorie?
+
+Kategorie: {category}
+Beispiel-Produkte: {', '.join([clean for _, _, clean in cleaned_terms[:3]])}
+
+Liste 5-8 relevante Schweizer Shops die diese Produkte verkaufen.
+Antworte NUR als komma-separierte Liste:
+Shop1.ch, Shop2.ch, Shop3.ch, ...
+
+Beispiele:
+- Elektronik: Digitec.ch, Galaxus.ch, MediaMarkt.ch, Interdiscount.ch, Manor.ch
+- Fitness: Decathlon.ch, Brack.ch, Gonser.ch, BodySport.ch, Gorilla-Sports.ch
+- Kleidung: Zalando.ch, Manor.ch, Ochsner-Sport.ch, SportXX.ch
+- Haustier: Fressnapf.ch, Qualipet.ch, Brack.ch, Zooplus.ch"""
+        
+        try:
+            shop_response = _call_claude_with_retry(
+                prompt=shop_prompt,
+                max_tokens=150,
+                use_web_search=False,
+                max_retries=1,
+            )
+            
+            if shop_response:
+                # Extract shop list from response
+                shops_line = shop_response.strip().split('\n')[0]
+                relevant_shops = shops_line.strip()
+            else:
+                # Fallback to general shops
+                relevant_shops = "Digitec.ch, Galaxus.ch, Brack.ch, Manor.ch, Interdiscount.ch"
+        except:
+            # Fallback to general shops
+            relevant_shops = "Digitec.ch, Galaxus.ch, Brack.ch, Manor.ch, Interdiscount.ch"
+        
+        print(f"   🏪 Relevant shops for {category}: {relevant_shops}")
+        print(f"   🔎 Searching for {len(cleaned_terms)} products...")
+        
         # v11: Enhanced prompt - request snippets for qty parsing audit trail
         prompt = f"""Finde Schweizer Neupreise (CHF) für diese {len(batch)} Produkte.
 Kategorie: {category}
@@ -660,7 +740,7 @@ Kategorie: {category}
 PRODUKTE:
 {product_list}
 
-Suche in: Digitec.ch, Galaxus.ch, Zalando.ch, Decathlon.ch, Manor.ch
+Suche in: {relevant_shops}
 
 WICHTIG: 
 1. Finde MEHRERE Preise pro Produkt (bis zu 5 Shops)
@@ -695,6 +775,7 @@ Bei unbekannt: prices=[], conf=0"""
             json_match = re.search(r'\[[\s\S]*\]', raw)
             if not json_match:
                 print(f"   ⚠️ No JSON array in batch response")
+                print(f"   🚫 JSON parse failed - using AI fallback for {len(batch)} products")
                 continue
             
             try:
@@ -702,6 +783,7 @@ Bei unbekannt: prices=[], conf=0"""
             except json.JSONDecodeError as e:
                 print(f"   ⚠️ Batch web search failed: {e}")
                 print(f"   📄 Raw JSON (first 500 chars): {json_match.group(0)[:500]}")
+                print(f"   🚫 JSON parse failed - using AI fallback for {len(batch)} products")
                 continue
             
             for item in parsed:
@@ -2373,6 +2455,9 @@ def calculate_deal_score(expected_profit: float, purchase_price: float, resale_p
         elif bids >= 10:
             score += 0.3
     
+    # Clamp score to 0-10 range
+    return max(0.0, min(10.0, score))
+
 
 # MAIN EVALUATION FUNCTION
 # ==============================================================================

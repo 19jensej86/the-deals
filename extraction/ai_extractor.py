@@ -183,6 +183,9 @@ def extract_product_with_ai(
         except ValueError:
             bundle_type = BundleType.UNKNOWN
         
+        # v12: Extract is_accessory_only flag (combined AI call for cost savings)
+        is_accessory_only = data.get("is_accessory_only", False)
+        
         # Determine if we have valid products
         quantity = data.get("quantity", 1)
         products = []
@@ -200,11 +203,19 @@ def extract_product_with_ai(
         can_price = (
             overall_confidence >= 0.6 and
             bundle_type != BundleType.UNKNOWN and
-            len(products) > 0
+            len(products) > 0 and
+            not is_accessory_only  # v12: Skip accessories
         )
         
         # Do we need detail scraping?
         needs_detail = data.get("needs_detail", False) or overall_confidence < 0.7
+        
+        # Skip reason includes accessory detection
+        skip_reason = None
+        if is_accessory_only:
+            skip_reason = "accessory_only"
+        elif not can_price and not needs_detail:
+            skip_reason = "confidence_too_low"
         
         # Calculate AI cost (rough estimate)
         # Claude Haiku: ~$0.25 per 1M input tokens, ~$1.25 per 1M output tokens
@@ -223,7 +234,8 @@ def extract_product_with_ai(
             can_price=can_price,
             needs_detail_scraping=needs_detail,
             needs_vision=overall_confidence < 0.5,
-            skip_reason=None if can_price or needs_detail else "confidence_too_low",
+            skip_reason=skip_reason,
+            is_accessory_only=is_accessory_only,  # v12: Store AI's accessory detection
             extraction_method="ai_structured",
             ai_cost_usd=ai_cost
         )
