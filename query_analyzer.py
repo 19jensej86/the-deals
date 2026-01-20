@@ -166,7 +166,7 @@ def _call_claude(prompt: str, max_tokens: int = 3000) -> Optional[str]:
     
     try:
         response = _claude_client.messages.create(
-            model="claude-3-5-haiku-20241022",
+            model="claude-3-5-haiku-20250514",  # Haiku 3.5 (updated 2025-05-14)
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}]
         )

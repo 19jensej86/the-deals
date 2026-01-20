@@ -48,6 +48,10 @@ class ModeConfig:
     prefer_ai_fallback: bool
     prefer_query_baseline: bool
     
+    # Vision behavior
+    vision_enabled: bool
+    max_vision_calls: int
+    
     # Budget limits
     max_run_cost_usd: float
     enforce_budget: bool
@@ -75,19 +79,23 @@ def get_mode_config(mode: str) -> ModeConfig:
         return ModeConfig(
             mode=runtime_mode,
             
-            # 🧪 TEST: TRUNCATE EVERYTHING
+            # 🧪 TEST: TRUNCATE EVERYTHING (v2.2 schema)
             truncate_on_start=True,
             truncate_tables=[
+                "deals",
+                "bundles",
+                "bundle_items",
+                "deal_audit",
+                "bundle_audit",
                 "listings",
                 "price_history", 
-                "component_cache",
-                "market_data",
-                "bundle_components",
+                "price_cache",
+                "user_actions",
             ],
             
-            # 🧪 TEST: MINIMAL WEBSEARCH
-            websearch_enabled=True,  # Erlaubt, aber stark limitiert
-            max_websearch_calls=1,   # MAX 1 CALL!
+            # 🧪 TEST: NO WEBSEARCH (saves $0.35 per run)
+            websearch_enabled=False,  # Deaktiviert - zu teuer für TEST
+            max_websearch_calls=0,    # 0 calls allowed
             websearch_wait_seconds=0,  # KEIN WAIT in Test
             
             # 🧪 TEST: NO RETRIES
@@ -102,8 +110,12 @@ def get_mode_config(mode: str) -> ModeConfig:
             prefer_ai_fallback=True,
             prefer_query_baseline=True,
             
-            # 🧪 TEST: STRICT BUDGET
-            max_run_cost_usd=0.20,  # MAX 20 CENTS!
+            # 🧪 TEST: NO VISION (saves ~$0.035 per run)
+            vision_enabled=False,
+            max_vision_calls=0,
+            
+            # 🧪 TEST: STRICT BUDGET (Updated 2026-01-20 for Haiku 4.5)
+            max_run_cost_usd=0.50,  # MAX 50 CENTS (was 0.20, increased for Haiku 4.5)
             enforce_budget=True,     # HARD STOP
         )
     
@@ -131,6 +143,10 @@ def get_mode_config(mode: str) -> ModeConfig:
             # 🚀 PROD: PREFER WEB PRICES
             prefer_ai_fallback=False,
             prefer_query_baseline=False,
+            
+            # 🚀 PROD: VISION ENABLED
+            vision_enabled=True,
+            max_vision_calls=10,  # Reasonable limit
             
             # 🚀 PROD: REASONABLE BUDGET
             max_run_cost_usd=5.00,  # $5 max per run

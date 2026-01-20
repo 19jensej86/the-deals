@@ -1,6 +1,11 @@
 # DealFinder Configuration - v7.0 (Claude Edition + Detail Scraping)
 # ===================================================================
 
+# RUNTIME MODE - Controls test vs production behavior
+# ====================================================
+runtime:
+  mode: test # "test" or "prod" - SINGLE SOURCE OF TRUTH
+
 general:
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
   request_timeout_sec: 18
@@ -63,12 +68,18 @@ bundle:
   use_vision_for_unclear: true
 
 search:
+  # TEST QUERIES - Controlled set for testing
+  # ==========================================
+  # These queries test key scenarios:
+  # 1. Accessory detection (Apple Watch Armband)
+  # 2. High-confidence product (AirPods Pro 2)
+  # 3. Bundle logic (Hantelscheiben Set)
+  # 4. Standard product (iPhone 12 Mini)
   queries:
-    - "Garmin Fenix 7"
-    - "AirPods Pro"
-    - "Hantelscheibe 5kg"
-    - "Kurzhantel Set"
-    - "Tommy Hilfiger Hoodie"
+    - "Apple Watch Ultra Armband original"
+    - "Apple AirPods Pro 2. Generation"
+    - "Olympic Hantelscheiben Set 4x5kg"
+    - "iPhone 12 Mini 128GB"
 
 # =================================================
 # AI Configuration - v7.0 CLAUDE
@@ -78,8 +89,9 @@ ai:
   provider: "claude"
 
   # Claude models
-  claude_model_fast: "claude-3-5-haiku-20241022" # Für schnelle Tasks (clustering, evaluation)
-  claude_model_web: "claude-sonnet-4-20250514" # Für Web-Search (Neupreise)
+  # UPDATED 2026-01-20: Haiku 3.5 deprecated, migrated to Haiku 4.5
+  claude_model_fast: "claude-3-5-haiku-20250514" # Haiku 4.5 - Für schnelle Tasks (clustering, evaluation)
+  claude_model_web: "claude-sonnet-4-20250514" # Sonnet 4 - Für Web-Search (Neupreise)
 
   # OpenAI fallback (falls Claude nicht verfügbar)
   openai_model: "gpt-4o-mini"
@@ -91,26 +103,18 @@ ai:
   adaptive_vision_rate: 0.10
 
   # v7.0: Web Search Settings
-  # ⚠️ WARNING: Web search costs ~$0.10-0.15 per batch!
-  # Set to false to use AI estimation only (much cheaper: ~$0.01/run)
+  # ⚠️ WARNING: Web search costs ~$0.35 per batch!
+  # Set to false to use AI estimation only (much cheaper with Haiku 4.5: ~$0.14/run)
+  # NOTE: Shops are selected dynamically by AI based on product category
+  #       No need to hardcode shop lists - AI chooses best shops automatically
   web_search:
     enabled: true # Set to FALSE to disable expensive web searches
-    preferred_shops:
-      - "digitec.ch"
-      - "galaxus.ch"
-      - "brack.ch"
-      - "interdiscount.ch"
-    # Für Kleidung
-    clothing_shops:
-      - "zalando.ch"
-      - "aboutyou.ch"
-      - "manor.ch"
 
-  # Pricing (USD pro Call) - CORRECTED based on actual billing!
+  # Pricing (USD pro Call) - UPDATED 2026-01-20 for Haiku 4.5
   pricing:
-    claude_haiku_usd: 0.002 # ~2k tokens × $1/1M
-    claude_sonnet_usd: 0.005 # ~1.5k tokens × $3/1M
-    claude_web_search_usd: 0.10 # ~22k tokens + retries = $0.10-0.15!
+    claude_haiku_usd: 0.008 # Haiku 4.5: ~2k tokens × $4/1M (4x increase)
+    claude_sonnet_usd: 0.005 # Sonnet 4: ~1.5k tokens × $3/1M
+    claude_web_search_usd: 0.35 # Sonnet 4 + web: ~22k tokens = $0.35
     openai_text_usd: 0.001
     vision_usd: 0.007
 

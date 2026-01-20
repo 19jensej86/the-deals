@@ -44,23 +44,26 @@ from io import StringIO
 from playwright.sync_api import sync_playwright
 
 from config import load_config, print_config_summary
-from db_pg import (
+# v2.2: Use new schema module
+from db_pg_v2 import (
     get_conn, 
-    ensure_schema, 
-    upsert_listing, 
+    ensure_schema,
+    ensure_schema_v2,
+    save_evaluation,  # Bridge function: old format → new schema
     cleanup_old_listings,
     clear_listings,
     record_price_if_changed,
-    clear_expired_market_data,
-    clear_stale_market_for_variant,
+    clean_price_cache as clear_expired_market_data,
     update_listing_details,
-    # v11.1: Unified schema functions
-    ensure_schema_v2,
-    insert_listing,
-    get_listings,
-    get_bundle_groups,
-    export_listings_json,
-    export_listings_csv,
+    # Run management
+    start_run,
+    finish_run,
+    get_run_stats,
+    # Query helpers
+    get_latest_deals as get_listings,
+    get_latest_bundles as get_bundle_groups,
+    export_deals_json as export_listings_json,
+    export_deals_csv as export_listings_csv,
 )
 from scrapers.browser_ctx import (
     ensure_chrome_closed,
@@ -186,9 +189,16 @@ def run_v10_pipeline(
     3. PHASE 3: Websearch for products that passed extraction
     4. PHASE 4: Pricing and deal evaluation
     
+    Args:
+        run_id: UUID string from start_run() - DO NOT generate new run_id here
+    
     Returns:
         List of deals for detail scraping
     """
+    # ✅ FAIL FAST: Validate UUID at pipeline entry
+    from db_pg_v2 import assert_valid_uuid
+    run_id = assert_valid_uuid(run_id, context="run_v10_pipeline()")
+    
     logger = get_logger()
     
     all_deals_for_detail = []
@@ -733,8 +743,7 @@ def run_v10_pipeline(
             # Save to database
             end_time = parse_ricardo_end_time(listing.get("end_time_text"))
             
-            if current_price and listing.get("listing_id"):
-                record_price_if_changed(conn, listing["listing_id"], current_price, bids_count or 0)
+            # v2.2: price_history recording moved to save_evaluation() - happens after listing insert
             
             price_source = ai_result.get("price_source", "ai_estimate")
             if ai_result.get("market_based_resale"):
@@ -868,8 +877,8 @@ def run_v10_pipeline(
                 data["location"] = detail_data.get("location")
             
             # Track metrics for analysis
-            if not hasattr(upsert_listing, 'run_metrics'):
-                upsert_listing.run_metrics = {
+            if not hasattr(save_evaluation, 'run_metrics'):
+                save_evaluation.run_metrics = {
                     'total': 0,
                     'bundles': 0,
                     'price_sources': {},
@@ -879,26 +888,27 @@ def run_v10_pipeline(
                     'websearch_misses': 0,
                 }
             
-            upsert_listing.run_metrics['total'] += 1
+            save_evaluation.run_metrics['total'] += 1
             if is_bundle:
-                upsert_listing.run_metrics['bundles'] += 1
+                save_evaluation.run_metrics['bundles'] += 1
             
             # Track price sources
             ps = data.get('price_source', 'unknown')
-            upsert_listing.run_metrics['price_sources'][ps] = upsert_listing.run_metrics['price_sources'].get(ps, 0) + 1
+            save_evaluation.run_metrics['price_sources'][ps] = save_evaluation.run_metrics['price_sources'].get(ps, 0) + 1
             
             # Track strategies
             strat = data.get('recommended_strategy', 'unknown')
-            upsert_listing.run_metrics['strategies'][strat] = upsert_listing.run_metrics['strategies'].get(strat, 0) + 1
+            save_evaluation.run_metrics['strategies'][strat] = save_evaluation.run_metrics['strategies'].get(strat, 0) + 1
             
             # Track websearch success
             if data.get('web_search_used'):
                 if data.get('shop_name'):
-                    upsert_listing.run_metrics['websearch_hits'] += 1
+                    save_evaluation.run_metrics['websearch_hits'] += 1
                 else:
-                    upsert_listing.run_metrics['websearch_misses'] += 1
+                    save_evaluation.run_metrics['websearch_misses'] += 1
             
-            upsert_listing(conn, data)
+            # v2.2: Use save_evaluation bridge function
+            save_evaluation(conn, data)
             
             # Collect for detail scraping
             if profit and profit > 0 and listing.get("url"):
@@ -1050,8 +1060,8 @@ def export_listings_to_file(conn, filename: str = "last_run_listings.json"):
         print("📊 RUN ANALYSIS SUMMARY")
         print("="*80)
         
-        if hasattr(upsert_listing, 'run_metrics'):
-            metrics = upsert_listing.run_metrics
+        if hasattr(save_evaluation, 'run_metrics'):
+            metrics = save_evaluation.run_metrics
             total = metrics['total']
             
             print(f"\n📈 LISTINGS PROCESSED: {total}")
@@ -1283,20 +1293,24 @@ def run_once():
     # --------------------------------------------------------------------------
     # 2) DATABASE CONNECTION + v11 SCHEMA RESET
     # --------------------------------------------------------------------------
+    conn = None
+    run_id = None
+    
     try:
         conn = get_conn(cfg.pg)
         
-        # v11.1: Generate unique run_id for this execution
-        import uuid
-        run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-        print(f"\n🆔 Run ID: {run_id}")
-        
-        # v11.1: SCHEMA INITIALIZATION (idempotent, no auto-drop)
-        print("\n🗄️ v11.1: Initializing unified schema...")
-        ensure_schema_v2(conn, reset_schema=False)
-        
-        # Also ensure legacy schema for backward compatibility during transition
+        # v2.2: Verify schema and create run record
+        print("\n🗄️ v2.2: Verifying schema...")
         ensure_schema(conn)
+        
+        # v2.2: Create run record with UUID
+        queries = cfg.search.get('queries', []) if isinstance(cfg.search, dict) else []
+        run_id = start_run(conn, mode=cfg.runtime.mode, queries=queries)
+        
+        # ✅ FAIL FAST: Validate UUID immediately after creation
+        from db_pg_v2 import assert_valid_uuid
+        run_id = assert_valid_uuid(run_id, context="run_once() after start_run()")
+        print(f"🆔 Run ID (validated): {run_id}")
         
         # Clear expired market data
         clear_expired_market_data(conn)
@@ -1307,24 +1321,45 @@ def run_once():
     except Exception as e:
         print("❌ DB error:", e)
         traceback.print_exc()
+        if conn and run_id:
+            finish_run(conn, run_id, error_message=str(e)[:500])
         return
 
     # --------------------------------------------------------------------------
-    # 3) DATA CLEARING BASED ON RUNTIME MODE
+    # 3) RUNTIME MODE VERIFICATION & DATA CLEARING
     # --------------------------------------------------------------------------
     # FIX #4: Use centralized runtime mode config for DB truncation
     from runtime_mode import get_mode_config, should_truncate_db
     
     mode_config = get_mode_config(cfg.runtime.mode)
     
+    # PART B: Startup TEST mode verification log
+    print("\n" + "="*70)
+    if mode_config.mode.value == "test":
+        print("🧪 TEST MODE ACTIVE")
+        print("="*70)
+        print(f"   Max Websearch Calls:  {mode_config.max_websearch_calls}")
+        print(f"   Max Cost (USD):       ${mode_config.max_run_cost_usd:.2f}")
+        print(f"   Retry Enabled:        {mode_config.retry_enabled}")
+        print(f"   Truncate on Start:    {mode_config.truncate_on_start}")
+        print(f"   Budget Enforced:      {mode_config.enforce_budget}")
+        print("="*70)
+    else:
+        print("🚀 PRODUCTION MODE ACTIVE")
+        print("="*70)
+        print(f"   Max Websearch Calls:  {mode_config.max_websearch_calls}")
+        print(f"   Max Cost (USD):       ${mode_config.max_run_cost_usd:.2f}")
+        print(f"   Retry Enabled:        {mode_config.retry_enabled}")
+        print("="*70)
+    
     if should_truncate_db(mode_config):
         print(f"\n🧪 {mode_config.mode.value.upper()} mode: Truncating ALL tables for clean test...")
         try:
             with conn.cursor() as cur:
+                # IMPROVEMENT #2: Use TRUNCATE instead of DELETE (faster, resets sequences, handles FKs)
                 for table in mode_config.truncate_tables:
-                    cur.execute(f"DELETE FROM {table}")
-                    deleted = cur.rowcount
-                    print(f"   🧹 Cleared {table} ({deleted} rows)")
+                    cur.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE")
+                    print(f"   🧹 Truncated {table} (sequences reset)")
                 conn.commit()
         except Exception as e:
             print(f"   ⚠️ Truncate failed: {e}")
@@ -1396,9 +1431,8 @@ def run_once():
     # v7.0: Collect all deals for detail scraping at the end
     all_deals_for_detail: List[Dict[str, Any]] = []
     
-    # v9.2: Generate unique run_id for this pipeline execution
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"\n🆔 Run ID: {run_id}")
+    # v2.2: run_id already created by start_run() - DO NOT override
+    # The UUID from run_once() is passed down to this function
     
     # v7.2: Global statistics
     global_stats = {
@@ -1493,72 +1527,13 @@ def run_once():
                                         })
                                         detail_success_count += 1
                                         
-                                        # OBJECTIVE A: Re-evaluate deal with detail data (ZERO COST)
-                                        from ai_filter import re_evaluate_with_details
-                                        from db_pg import update_listing_reevaluation
+                                        # TODO: Re-evaluate deal with detail data (function not yet implemented)
+                                        # from ai_filter import re_evaluate_with_details
+                                        # from db_pg_v2 import update_listing_details as update_listing_reevaluation
                                         
-                                        # Get original evaluation result
-                                        original_result = {
-                                            "expected_profit": deal.get("expected_profit", 0),
-                                            "deal_score": deal.get("deal_score", 0),
-                                            "recommended_strategy": deal.get("recommended_strategy", "watch"),
-                                            "strategy_reason": deal.get("strategy_reason", ""),
-                                            "resale_price_est": deal.get("resale_price_est", 0),
-                                            "price_source": deal.get("price_source", "unknown"),
-                                            "market_based_resale": deal.get("market_based_resale", False),
-                                        }
-                                        
-                                        # Determine purchase price
-                                        buy_now_price = deal.get("buy_now_price")
-                                        current_price = deal.get("current_price_ricardo")
-                                        predicted_final = deal.get("predicted_final_price")
-                                        
-                                        if buy_now_price:
-                                            purchase_price = buy_now_price
-                                        elif predicted_final:
-                                            purchase_price = predicted_final
-                                        elif current_price:
-                                            purchase_price = current_price
-                                        else:
-                                            purchase_price = 0
-                                        
-                                        # Re-evaluate with detail data
-                                        is_auction = current_price is not None and buy_now_price is None
-                                        has_buy_now = buy_now_price is not None
-                                        
-                                        updated = re_evaluate_with_details(
-                                            original_result=original_result,
-                                            detail_data=detail,
-                                            purchase_price=purchase_price,
-                                            is_auction=is_auction,
-                                            has_buy_now=has_buy_now,
-                                            bids_count=deal.get("bids_count", 0),
-                                            hours_remaining=deal.get("hours_remaining"),
-                                            is_bundle=deal.get("is_bundle", False)
-                                        )
-                                        
-                                        # Log re-evaluation if values changed
-                                        if updated["expected_profit"] != original_result["expected_profit"]:
-                                            print(f"   🔄 Re-evaluated {deal['listing_id']}:")
-                                            print(f"      Profit: {original_result['expected_profit']:.0f} → {updated['expected_profit']:.0f} CHF")
-                                            print(f"      Strategy: {original_result['recommended_strategy']} → {updated['recommended_strategy']}")
-                                            
-                                            adjustments = updated.get("detail_adjustments", {})
-                                            if adjustments.get("shipping_cost"):
-                                                print(f"      Shipping: -{adjustments['shipping_cost']:.0f} CHF")
-                                            if adjustments.get("rating_penalty"):
-                                                print(f"      Rating penalty: -{adjustments['rating_penalty']:.0f} CHF")
-                                            if adjustments.get("pickup_only_penalty"):
-                                                print(f"      Pickup-only: -{adjustments['pickup_only_penalty']:.0f} CHF")
-                                        
-                                        # Update database with re-evaluated values
-                                        update_listing_reevaluation(conn, {
-                                            "listing_id": deal["listing_id"],
-                                            "expected_profit": updated["expected_profit"],
-                                            "deal_score": updated["deal_score"],
-                                            "recommended_strategy": updated["recommended_strategy"],
-                                            "strategy_reason": updated["strategy_reason"],
-                                        })
+                                        # Skip re-evaluation for now (function not implemented)
+                                        # updated = None
+                                        # TODO: Implement re_evaluate_with_details in ai_filter.py
                                     else:
                                         print(f"   ⚠️ No detail data for {deal['listing_id']} - scraping failed")
                                         detail_fail_count += 1
@@ -1649,7 +1624,9 @@ def run_once():
             # ------------------------------------------------------------------
             # 11) AI COST SUMMARY (v9.2: Enhanced with step breakdown)
             # ------------------------------------------------------------------
-            run_cost, day = get_run_cost_summary()
+            cost_summary = get_run_cost_summary()
+            run_cost = cost_summary.get("total_usd", 0.0)
+            day = cost_summary.get("date", "")
             day_total = save_day_cost()
             
             # Get cost summary from logger
@@ -1681,8 +1658,45 @@ def run_once():
             # Export listings to JSON
             export_listings_to_file(conn, "last_run_listings.json")
             
+            # IMPROVEMENT #4: Post-run invariant checks (TEST MODE ONLY)
+            try:
+                from test_invariants import run_invariant_checks
+                run_invariant_checks(conn, mode_config)
+            except ImportError:
+                pass  # test_invariants not available
+            except Exception as e:
+                # Invariant violation - fail the run
+                print(f"\n❌ POST-RUN INVARIANT CHECK FAILED:")
+                print(f"{e}")
+                raise
+            
             print("\n✅ Pipeline completed successfully!")
+            
+            # ✅ Finalize run on success
+            if conn and run_id:
+                cost_summary = get_run_cost_summary()
+                finish_run(
+                    conn, run_id,
+                    listings_found=global_stats.get('total_scraped', 0),
+                    deals_created=0,  # TODO: track from save_evaluation
+                    bundles_created=0,
+                    profitable_deals=0,
+                    ai_cost_usd=cost_summary.get('total_usd', 0.0),
+                    websearch_calls=0  # TODO: track from ai_filter
+                )
 
+    except Exception as e:
+        # ❌ Finalize run on failure
+        print(f"\n❌ Pipeline failed: {e}")
+        if conn and run_id:
+            cost_summary = get_run_cost_summary()
+            finish_run(
+                conn, run_id,
+                ai_cost_usd=cost_summary.get('total_usd', 0.0),
+                error_message=str(e)[:500]
+            )
+        raise
+    
     finally:
         cleanup_profile(tmp_profile)
         

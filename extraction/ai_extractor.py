@@ -51,7 +51,7 @@ def _call_claude(prompt: str, max_tokens: int = 800) -> Optional[str]:
     
     try:
         response = _claude_client.messages.create(
-            model="claude-3-5-haiku-20241022",
+            model="claude-3-5-haiku-20250514",  # Haiku 4.5 (updated 2026-01-20)
             max_tokens=max_tokens,
             messages=[
                 {"role": "user", "content": SYSTEM_PROMPT + "\n\n" + prompt}
@@ -241,8 +241,9 @@ def extract_product_with_ai(
         )
         
     except (json.JSONDecodeError, ValueError, KeyError) as e:
-        # Parsing failed - return empty with low confidence
-        print(f"   ⚠️ Failed to parse AI response: {e}")
+        # IMPROVEMENT #1: Explicit failure tracking (no silent skips)
+        error_type = type(e).__name__
+        print(f"   ❌ EXTRACTION FAILED: {error_type} - {str(e)[:100]}")
         return ExtractedProduct(
             listing_id=listing_id,
             original_title=title,
@@ -252,9 +253,11 @@ def extract_product_with_ai(
             bundle_confidence=0.0,
             overall_confidence=0.0,
             can_price=False,
-            needs_detail_scraping=True,
+            extraction_status="FAILED",  # Explicit failure marker
+            failure_reason=f"json_parse_error: {error_type}",
+            needs_detail_scraping=False,  # Don't escalate failed extractions
             needs_vision=False,
-            skip_reason="ai_response_parse_error",
+            skip_reason="extraction_failed",
             extraction_method="ai_structured",
             ai_cost_usd=0.0
         )

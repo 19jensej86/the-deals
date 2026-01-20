@@ -34,6 +34,10 @@ class ExtractedProduct:
     overall_confidence: float = 0.0         # Min of all confidences
     can_price: bool = False                 # False if too unclear
     
+    # === EXTRACTION STATUS ===
+    extraction_status: str = "SUCCESS"      # "SUCCESS", "FAILED", "PARTIAL"
+    failure_reason: Optional[str] = None    # "json_parse_error", "api_error", etc.
+    
     # === ESCALATION ===
     needs_detail_scraping: bool = False
     needs_vision: bool = False
