@@ -97,7 +97,7 @@ class AIConf:
     provider: str = "claude"  # "claude" or "openai"
     
     # Claude models
-    claude_model_fast: str = "claude-haiku-4-5-20241022"
+    claude_model_fast: str = "claude-3-5-haiku-20241022"
     claude_model_web: str = "claude-sonnet-4-20250514"
     
     # OpenAI fallback
@@ -221,7 +221,7 @@ def load_config() -> Cfg:
         search=y.get("search", {"queries": []}),
         ai=AIConf(
             provider=ai.get("provider", "claude"),
-            claude_model_fast=ai.get("claude_model_fast", "claude-haiku-4-5-20241022"),
+            claude_model_fast=ai.get("claude_model_fast", "claude-3-5-haiku-20241022"),
             claude_model_web=ai.get("claude_model_web", "claude-sonnet-4-20250514"),
             openai_model=ai.get("openai_model", "gpt-4o-mini"),
             use_ai_text=ai.get("use_ai_text", True),

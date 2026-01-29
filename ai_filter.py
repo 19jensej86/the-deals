@@ -103,13 +103,7 @@ except ImportError:
 _claude_client = None
 _openai_client = None
 _provider = "claude"
-
-# Model configuration (can be overridden by config)
-# UPDATED 2026-01-20: Haiku 3.5 deprecated, migrated to Haiku 4.5
-MODEL_FAST = "claude-3-5-haiku-20250514"      # Haiku 4.5: Quick tasks (clustering, evaluation)
-MODEL_WEB = "claude-sonnet-4-20250514"         # Sonnet 4: Web search (new prices)
-MODEL_OPENAI = "gpt-4o-mini"                   # Fallback
-
+_config = None  # Will be set by init_ai_filter()
 
 def _init_clients():
     """Initialize AI clients based on available API keys."""
@@ -219,7 +213,6 @@ MAX_BUNDLE_RESALE_PERCENT_OF_NEW = 0.85
 
 COMPONENT_MARKET_TRUST_MULTIPLIER = 5.0
 
-
 # ==============================================================================
 # v7.0: UNIFIED AI CALL WRAPPER
 # ==============================================================================
@@ -230,6 +223,7 @@ def _call_claude(
     model: str = None,
     use_web_search: bool = False,
     image_url: str = None,
+    step: str = "unknown",
 ) -> Optional[str]:
     """
     Call Claude API with optional web search or vision.
@@ -240,6 +234,7 @@ def _call_claude(
         model: Override model (default: MODEL_FAST)
         use_web_search: Enable web search tool
         image_url: Optional image URL for vision
+        step: Pipeline step name for logging
     
     Returns:
         Response text or None on error
@@ -247,11 +242,25 @@ def _call_claude(
     if not _claude_client:
         return None
     
-    # Select model
+    # Select model from config
+    if not _config:
+        raise RuntimeError("AI Filter not initialized. Call init_ai_filter(cfg) first.")
+    
     if use_web_search:
-        selected_model = MODEL_WEB
+        selected_model = _config.ai.claude_model_web
     else:
-        selected_model = model or MODEL_FAST
+        selected_model = model or _config.ai.claude_model_fast
+    
+    # AI_CALL_DECISION: Log before making AI call
+    runtime_mode = getattr(_config.runtime, 'mode', 'unknown')
+    call_type = "vision" if image_url else ("websearch" if use_web_search else "text")
+    print(f"\nAI_CALL_DECISION:")
+    print(f"  step: {step}")
+    print(f"  runtime_mode: {runtime_mode}")
+    print(f"  model: {selected_model}")
+    print(f"  call_type: {call_type}")
+    print(f"  allowed: true")
+    print(f"  reason: AI_ENABLED")
     
     try:
         # Build messages
@@ -293,10 +302,24 @@ def _call_claude(
         
     except Exception as e:
         error_str = str(e)
+        
+        # AI_FAILURE: Structured error logging
+        runtime_mode = getattr(_config.runtime, 'mode', 'unknown')
+        error_type = "rate_limit" if ("429" in error_str or "rate_limit" in error_str.lower()) else "api_error"
+        
+        print(f"\nAI_FAILURE:")
+        print(f"  step: {step}")
+        print(f"  model: {selected_model}")
+        print(f"  runtime_mode: {runtime_mode}")
+        print(f"  error_type: {error_type}")
+        print(f"  error_message: {str(e)[:100]}")
+        
         # Re-raise 429 rate limit errors so retry logic can handle them
-        if "429" in error_str or "rate_limit" in error_str.lower():
+        if error_type == "rate_limit":
+            print(f"  action_taken: re-raise (retry logic will handle)")
             raise  # Let caller handle rate limits
-        print(f"⚠️ Claude API error: {e}")
+        
+        print(f"  action_taken: return_none (caller fallback)")
         return None
 
 
@@ -305,12 +328,27 @@ def _call_openai(
     max_tokens: int = 500,
     model: str = None,
     image_url: str = None,
+    step: str = "unknown",
 ) -> Optional[str]:
     """Call OpenAI API (fallback)."""
     if not _openai_client:
         return None
     
-    selected_model = model or MODEL_OPENAI
+    if not _config:
+        raise RuntimeError("AI Filter not initialized. Call init_ai_filter(cfg) first.")
+    
+    selected_model = model or _config.ai.openai_model
+    
+    # AI_CALL_DECISION: Log before making AI call
+    runtime_mode = getattr(_config.runtime, 'mode', 'unknown')
+    call_type = "vision" if image_url else "text"
+    print(f"\nAI_CALL_DECISION:")
+    print(f"  step: {step}")
+    print(f"  runtime_mode: {runtime_mode}")
+    print(f"  model: {selected_model}")
+    print(f"  call_type: {call_type}")
+    print(f"  allowed: true")
+    print(f"  reason: OPENAI_FALLBACK")
     
     try:
         if image_url:
@@ -334,7 +372,15 @@ def _call_openai(
         return response.choices[0].message.content.strip()
         
     except Exception as e:
-        print(f"⚠️ OpenAI API error: {e}")
+        # AI_FAILURE: Structured error logging
+        runtime_mode = getattr(_config.runtime, 'mode', 'unknown')
+        print(f"\nAI_FAILURE:")
+        print(f"  step: {step}")
+        print(f"  model: {selected_model}")
+        print(f"  runtime_mode: {runtime_mode}")
+        print(f"  error_type: api_error")
+        print(f"  error_message: {str(e)[:100]}")
+        print(f"  action_taken: return_none")
         return None
 
 
@@ -566,19 +612,42 @@ def search_web_batch_for_new_prices(
         cfg = load_config()
         mode_config = get_mode_config(cfg.runtime.mode)
         
-        # Check if websearch allowed in this mode
-        if not should_use_websearch(mode_config, WEB_SEARCH_COUNT_TODAY):
+        # MODE_GUARD: Check if websearch allowed in this mode
+        websearch_allowed = should_use_websearch(mode_config, WEB_SEARCH_COUNT_TODAY)
+        print(f"\nMODE_GUARD:")
+        print(f"  runtime_mode: {mode_config.mode.value}")
+        print(f"  feature: websearch")
+        print(f"  allowed: {str(websearch_allowed).lower()}")
+        print(f"  reason: {'WEBSEARCH_LIMIT_REACHED' if not websearch_allowed else 'WITHIN_LIMITS'}")
+        
+        if not websearch_allowed:
             print(f"   🚫 Websearch limit reached ({WEB_SEARCH_COUNT_TODAY}/{mode_config.max_websearch_calls}) - using AI fallback")
             return {}
         
         # Check budget
         cost_summary = get_run_cost_summary()
         current_cost = cost_summary.get("total_usd", 0.0)
-        if mode_budget_check(mode_config, current_cost):
+        budget_exceeded = mode_budget_check(mode_config, current_cost)
+        
+        # MODE_GUARD: Budget check
+        print(f"\nMODE_GUARD:")
+        print(f"  runtime_mode: {mode_config.mode.value}")
+        print(f"  feature: websearch")
+        print(f"  allowed: {str(not budget_exceeded).lower()}")
+        print(f"  reason: {'BUDGET_EXCEEDED' if budget_exceeded else 'WITHIN_BUDGET'}")
+        
+        if budget_exceeded:
             print(f"   🚫 Budget exceeded (${current_cost:.2f}/${mode_config.max_run_cost_usd:.2f}) - stopping websearch")
             return {}
     except ImportError:
         # Fallback to old logic if runtime_mode not available
+        # MODE_GUARD: Config-based websearch check
+        print(f"\nMODE_GUARD:")
+        print(f"  runtime_mode: unknown")
+        print(f"  feature: websearch")
+        print(f"  allowed: {str(WEB_SEARCH_ENABLED).lower()}")
+        print(f"  reason: {'CONFIG_ENABLED' if WEB_SEARCH_ENABLED else 'CONFIG_DISABLED'}")
+        
         if not WEB_SEARCH_ENABLED:
             print("   ℹ️ Web search DISABLED (config.yaml) - using AI estimation only")
             return {}
@@ -2633,9 +2702,38 @@ def evaluate_listing_with_ai(
     
     # v7.2.1: Fallback new_price to buy_now_price if web search failed
     if not result["new_price"] and buy_now_price and buy_now_price > 0:
-        result["new_price"] = buy_now_price * 1.1  # Conservative estimate: assume 10% markup
-        result["price_source"] = PRICE_SOURCE_BUY_NOW_FALLBACK
-        print(f"   Using buy_now_price as new_price fallback: {result['new_price']:.2f} CHF")
+        # MODE_GUARD: AI fallback pricing decision
+        try:
+            from config import load_config
+            from runtime_mode import get_mode_config
+            cfg = load_config()
+            mode_config = get_mode_config(cfg.runtime.mode)
+            runtime_mode = mode_config.mode.value
+            is_test_mode = (runtime_mode == "test")
+        except:
+            runtime_mode = "unknown"
+            is_test_mode = False
+        
+        # TEST MODE CONTRACT: buy_now_fallback is NOT allowed in TEST mode
+        if is_test_mode:
+            print(f"\nMODE_GUARD:")
+            print(f"  runtime_mode: {runtime_mode}")
+            print(f"  feature: ai_fallback_pricing")
+            print(f"  allowed: false")
+            print(f"  reason: TEST_MODE_BUY_NOW_FALLBACK_BLOCKED")
+            print(f"   TEST MODE: Skipping buy_now_fallback pricing (not allowed in TEST mode)")
+            # Do NOT set result["new_price"] - let it remain None
+            # query_baseline will be used later as final fallback
+        else:
+            print(f"\nMODE_GUARD:")
+            print(f"  runtime_mode: {runtime_mode}")
+            print(f"  feature: ai_fallback_pricing")
+            print(f"  allowed: true")
+            print(f"  reason: BUY_NOW_FALLBACK_USED")
+            
+            result["new_price"] = buy_now_price * 1.1  # Conservative estimate: assume 10% markup
+            result["price_source"] = PRICE_SOURCE_BUY_NOW_FALLBACK
+            print(f"   Using buy_now_price as new_price fallback: {result['new_price']:.2f} CHF")
     
     # v7.2.1: Calculate resale_price_est from new_price if missing
     resale_rate = _get_resale_rate(query_analysis)
@@ -2645,11 +2743,32 @@ def evaluate_listing_with_ai(
     # v9.0 FIX: If we have resale_price but no new_price, estimate new_price
     # This ensures data consistency: prefer rough but realistic values over NULL/0
     if result["resale_price_est"] and not result["new_price"]:
-        # Reverse calculate: new_price = resale_price / resale_rate
-        estimated_new = result["resale_price_est"] / resale_rate if resale_rate > 0 else result["resale_price_est"] * 2
-        result["new_price"] = round(estimated_new, 2)
-        if result["price_source"] == PRICE_SOURCE_UNKNOWN:
-            result["price_source"] = PRICE_SOURCE_AI_ESTIMATE  # Estimated from resale
+        # TEST MODE CONTRACT: AI price estimation is NOT allowed in TEST mode
+        try:
+            from config import load_config
+            from runtime_mode import get_mode_config
+            cfg = load_config()
+            mode_config = get_mode_config(cfg.runtime.mode)
+            is_test_mode = (mode_config.mode.value == "test")
+        except:
+            is_test_mode = False
+        
+        if is_test_mode:
+            # MODE_GUARD: Block AI price estimation in TEST mode
+            print(f"\nMODE_GUARD:")
+            print(f"  runtime_mode: test")
+            print(f"  feature: ai_price_estimation")
+            print(f"  allowed: false")
+            print(f"  reason: TEST_MODE_AI_ESTIMATION_BLOCKED")
+            print(f"   TEST MODE: Skipping AI price estimation (not allowed in TEST mode)")
+            # Do NOT estimate new_price - let it remain None
+            # query_baseline will be used later as final fallback
+        else:
+            # Reverse calculate: new_price = resale_price / resale_rate
+            estimated_new = result["resale_price_est"] / resale_rate if resale_rate > 0 else result["resale_price_est"] * 2
+            result["new_price"] = round(estimated_new, 2)
+            if result["price_source"] == PRICE_SOURCE_UNKNOWN:
+                result["price_source"] = PRICE_SOURCE_AI_ESTIMATE  # Estimated from resale
     
     # QUANTITY-AWARE RESALE: Apply quantity multiplication for single products
     # CRITICAL: This must happen AFTER unit resale is calculated but BEFORE profit calculation
@@ -2684,6 +2803,23 @@ def evaluate_listing_with_ai(
     # Check for bundles
     if BUNDLE_ENABLED and looks_like_bundle(title, description):
         vision_for_this_call = random.random() < VISION_RATE if image_url else False
+        
+        # MODE_GUARD: Vision usage decision
+        try:
+            from config import load_config
+            from runtime_mode import get_mode_config
+            cfg = load_config()
+            mode_config = get_mode_config(cfg.runtime.mode)
+            runtime_mode = mode_config.mode.value
+        except:
+            runtime_mode = "unknown"
+        
+        print(f"\nMODE_GUARD:")
+        print(f"  runtime_mode: {runtime_mode}")
+        print(f"  feature: vision")
+        print(f"  allowed: {str(vision_for_this_call).lower()}")
+        print(f"  reason: {'VISION_ENABLED_RANDOM' if vision_for_this_call else 'VISION_DISABLED_RANDOM'}")
+        
         bundle_result = detect_bundle_with_ai(
             title=title,
             description=description,
@@ -3293,4 +3429,33 @@ def get_lowest_variant_resale(base_product: str) -> Optional[float]:
     return round(min(prices), 2) if prices else None
 
 
-# ... (rest of the code remains the same)
+def init_ai_filter(cfg):
+    """
+    Initialize AI Filter with config and validate Claude model configuration.
+    MUST be called before any AI operations.
+    
+    Args:
+        cfg: Configuration object with ai.claude_model_fast and ai.claude_model_web
+    
+    Raises:
+        RuntimeError: If Claude model configuration is invalid
+    """
+    global _config
+    _config = cfg
+    
+    # Validate Claude model configuration if Claude is the provider
+    if cfg.ai.provider == "claude":
+        if not cfg.ai.claude_model_fast:
+            raise RuntimeError("❌ CONFIG ERROR: ai.claude_model_fast is empty")
+        
+        if cfg.ai.claude_model_fast != "claude-3-5-haiku-20241022":
+            raise RuntimeError(
+                f"❌ CONFIG ERROR: Invalid Claude fast model '{cfg.ai.claude_model_fast}'\n"
+                f"   Expected: 'claude-3-5-haiku-20241022' (Haiku 3.5)\n"
+                f"   This project uses Haiku 3.5 only. Update config.yaml."
+            )
+        
+        if not cfg.ai.claude_model_web:
+            raise RuntimeError("❌ CONFIG ERROR: ai.claude_model_web is empty")
+        
+        print(f"✅ AI Filter configured: {cfg.ai.claude_model_fast} (fast), {cfg.ai.claude_model_web} (web)")

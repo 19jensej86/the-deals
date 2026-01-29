@@ -89,8 +89,8 @@ ai:
   provider: "claude"
 
   # Claude models
-  # UPDATED 2026-01-20: Haiku 3.5 deprecated, migrated to Haiku 4.5
-  claude_model_fast: "claude-3-5-haiku-20250514" # Haiku 4.5 - Für schnelle Tasks (clustering, evaluation)
+  # NOTE: Haiku 4.5 (20250514) not yet available - using Haiku 3.5
+  claude_model_fast: "claude-3-5-haiku-20241022" # Haiku 3.5 - Für schnelle Tasks (clustering, evaluation)
   claude_model_web: "claude-sonnet-4-20250514" # Sonnet 4 - Für Web-Search (Neupreise)
 
   # OpenAI fallback (falls Claude nicht verfügbar)

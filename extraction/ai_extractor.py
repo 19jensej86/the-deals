@@ -44,14 +44,30 @@ def _init_ai_clients():
             pass
 
 
-def _call_claude(prompt: str, max_tokens: int = 800) -> Optional[str]:
+def _call_claude(prompt: str, max_tokens: int = 800, config=None) -> Optional[str]:
     """Call Claude API."""
     if not _claude_client:
         return None
     
+    # Get model from config or fail
+    if not config:
+        raise RuntimeError("Config required for Claude API calls. Pass config parameter.")
+    
+    model = config.ai.claude_model_fast
+    runtime_mode = getattr(config.runtime, 'mode', 'unknown')
+    
+    # AI_CALL_DECISION: Log before making AI call
+    print(f"\nAI_CALL_DECISION:")
+    print(f"  step: extraction")
+    print(f"  runtime_mode: {runtime_mode}")
+    print(f"  model: {model}")
+    print(f"  call_type: text")
+    print(f"  allowed: true")
+    print(f"  reason: EXTRACTION_REQUIRED")
+    
     try:
         response = _claude_client.messages.create(
-            model="claude-3-5-haiku-20250514",  # Haiku 4.5 (updated 2026-01-20)
+            model=model,
             max_tokens=max_tokens,
             messages=[
                 {"role": "user", "content": SYSTEM_PROMPT + "\n\n" + prompt}
@@ -59,7 +75,27 @@ def _call_claude(prompt: str, max_tokens: int = 800) -> Optional[str]:
         )
         return response.content[0].text
     except Exception as e:
-        print(f"   ⚠️ Claude API error: {e}")
+        error_str = str(e)
+        
+        # AI_FAILURE: Structured error logging
+        error_type = "model_not_found" if ("404" in error_str or "not_found_error" in error_str) else "api_error"
+        print(f"\nAI_FAILURE:")
+        print(f"  step: extraction")
+        print(f"  model: {model}")
+        print(f"  runtime_mode: {runtime_mode}")
+        print(f"  error_type: {error_type}")
+        print(f"  error_message: {str(e)[:100]}")
+        
+        # Check for model not found errors - these are CONFIG errors, not runtime issues
+        if error_type == "model_not_found":
+            print(f"  action_taken: raise_error (CONFIG ERROR)")
+            raise RuntimeError(
+                f"❌ CLAUDE MODEL ERROR: {e}\n"
+                f"   Model used: {model}\n"
+                f"   This is a configuration error. Check config.yaml ai.claude_model_fast"
+            )
+        
+        print(f"  action_taken: return_none (fallback to OpenAI)")
         return None
 
 
@@ -67,6 +103,15 @@ def _call_openai(prompt: str, max_tokens: int = 800) -> Optional[str]:
     """Call OpenAI API as fallback."""
     if not _openai_client:
         return None
+    
+    # AI_CALL_DECISION: Log before making AI call
+    print(f"\nAI_CALL_DECISION:")
+    print(f"  step: extraction")
+    print(f"  runtime_mode: unknown")
+    print(f"  model: gpt-4o-mini")
+    print(f"  call_type: text")
+    print(f"  allowed: true")
+    print(f"  reason: OPENAI_FALLBACK")
     
     try:
         response = _openai_client.chat.completions.create(
@@ -79,17 +124,25 @@ def _call_openai(prompt: str, max_tokens: int = 800) -> Optional[str]:
         )
         return response.choices[0].message.content
     except Exception as e:
-        print(f"   ⚠️ OpenAI API error: {e}")
+        # AI_FAILURE: Structured error logging
+        print(f"\nAI_FAILURE:")
+        print(f"  step: extraction")
+        print(f"  model: gpt-4o-mini")
+        print(f"  runtime_mode: unknown")
+        print(f"  error_type: api_error")
+        print(f"  error_message: {str(e)[:100]}")
+        print(f"  action_taken: return_none")
         return None
 
 
-def _call_ai(prompt: str, max_tokens: int = 800) -> Optional[str]:
+def _call_ai(prompt: str, max_tokens: int = 800, config=None) -> Optional[str]:
     """
     Call AI (Claude primary, OpenAI fallback).
     
     Args:
         prompt: User prompt
         max_tokens: Max response tokens
+        config: Configuration object (required for Claude)
     
     Returns:
         AI response text or None
@@ -97,7 +150,7 @@ def _call_ai(prompt: str, max_tokens: int = 800) -> Optional[str]:
     _init_ai_clients()
     
     # Try Claude first
-    response = _call_claude(prompt, max_tokens)
+    response = _call_claude(prompt, max_tokens, config=config)
     if response:
         return response
     
@@ -112,7 +165,8 @@ def _call_ai(prompt: str, max_tokens: int = 800) -> Optional[str]:
 def extract_product_with_ai(
     listing_id: str,
     title: str,
-    description: str = None
+    description: str = None,
+    config=None
 ) -> ExtractedProduct:
     """
     Extracts product information from listing using AI.
@@ -123,6 +177,7 @@ def extract_product_with_ai(
         listing_id: Unique listing identifier
         title: Listing title
         description: Optional description (first 300 chars used)
+        config: Configuration object (required for Claude)
     
     Returns:
         ExtractedProduct with structured data
@@ -132,7 +187,7 @@ def extract_product_with_ai(
     user_prompt = generate_extraction_prompt(title, description)
     
     # Call AI
-    raw_response = _call_ai(user_prompt, max_tokens=800)
+    raw_response = _call_ai(user_prompt, max_tokens=800, config=config)
     
     if not raw_response:
         # AI call failed - return empty with low confidence

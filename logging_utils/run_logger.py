@@ -38,6 +38,11 @@ class RunLogger:
         if stat_name in self.run_stats:
             self.run_stats[stat_name] += amount
     
+    def log_ai_call(self, purpose: str, model: str, cost_usd: float):
+        """Log an AI call at run level."""
+        self.run_stats["total_ai_calls"] += 1
+        self.run_stats["total_cost_usd"] += cost_usd
+    
     def finalize_run(self) -> Dict[str, Any]:
         """Calculate final statistics."""
         for log in self.listing_logs.values():

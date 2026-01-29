@@ -62,8 +62,12 @@ from db_pg_v2 import (
     # Query helpers
     get_latest_deals as get_listings,
     get_latest_bundles as get_bundle_groups,
-    export_deals_json as export_listings_json,
-    export_deals_csv as export_listings_csv,
+    export_deals_json,
+    export_deals_csv,
+    export_bundles_json,
+    export_bundles_csv,
+    export_products_json,
+    export_run_stats,
 )
 from scrapers.browser_ctx import (
     ensure_chrome_closed,
@@ -90,6 +94,7 @@ from query_analyzer import (
 )
 
 from ai_filter import (
+    init_ai_filter,
     apply_config,
     apply_ai_budget_from_cfg,
     reset_run_cost,
@@ -392,6 +397,7 @@ def run_v10_pipeline(
     extracted_products, run_logger_v10 = process_batch(
         listings=all_listings_flat,
         run_id=run_id,
+        config=cfg,
         detail_scraper=detail_scraper_func,
         vision_analyzer=vision_analyzer_func
     )
@@ -999,20 +1005,11 @@ def export_listings_to_file(conn, filename: str = "last_run_listings.json"):
         cur = conn.cursor()
         cur.execute("""
             SELECT 
-                id, platform, listing_id, title, variant_key, cleaned_title,
-                buy_now_price, current_price_ricardo, predicted_final_price,
-                new_price, resale_price_est, resale_price_bundle,
-                expected_profit, market_value, price_source,
-                deal_score, recommended_strategy, strategy_reason,
-                market_based_resale, market_sample_size,
-                is_bundle, bundle_components,
-                bids_count, hours_remaining, end_time,
-                location, shipping, pickup_available, seller_rating,
-                web_search_used, cache_hit, vision_used,
-                created_at, updated_at,
-                description, ai_notes, image_url, url
+                id, run_id, platform, source_id, url, title, image_url, product_id,
+                buy_now_price, current_bid, bids_count, end_time, location,
+                shipping_cost, pickup_available, seller_rating, first_seen, last_seen
             FROM listings
-            ORDER BY expected_profit DESC NULLS LAST
+            ORDER BY id DESC
         """)
         
         columns = [desc[0] for desc in cur.description]
@@ -1258,6 +1255,14 @@ def run_once():
     cfg = load_config()
     print_config_summary(cfg)
 
+    # 🔥 CRITICAL: Validate Claude model configuration BEFORE any AI operations
+    try:
+        init_ai_filter(cfg)
+    except RuntimeError as e:
+        print(f"\n❌ FATAL: {e}")
+        print("   Pipeline cannot start with invalid AI configuration.")
+        sys.exit(1)
+
     reset_run_cost()
 
     try:
@@ -1410,6 +1415,7 @@ def run_once():
     query_analyses = analyze_queries(
         queries=queries,
         model=cfg.ai.openai_model,
+        config=cfg,
     )
     
     logger.step_result(
@@ -1655,7 +1661,24 @@ def run_once():
             # ------------------------------------------------------------------
             log_section("Exporting Data for Analysis")
             
-            # Export listings to JSON
+            print("📊 Exporting comprehensive run data for analysis...")
+            print("   This allows Cascade to analyze runs without DB/console access\n")
+            
+            # Export deals (v2.2 schema)
+            export_deals_json(conn, "last_run_deals.json")
+            export_deals_csv(conn, "last_run_deals.csv")
+            
+            # Export bundles (v2.2 schema)
+            export_bundles_json(conn, "last_run_bundles.json")
+            export_bundles_csv(conn, "last_run_bundles.csv")
+            
+            # Export products
+            export_products_json(conn, "last_run_products.json")
+            
+            # Export run statistics and metadata
+            export_run_stats(conn, "last_run_stats.json")
+            
+            # Legacy export (for backwards compatibility)
             export_listings_to_file(conn, "last_run_listings.json")
             
             # IMPROVEMENT #4: Post-run invariant checks (TEST MODE ONLY)

@@ -1055,6 +1055,236 @@ def export_deals_csv(conn, filepath: str = "last_run_deals.csv"):
     return len(deals)
 
 
+def export_bundles_json(conn, filepath: str = "last_run_bundles.json"):
+    """Exports latest bundles to JSON file with full component details."""
+    bundles = get_latest_bundles(conn, limit=10000)
+    
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump({
+            'export_time': datetime.now().isoformat(),
+            'total_bundles': len(bundles),
+            'bundles': bundles
+        }, f, ensure_ascii=False, indent=2, default=str)
+    
+    print(f"📁 Exported {len(bundles)} bundles to {filepath}")
+    return len(bundles)
+
+
+def export_bundles_csv(conn, filepath: str = "last_run_bundles.csv"):
+    """Exports latest bundles to CSV file."""
+    import csv
+    
+    bundles = get_latest_bundles(conn, limit=10000)
+    
+    if not bundles:
+        print("⚠️ No bundles to export")
+        return 0
+    
+    fieldnames = list(bundles[0].keys())
+    
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(bundles)
+    
+    print(f"📁 Exported {len(bundles)} bundles to {filepath}")
+    return len(bundles)
+
+
+def export_products_json(conn, filepath: str = "last_run_products.json"):
+    """Exports all products from latest run."""
+    with conn.cursor() as cur:
+        # Get products that were part of the latest run
+        cur.execute("""
+            SELECT DISTINCT
+                p.id,
+                p.base_product_key,
+                p.variant_key,
+                p.display_name,
+                p.brand,
+                p.category,
+                p.created_at,
+                p.updated_at
+            FROM products p
+            JOIN deals d ON d.product_id = p.id
+            WHERE d.run_id = (SELECT id FROM runs ORDER BY started_at DESC LIMIT 1)
+            ORDER BY p.display_name
+        """)
+        
+        columns = [desc[0] for desc in cur.description]
+        products = [dict(zip(columns, row)) for row in cur.fetchall()]
+    
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump({
+            'export_time': datetime.now().isoformat(),
+            'total_products': len(products),
+            'products': products
+        }, f, ensure_ascii=False, indent=2, default=str)
+    
+    print(f"📁 Exported {len(products)} products to {filepath}")
+    return len(products)
+
+
+def export_run_stats(conn, filepath: str = "last_run_stats.json"):
+    """Exports comprehensive run statistics and metadata."""
+    cur = conn.cursor()
+    try:
+        # Get latest run metadata
+        cur.execute("""
+            SELECT 
+                id,
+                started_at,
+                finished_at,
+                status,
+                mode,
+                listings_found,
+                deals_created,
+                bundles_created,
+                profitable_deals,
+                ai_cost_usd,
+                websearch_calls,
+                duration_sec,
+                error_message
+            FROM runs
+            ORDER BY started_at DESC
+            LIMIT 1
+        """)
+        
+        run_row = cur.fetchone()
+        if not run_row:
+            print("⚠️ No run data found")
+            return 0
+        
+        columns = [desc[0] for desc in cur.description]
+        
+        # Debug: Check if we have matching lengths
+        if len(columns) != len(run_row):
+            print(f"⚠️ Column/row mismatch: {len(columns)} columns vs {len(run_row)} values")
+            print(f"Columns: {columns}")
+            print(f"Row length: {len(run_row)}")
+            return 0
+        
+        run_data = dict(zip(columns, run_row))
+        
+        # Ensure we have an id field
+        if 'id' not in run_data:
+            print(f"⚠️ No 'id' field in run_data. Available fields: {list(run_data.keys())}")
+            return 0
+        
+        # Debug: Print run_data to see what we have
+        print(f"🔍 DEBUG: run_data keys: {list(run_data.keys())}")
+        print(f"🔍 DEBUG: run_data['id'] type: {type(run_data['id'])}")
+        print(f"🔍 DEBUG: run_data['id'] value: {run_data['id']}")
+        
+        # Extract run_id safely - keep as string for psycopg2
+        try:
+            run_id = str(run_data['id'])
+            print(f"🔍 DEBUG: run_id = {run_id} (type: {type(run_id)})")
+        except Exception as e:
+            print(f"❌ Error converting run_data['id'] to string: {e}")
+            print(f"   run_data['id'] = {run_data['id']}")
+            print(f"   type = {type(run_data['id'])}")
+            return 0
+        
+        # Get deal statistics
+        print("🔍 DEBUG: Executing deal statistics query...")
+        print(f"🔍 DEBUG: run_id parameter = {run_id} (type: {type(run_id)})")
+        try:
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_deals,
+                    COUNT(*) FILTER (WHERE expected_profit > 20) as profitable_deals,
+                    COUNT(*) FILTER (WHERE expected_profit > 50) as very_profitable_deals,
+                    ROUND(AVG(expected_profit)::numeric, 2) as avg_profit,
+                    ROUND(MAX(expected_profit)::numeric, 2) as max_profit,
+                    ROUND(MIN(expected_profit)::numeric, 2) as min_profit
+                FROM deals
+                WHERE run_id = %s
+            """, (run_id,))
+            print("🔍 DEBUG: Query executed successfully")
+        except Exception as e:
+            print(f"❌ SQL execution failed: {e}")
+            print(f"   Error type: {type(e)}")
+            import traceback
+            traceback.print_exc()
+            return 0
+        
+        print("🔍 DEBUG: Fetching deal row...")
+        deal_row = cur.fetchone()
+        print(f"🔍 DEBUG: deal_row = {deal_row}")
+        if deal_row:
+            print(f"🔍 DEBUG: Creating deal_stats dict from {len(deal_row)} values...")
+            deal_stats = dict(zip([desc[0] for desc in cur.description], deal_row))
+            print("🔍 DEBUG: deal_stats created successfully")
+        else:
+            deal_stats = {
+                'total_deals': 0,
+                'profitable_deals': 0,
+                'very_profitable_deals': 0,
+                'avg_profit': 0,
+                'max_profit': 0,
+                'min_profit': 0
+            }
+        
+        # Get bundle statistics
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total_bundles,
+                COUNT(*) FILTER (WHERE expected_profit > 20) as profitable_bundles,
+                ROUND(AVG(expected_profit)::numeric, 2) as avg_bundle_profit
+            FROM bundles
+            WHERE run_id = %s
+        """, (run_id,))
+        
+        bundle_row = cur.fetchone()
+        if bundle_row:
+            bundle_stats = dict(zip([desc[0] for desc in cur.description], bundle_row))
+        else:
+            bundle_stats = {
+                'total_bundles': 0,
+                'profitable_bundles': 0,
+                'avg_bundle_profit': 0
+            }
+        
+        # Get strategy breakdown
+        cur.execute("""
+            SELECT 
+                strategy,
+                COUNT(*) as count
+            FROM deals
+            WHERE run_id = %s
+            GROUP BY strategy
+            ORDER BY count DESC
+        """, (run_id,))
+        
+        print("🔍 DEBUG: Fetching strategies...")
+        strategy_rows = cur.fetchall()
+        print(f"🔍 DEBUG: Got {len(strategy_rows)} strategy rows")
+        try:
+            strategies = {row[0]: row[1] for row in strategy_rows} if strategy_rows else {}
+            print(f"🔍 DEBUG: strategies dict created successfully")
+        except Exception as e:
+            print(f"❌ Error creating strategies dict: {e}")
+            print(f"   Rows: {strategy_rows}")
+            strategies = {}
+        
+        stats = {
+            'export_time': datetime.now().isoformat(),
+            'run_metadata': run_data,
+            'deal_statistics': deal_stats,
+            'bundle_statistics': bundle_stats,
+            'strategy_breakdown': strategies
+        }
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2, default=str)
+        
+        print(f"📁 Exported run statistics to {filepath}")
+        return 1
+    finally:
+        cur.close()
+
+
 # ==============================================================================
 # BRIDGE FUNCTION: Old format → New schema
 # ==============================================================================

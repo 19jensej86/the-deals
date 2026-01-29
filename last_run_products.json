@@ -1,0 +1,86 @@
+{
+  "export_time": "2026-01-29T22:08:39.064570",
+  "total_products": 8,
+  "products": [
+    {
+      "id": 39,
+      "base_product_key": "airpods",
+      "variant_key": "airpods",
+      "display_name": "AirPods",
+      "brand": null,
+      "category": null,
+      "created_at": "2026-01-29 22:07:37.124787+01:00",
+      "updated_at": "2026-01-29 22:07:37.124787+01:00"
+    },
+    {
+      "id": 41,
+      "base_product_key": "airpods_pro",
+      "variant_key": "airpods_pro",
+      "display_name": "AirPods Pro",
+      "brand": null,
+      "category": null,
+      "created_at": "2026-01-29 22:07:37.164257+01:00",
+      "updated_at": "2026-01-29 22:07:37.164257+01:00"
+    },
+    {
+      "id": 40,
+      "base_product_key": "airpods_pro_2",
+      "variant_key": "airpods_pro_2",
+      "display_name": "AirPods Pro 2",
+      "brand": null,
+      "category": null,
+      "created_at": "2026-01-29 22:07:37.139497+01:00",
+      "updated_at": "2026-01-29 22:07:37.139497+01:00"
+    },
+    {
+      "id": 6,
+      "base_product_key": "apple_airpods_pro",
+      "variant_key": "apple_airpods_pro",
+      "display_name": "Apple AirPods Pro",
+      "brand": null,
+      "category": null,
+      "created_at": "2026-01-20 18:56:49.864966+01:00",
+      "updated_at": "2026-01-20 18:56:49.864966+01:00"
+    },
+    {
+      "id": 15,
+      "base_product_key": "apple_iphone_12",
+      "variant_key": "apple_iphone_12_mini",
+      "display_name": "Apple iPhone 12 mini",
+      "brand": null,
+      "category": null,
+      "created_at": "2026-01-20 18:57:18.435291+01:00",
+      "updated_at": "2026-01-20 18:57:18.435291+01:00"
+    },
+    {
+      "id": 23,
+      "base_product_key": "iphone_12_mini",
+      "variant_key": "iphone_12_mini",
+      "display_name": "iPhone 12 mini",
+      "brand": null,
+      "category": null,
+      "created_at": "2026-01-28 22:33:19.339834+01:00",
+      "updated_at": "2026-01-28 22:33:19.339834+01:00"
+    },
+    {
+      "id": 29,
+      "base_product_key": "olympic_adapter",
+      "variant_key": "olympic_adapter",
+      "display_name": "Olympic Adapter",
+      "brand": null,
+      "category": null,
+      "created_at": "2026-01-28 23:38:26.706677+01:00",
+      "updated_at": "2026-01-28 23:38:26.706677+01:00"
+    },
+    {
+      "id": 24,
+      "base_product_key": "weight_plates",
+      "variant_key": "weight_plates",
+      "display_name": "Weight Plates",
+      "brand": null,
+      "category": null,
+      "created_at": "2026-01-28 23:09:58.240776+01:00",
+      "updated_at": "2026-01-28 23:09:58.240776+01:00"
+    }
+  ]
+}

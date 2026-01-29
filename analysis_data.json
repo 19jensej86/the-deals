@@ -1,31 +1,25 @@
 {
-  "export_time": "2026-01-20T07:08:33.534189",
-  "quality_score": 65.0,
+  "export_time": "2026-01-29T22:08:39.091444",
+  "quality_score": 0,
   "summary": {
-    "total_listings": 31,
-    "profitable_deals": 12,
+    "total_listings": 30,
+    "profitable_deals": 0,
     "bundles_detected": 0,
     "web_searches_used": 0,
-    "web_search_api_calls": 1,
-    "run_cost_usd": 0.383
+    "web_search_api_calls": 0,
+    "run_cost_usd": 0.132
   },
   "price_sources": {
-    "ai_estimate": 12,
-    "query_baseline": 8,
-    "bundle_aggregate": 7,
-    "buy_now_fallback": 4
+    "unknown": 30
   },
   "strategies": {
-    "watch": 7,
-    "buy_now": 4,
-    "bid_now": 1,
-    "skip": 19
+    "unknown": 30
   },
   "profit_stats": {
-    "max": 221.96,
-    "min": -601.5,
-    "avg": -73.89032258064516,
-    "profitable_count": 12
+    "max": 0,
+    "min": 0,
+    "avg": 0.0,
+    "profitable_count": 0
   },
   "issues": {
     "bundle_default_prices": [],

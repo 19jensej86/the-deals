@@ -159,14 +159,31 @@ def clear_query_cache():
 # AI CALL WRAPPERS
 # =============================================================================
 
-def _call_claude(prompt: str, max_tokens: int = 3000) -> Optional[str]:
+def _call_claude(prompt: str, max_tokens: int = 3000, config=None) -> Optional[str]:
     """Call Claude API."""
     if not _claude_client:
         return None
     
+    # Get config values or use defaults
+    if config:
+        model = config.ai.claude_model_fast
+        runtime_mode = config.runtime.mode
+    else:
+        model = "claude-3-5-haiku-20241022"  # Fallback if no config
+        runtime_mode = "unknown"
+    
+    # AI_CALL_DECISION: Log before making AI call
+    print(f"\nAI_CALL_DECISION:")
+    print(f"  step: query_analysis")
+    print(f"  runtime_mode: {runtime_mode}")
+    print(f"  model: {model}")
+    print(f"  call_type: text")
+    print(f"  allowed: true")
+    print(f"  reason: QUERY_ANALYSIS_REQUIRED")
+    
     try:
         response = _claude_client.messages.create(
-            model="claude-3-5-haiku-20250514",  # Haiku 3.5 (updated 2025-05-14)
+            model=model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -179,18 +196,49 @@ def _call_claude(prompt: str, max_tokens: int = 3000) -> Optional[str]:
         return None
         
     except Exception as e:
-        print(f"⚠️ Claude API error: {e}")
+        # AI_FAILURE: Structured error logging
+        error_str = str(e)
+        error_type = "rate_limit" if ("429" in error_str or "rate_limit" in error_str.lower()) else "api_error"
+        
+        # Get runtime_mode from config if available
+        runtime_mode = config.runtime.mode if config else "unknown"
+        model = config.ai.claude_model_fast if config else "claude-3-5-haiku-20241022"
+        
+        print(f"\nAI_FAILURE:")
+        print(f"  step: query_analysis")
+        print(f"  model: {model}")
+        print(f"  runtime_mode: {runtime_mode}")
+        print(f"  error_type: {error_type}")
+        print(f"  error_message: {str(e)[:100]}")
+        print(f"  action_taken: return_none (fallback to OpenAI)")
         return None
 
 
-def _call_openai(prompt: str, max_tokens: int = 3000) -> Optional[str]:
+def _call_openai(prompt: str, max_tokens: int = 3000, config=None) -> Optional[str]:
     """Call OpenAI API (fallback)."""
     if not _openai_client:
         return None
     
+    # Get config values or use defaults
+    if config:
+        model = config.ai.openai_model
+        runtime_mode = config.runtime.mode
+    else:
+        model = "gpt-4o-mini"  # Fallback if no config
+        runtime_mode = "unknown"
+    
+    # AI_CALL_DECISION: Log before making AI call
+    print(f"\nAI_CALL_DECISION:")
+    print(f"  step: query_analysis")
+    print(f"  runtime_mode: {runtime_mode}")
+    print(f"  model: {model}")
+    print(f"  call_type: text")
+    print(f"  allowed: true")
+    print(f"  reason: OPENAI_FALLBACK")
+    
     try:
         response = _openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=max_tokens,
@@ -199,20 +247,30 @@ def _call_openai(prompt: str, max_tokens: int = 3000) -> Optional[str]:
         return response.choices[0].message.content.strip()
         
     except Exception as e:
-        print(f"⚠️ OpenAI API error: {e}")
+        # AI_FAILURE: Structured error logging
+        runtime_mode = config.runtime.mode if config else "unknown"
+        model_name = config.ai.openai_model if config else "gpt-4o-mini"
+        
+        print(f"\nAI_FAILURE:")
+        print(f"  step: query_analysis")
+        print(f"  model: {model_name}")
+        print(f"  runtime_mode: {runtime_mode}")
+        print(f"  error_type: api_error")
+        print(f"  error_message: {str(e)[:100]}")
+        print(f"  action_taken: return_none")
         return None
 
 
-def _call_ai(prompt: str, max_tokens: int = 3000) -> Optional[str]:
+def _call_ai(prompt: str, max_tokens: int = 3000, config=None) -> Optional[str]:
     """Call AI with automatic fallback."""
     if _provider == "claude" and _claude_client:
-        result = _call_claude(prompt, max_tokens)
+        result = _call_claude(prompt, max_tokens, config=config)
         if result:
             return result
     
     # Fallback to OpenAI
     if _openai_client:
-        return _call_openai(prompt, max_tokens)
+        return _call_openai(prompt, max_tokens, config=config)
     
     return None
 
@@ -224,6 +282,7 @@ def _call_ai(prompt: str, max_tokens: int = 3000) -> Optional[str]:
 def analyze_queries(
     queries: List[str],
     model: str = None,  # Ignored in v7.0, uses configured provider
+    config=None,  # Config object for logging
 ) -> Dict[str, Dict[str, Any]]:
     """
     Analyzes ALL search queries in ONE AI call.
@@ -231,6 +290,7 @@ def analyze_queries(
     Args:
         queries: List of search queries from config
         model: Ignored (uses Claude or OpenAI based on config)
+        config: Configuration object (for logging runtime_mode and model)
     
     Returns:
         Dict mapping each query to its analysis
@@ -338,7 +398,7 @@ Antworte NUR als gültiges JSON:
 }}"""
 
     try:
-        raw = _call_ai(prompt, max_tokens=3000)
+        raw = _call_ai(prompt, max_tokens=3000, config=config)
         
         if not raw:
             print(f"⚠️ No AI response")
@@ -390,6 +450,64 @@ Antworte NUR als gültiges JSON:
     except Exception as e:
         print(f"⚠️ Query analysis failed: {e}")
         return _create_fallback_analysis(queries)
+
+
+def _create_default_analysis(query: str) -> Dict[str, Any]:
+    """Creates a default analysis for a query when AI fails."""
+    # Detect category from query
+    query_lower = query.lower()
+    
+    if any(word in query_lower for word in ['watch', 'uhr', 'smartwatch']):
+        category = 'electronics'
+        price_range = [100, 800]
+        min_price = 50.0
+    elif any(word in query_lower for word in ['airpods', 'kopfhörer', 'headphone']):
+        category = 'electronics'
+        price_range = [50, 300]
+        min_price = 30.0
+    elif any(word in query_lower for word in ['iphone', 'smartphone', 'handy']):
+        category = 'electronics'
+        price_range = [200, 1200]
+        min_price = 100.0
+    elif any(word in query_lower for word in ['hantel', 'gewicht', 'fitness']):
+        category = 'fitness'
+        price_range = [50, 500]
+        min_price = 20.0
+    else:
+        category = 'unknown'
+        price_range = [50, 500]
+        min_price = 10.0
+    
+    new_price_estimate = (price_range[0] + price_range[1]) / 2
+    
+    return {
+        "category": category,
+        "resale_rate": 0.45,
+        "min_realistic_price": min_price,
+        "typical_new_price_range": price_range,
+        "new_price_estimate": new_price_estimate,
+        "bundle_common": False,
+        "needs_vision_for_bundles": False,
+        "spelling_variants": [query.lower()],
+        "accessory_keywords": [],
+        "defect_keywords": ["defekt", "kaputt", "bastler"],
+        "auction_typical_multiplier": 5.0,
+        "search_term_cleanup": {
+            "remove_after": ["inkl", "mit", "+", "und", "NEU", "OVP", "TOP"],
+            "remove_words": ["gebraucht", "neuwertig", "Top-Zustand", "wie neu"],
+            "keep_parts": "brand_model"
+        },
+        "notes": "Fallback analysis - AI failed",
+    }
+
+
+def _create_fallback_analysis(queries: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Creates fallback analysis for all queries when AI completely fails."""
+    print(f"⚠️ Using fallback analysis for all {len(queries)} queries")
+    result = {}
+    for query in queries:
+        result[query] = _create_default_analysis(query)
+    return result
 
 
 def _validate_analysis(analysis: Dict, query: str) -> Dict[str, Any]:

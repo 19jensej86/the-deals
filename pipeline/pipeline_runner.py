@@ -207,6 +207,7 @@ def process_listing(
 def process_batch(
     listings: List[Dict[str, Any]],
     run_id: str,
+    config,
     detail_scraper=None,
     vision_analyzer=None
 ) -> tuple[List[ExtractedProduct], RunLogger]:
@@ -237,14 +238,14 @@ def process_batch(
     
     # OPTIMIZATION: Batch extraction (1 AI call for all)
     print(f"🧠 Batch extracting {len(listings)} products in 1 AI call...")
-    extraction_results = extract_products_batch(listings)
+    extraction_results = extract_products_batch(listings, config=config)
     print(f"   ✅ Extracted {len(extraction_results)} products")
     
     # Log batch AI cost
     total_batch_cost = 0.020  # Fixed cost for batch
     run_logger.log_ai_call(
         purpose="batch_extraction",
-        model="claude-3-5-haiku-20250514",
+        model=config.ai.claude_model_fast,
         cost_usd=total_batch_cost
     )
     
