@@ -1,19 +1,19 @@
 {
-  "export_time": "2026-01-29T22:08:39.091444",
+  "export_time": "2026-01-30T08:33:53.865512",
   "quality_score": 0,
   "summary": {
-    "total_listings": 30,
+    "total_listings": 34,
     "profitable_deals": 0,
     "bundles_detected": 0,
     "web_searches_used": 0,
-    "web_search_api_calls": 0,
-    "run_cost_usd": 0.132
+    "web_search_api_calls": 1,
+    "run_cost_usd": 0.494
   },
   "price_sources": {
-    "unknown": 30
+    "unknown": 34
   },
   "strategies": {
-    "unknown": 30
+    "unknown": 34
   },
   "profit_stats": {
     "max": 0,

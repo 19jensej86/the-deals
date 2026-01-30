@@ -1,11 +1,11 @@
 {
-  "export_time": "2026-01-29T22:08:39.078489",
+  "export_time": "2026-01-30T08:33:53.842047",
   "run_metadata": {
-    "id": "9942251d-2038-4450-b120-cd8d619761c7",
-    "started_at": "2026-01-29 22:05:47.035417+01:00",
+    "id": "b19ad9cf-428b-4c38-8b97-48de6602d307",
+    "started_at": "2026-01-30 08:28:24.705634+01:00",
     "finished_at": null,
     "status": "running",
-    "mode": "test",
+    "mode": "prod",
     "listings_found": 0,
     "deals_created": 0,
     "bundles_created": 0,
@@ -18,20 +18,20 @@
   "deal_statistics": {
     "total_deals": 23,
     "profitable_deals": 10,
-    "very_profitable_deals": 8,
-    "avg_profit": "27.80",
-    "max_profit": "170.20",
+    "very_profitable_deals": 7,
+    "avg_profit": "34.88",
+    "max_profit": "210.30",
     "min_profit": "-54.36"
   },
   "bundle_statistics": {
     "total_bundles": 7,
     "profitable_bundles": 2,
-    "avg_bundle_profit": "-15.66"
+    "avg_bundle_profit": "23.91"
   },
   "strategy_breakdown": {
     "skip": 13,
-    "watch": 7,
-    "buy_now": 2,
+    "watch": 8,
+    "buy_now": 1,
     "bid_now": 1
   }
 }

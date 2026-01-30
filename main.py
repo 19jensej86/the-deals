@@ -220,10 +220,10 @@ def run_v10_pipeline(
     )
     
     log_explanation(
-        "Wir besuchen Ricardo.ch und suchen nach jedem Produkt. "
-        "Für jedes Inserat extrahieren wir: Titel, Preis, Endzeit, Bild, Beschreibung. "
-        "Wir filtern offensichtlichen Müll (Zubehör, Defekte, ausgeschlossene Begriffe) bereits hier. "
-        "Dieser Schritt verwendet KEINE KI - es ist reines Web-Scraping mit regelbasierten Filtern."
+        "Visiting Ricardo.ch and scraping listings for each query. "
+        "For each listing we extract: title, price, end time, image, description. "
+        "We filter obvious junk (accessories, defects, excluded terms) at this stage. "
+        "This step uses NO AI - it's pure web scraping with rule-based filters."
     )
     
     all_listings_by_query: Dict[str, List[Dict[str, Any]]] = {}
@@ -751,6 +751,10 @@ def run_v10_pipeline(
             
             # v2.2: price_history recording moved to save_evaluation() - happens after listing insert
             
+            # SEMANTICS: price_source describes the source of the RESALE PRICE
+            # - web_search_used=true means websearch was used for NEW PRICE (reference value)
+            # - price_source=market_* means RESALE PRICE comes from Ricardo auction data
+            # Both can be true simultaneously: websearch for new_price, market for resale_price
             price_source = ai_result.get("price_source", "ai_estimate")
             if ai_result.get("market_based_resale"):
                 price_source = ai_result.get("market_source", "market_auction")

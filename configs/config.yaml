@@ -4,7 +4,7 @@
 # RUNTIME MODE - Controls test vs production behavior
 # ====================================================
 runtime:
-  mode: test # "test" or "prod" - SINGLE SOURCE OF TRUTH
+  mode: prod # "test" or "prod" - SINGLE SOURCE OF TRUTH
 
 general:
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -31,6 +31,14 @@ general:
   max_unclear_detail_scrapes: 10 # Max detail pages for unclear listings
   max_vision_for_clarity: 5 # Max vision calls for still-unclear items
 
+  # Detail Scraping
+  detail_scraping:
+    enabled: true
+
+  # Vision
+  vision:
+    enabled: true
+
   # v9.2: AI-based Title Normalization
   # ----------------------------------
   # Uses AI instead of regex for title cleanup and bundle detection.
@@ -46,11 +54,14 @@ postgres:
   password: "dealsecret"
 
 db:
-  clear_on_start: true
+  clear_on_start: false
+  truncate_on_start: false
+  clear_runs_only: false
 
 cache:
   enabled: true
-  clear_on_start: true
+  clear_on_start: false
+  persist: true
   variant_cache_days: 30
   component_cache_days: 30
   cluster_cache_days: 7
@@ -109,6 +120,12 @@ ai:
   #       No need to hardcode shop lists - AI chooses best shops automatically
   web_search:
     enabled: true # Set to FALSE to disable expensive web searches
+    max_calls_per_run: null # Allow per distinct product
+    batch_enabled: true
+
+  # AI Fallback Pricing
+  ai_fallback_pricing:
+    enabled: true
 
   # Pricing (USD pro Call) - UPDATED 2026-01-20 for Haiku 4.5
   pricing:
@@ -120,6 +137,8 @@ ai:
 
   # Budget limits
   budget:
+    enforce: true
+    max_total_usd: 2.00
     daily_cost_usd_max: 5.00 # Increased 10x for testing (was 0.50)
     daily_vision_calls_max: 100
     daily_web_search_max: 100 # Increased 10x for testing (was 10)

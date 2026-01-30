@@ -176,6 +176,7 @@ MIN_PROFIT_THRESHOLD = 20.0
 BUNDLE_ENABLED = True
 BUNDLE_DISCOUNT_PERCENT = 0.10
 BUNDLE_MIN_COMPONENT_VALUE = 10.0
+MAX_COMPONENT_PRICE = 300.0  # Max realistic price per component (CHF)
 BUNDLE_USE_VISION = True
 
 CACHE_ENABLED = True
@@ -2244,22 +2245,22 @@ def detect_bundle_with_ai(
         return result
     
     # Fallback: Individual detection (only if batch wasn't used)
-    prompt = f"""Analysiere dieses Ricardo-Inserat auf Bundle/Set:
+    prompt = f"""Analyze this Ricardo listing for bundle/set:
 
-TITEL: {title}
-BESCHREIBUNG: {description[:500] if description else "Keine"}
-SUCHBEGRIFF: {query}
+TITLE: {title}
+DESCRIPTION: {description[:500] if description else "None"}
+SEARCH TERM: {query}
 
-Ist dies ein Bundle/Set mit mehreren Artikeln?
+Is this a bundle/set with multiple items?
 
-Wenn JA, liste die Komponenten auf mit geschätzter Anzahl.
+If YES, list the components with estimated quantity.
 
-Antworte NUR als JSON:
+Respond ONLY as JSON:
 {{
   "is_bundle": true/false,
   "components": [
-    {{"name": "Artikel 1", "quantity": 2, "unit": "stück"}},
-    {{"name": "Artikel 2", "quantity": 1, "unit": "stück"}}
+    {{"name": "Item 1", "quantity": 2, "unit": "pieces"}},
+    {{"name": "Item 2", "quantity": 1, "unit": "pieces"}}
   ],
   "confidence": 0.0-1.0
 }}"""
@@ -2333,6 +2334,11 @@ def price_bundle_components(
         # Guard: Skip component if price estimation failed
         if est_new is None or est_new <= 0:
             print(f"      ⚠️ {name}: Price unavailable, skipping component")
+            continue
+        
+        # GUARD: Skip component if price is unrealistic (likely misidentification)
+        if est_new > MAX_COMPONENT_PRICE:
+            print(f"      ⚠️ {name}: Price {est_new:.2f} CHF exceeds max ({MAX_COMPONENT_PRICE:.2f}), skipping component")
             continue
         
         # Calculate resale with category-aware rate
@@ -2685,6 +2691,7 @@ def evaluate_listing_with_ai(
         "market_value": None,
         "price_source": PRICE_SOURCE_UNKNOWN,
         "buy_now_ceiling": None,
+        "market_source": None,  # Granular market source (auction_demand, etc.)
     }
     
     # Get variant info
@@ -2696,6 +2703,7 @@ def evaluate_listing_with_ai(
         result["market_value"] = variant_info.get("market_value")
         result["buy_now_ceiling"] = variant_info.get("buy_now_ceiling")
         result["price_source"] = variant_info.get("price_source", PRICE_SOURCE_UNKNOWN)
+        result["market_source"] = variant_info.get("market_source")  # Granular market source (auction_demand, etc.)
         
         if variant_info.get("resale_price"):
             result["resale_price_est"] = variant_info["resale_price"]
@@ -2846,14 +2854,21 @@ def evaluate_listing_with_ai(
             )
             result["bundle_components"] = priced
             
-            # Calculate bundle resale
-            bundle_new = calculate_bundle_new_price(priced)
-            bundle_resale = calculate_bundle_resale(priced, bundle_new)
-            
-            result["resale_price_bundle"] = bundle_resale
-            result["resale_price_est"] = bundle_resale
-            result["new_price"] = bundle_new
-            result["price_source"] = PRICE_SOURCE_BUNDLE_AGGREGATE
+            # GUARD: Require at least 2 priced components
+            # Single-component "bundles" are false positives (e.g., "25x charger" = 1 product type)
+            if len(priced) < 2:
+                print(f"   ⚠️ Bundle has only {len(priced)} valid component(s) — treating as single product")
+                result["is_bundle"] = False
+                # Fall through to normal pricing (query_baseline or other sources)
+            else:
+                # Calculate bundle resale
+                bundle_new = calculate_bundle_new_price(priced)
+                bundle_resale = calculate_bundle_resale(priced, bundle_new)
+                
+                result["resale_price_bundle"] = bundle_resale
+                result["resale_price_est"] = bundle_resale
+                result["new_price"] = bundle_new
+                result["price_source"] = PRICE_SOURCE_BUNDLE_AGGREGATE
     
     # FIX #1: QUERY BASELINE FALLBACK - Final safety net to prevent NULL/0 resale prices
     # If ALL price sources failed (web, AI, market, buy_now, bundle), use query baseline
