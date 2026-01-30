@@ -183,7 +183,7 @@ CACHE_ENABLED = True
 VARIANT_CACHE_DAYS = 30
 COMPONENT_CACHE_DAYS = 30
 CLUSTER_CACHE_DAYS = 7
-CATEGORY_THRESHOLD_CACHE_DAYS = 90
+CATEGORY_THRESHOLD_CACHE_DAYS = 365  # Category behavior is stable year-over-year
 
 RUN_COST_USD: float = 0.0
 DAY_COST_FILE = "ai_cost_day.txt"
@@ -1212,7 +1212,78 @@ def _save_cluster_cache():
         with open(CLUSTER_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(_cluster_cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"⚠️ Cluster cache save failed: {e}")
+        print(f"{e}")
+
+def get_cache_duration_for_category(variant_key: str) -> int:
+    """
+    Get cache duration based on product category.
+    RULE: Never shorten below WEB_PRICE_CACHE_DAYS (60). Only extend for stable categories.
+    
+    Args:
+        variant_key: Product variant identifier
+    
+    Returns:
+        int: Cache duration in days
+    """
+    vk_lower = variant_key.lower()
+    
+    # Fitness equipment: prices stable for months (extend to 120 days)
+    fitness_keywords = ["hantel", "gewicht", "plate", "bank", "rack", "fitness", "bumper", "scheibe"]
+    if any(kw in vk_lower for kw in fitness_keywords):
+        return 120  # 4 months (extended from 60)
+    
+    # All other categories: use default (60 days)
+    # Electronics, clothing, luxury goods remain at 60 days
+    return WEB_PRICE_CACHE_DAYS  # 60 days (never shortened)
+
+def is_commodity_variant(variant_key: str, category: str, websearch_query: Optional[str] = None) -> bool:
+    """
+    Check if variant is a commodity with stable prices.
+    
+    CONSERVATIVE DETECTION (CORRECTED):
+    - Uses websearch_query (display_name) as primary signal, NOT variant_key
+    - Only skips websearch when confident (explicit signals)
+    - Ambiguous cases → do websearch (safe default)
+    
+    Commodities:
+    1. Fitness weights with explicit weight in websearch_query
+    2. Standard accessories (cables, adapters, bands)
+    
+    Args:
+        variant_key: Product variant identifier (normalized, often generic)
+        category: Category string (used cautiously)
+        websearch_query: The actual search query string (display_name/final_search_name)
+    
+    Returns:
+        bool: True if commodity (skip websearch), False otherwise
+    """
+    # Use websearch_query as primary signal (more specific than variant_key)
+    search_text = (websearch_query or variant_key).lower()
+    
+    # SIGNAL 1: Explicit weight + fitness keywords = commodity
+    # Example: "Hantelscheibe 5kg Gusseisen" or "Bumper Plate 20kg"
+    has_explicit_weight = bool(re.search(r'\d+(?:[.,]\d+)?\s*kg', search_text))
+    fitness_keywords = ["hantel", "gewicht", "plate", "scheibe", "bumper", "disc"]
+    
+    if has_explicit_weight and any(kw in search_text for kw in fitness_keywords):
+        return True  # Commodity: stable CHF/kg pricing
+    
+    # SIGNAL 2: Accessory allowlist (stable prices, <50 CHF)
+    accessory_keywords = [
+        "kabel", "cable", "ladegerät", "charger", "adapter",
+        "armband", "band", "strap",  # Watch bands
+        "clip", "halter", "holder",
+    ]
+    if any(kw in search_text for kw in accessory_keywords):
+        return True  # Commodity: accessories have stable prices
+    
+    # Default: NOT commodity (do websearch)
+    # This includes:
+    # - Generic patterns without explicit weight ("Weight Plates", "weight_plates")
+    # - Electronics (prices vary)
+    # - Clothing (sizes/styles vary)
+    # - Any ambiguous case
+    return False
 
 def get_cached_web_price(variant_key: str) -> Optional[Dict[str, Any]]:
     """Get cached web price for a variant."""
@@ -1227,7 +1298,10 @@ def get_cached_web_price(variant_key: str) -> Optional[Dict[str, Any]]:
                 cached_date = datetime.datetime.fromisoformat(cached_at)
                 age_days = (datetime.datetime.now() - cached_date).days
                 
-                if age_days < WEB_PRICE_CACHE_DAYS:
+                # OPTIMIZATION: Category-specific cache duration
+                cache_days = get_cache_duration_for_category(variant_key)
+                
+                if age_days < cache_days:
                     return {
                         "new_price": cached.get("new_price"),
                         "price_source": cached.get("price_source"),
@@ -1925,8 +1999,18 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
                 "market_value": market_data.get("market_value"),
                 "buy_now_ceiling": market_data.get("buy_now_ceiling"),
             }
+            # OPTIMIZATION: Skip websearch if market data has high confidence
+            market_sample_size = market_data.get("sample_size", 0)
+            market_based_resale = market_data.get("market_based", False)
+            market_confidence_high = (market_sample_size > 0 and market_sample_size >= 10 and market_based_resale)
+            
             if results[vk]["new_price"] is None:
-                need_new_price.append(vk)
+                if market_confidence_high:
+                    # High confidence market data (≥10 samples + market_based), AI estimate is good enough for new_price
+                    print(f"   High confidence market ({market_sample_size} samples), skipping websearch for {vk[:40]}...")
+                    # Will use AI estimate later (fallback path)
+                else:
+                    need_new_price.append(vk)
             continue
         
         # Check cache
@@ -1973,12 +2057,28 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
             pass  # runtime_mode not available, proceed normally
 
         if need_new_price:
-            print(f"\n v7.3: BATCH web searching {len(need_new_price)} variants (rate-limit safe)...")
+            # OPTIMIZATION: Skip websearch for commodity/stable-price variants
+            commodity_variants = []
+            websearch_variants = []
+            
+            for vk in need_new_price:
+                # Use variant_key as websearch_query (in real pipeline, this would be display_name/final_search_name)
+                # TODO: Pass websearch_query metadata from main.py for more accurate detection
+                if is_commodity_variant(vk, category, websearch_query=vk):
+                    commodity_variants.append(vk)
+                else:
+                    websearch_variants.append(vk)
+            
+            if commodity_variants:
+                print(f"   Skipping websearch for {len(commodity_variants)} commodity variants (stable prices)")
+            
+            if websearch_variants:
+                print(f"\n   BATCH web searching {len(websearch_variants)} variants (rate-limit safe)...")
 
-            # v7.3.3: Pass query_analysis for better search term cleaning
-            web_results = search_web_batch_for_new_prices(need_new_price, category, query_analysis)
-        else:
-            web_results = {}
+                # v7.3.3: Pass query_analysis for better search term cleaning
+                web_results = search_web_batch_for_new_prices(websearch_variants, category, query_analysis)
+            else:
+                web_results = {}
 
         for vk in need_new_price:
             web_result = web_results.get(vk)
@@ -2367,12 +2467,24 @@ def _estimate_component_price(name: str, category: str, query_analysis: Optional
     name_lower = name.lower()
     
     # ACCESSORIES (low value items) - handle first
-    if any(kw in name_lower for kw in ["koffer", "case", "tasche", "bag", "etui"]):
-        return 15.0  # Cases/bags are cheap
-    if any(kw in name_lower for kw in ["adapter", "clip", "halter", "holder"]):
-        return 10.0
-    if any(kw in name_lower for kw in ["anleitung", "manual", "handbuch"]):
-        return 0.0  # Manuals have no resale value
+    # Expanded map for better accuracy
+    ACCESSORY_KEYWORDS = {
+        # Cases and bags
+        "koffer": 15.0, "case": 15.0, "tasche": 15.0, "bag": 15.0, "etui": 15.0,
+        "hülle": 15.0, "cover": 15.0, "schutzhülle": 15.0,
+        # Small accessories
+        "adapter": 10.0, "clip": 10.0, "halter": 10.0, "holder": 10.0,
+        # Cables and chargers
+        "kabel": 20.0, "cable": 20.0, "ladegerät": 20.0, "charger": 20.0, "ladekabel": 20.0,
+        # Bands and straps
+        "armband": 25.0, "band": 25.0, "strap": 25.0, "wristband": 25.0,
+        # Manuals (no value)
+        "anleitung": 0.0, "manual": 0.0, "handbuch": 0.0,
+    }
+    
+    for keyword, price in ACCESSORY_KEYWORDS.items():
+        if keyword in name_lower:
+            return price
     
     # FITNESS: Weight-based pricing (CHF per kg)
     if category == "fitness" or any(kw in name_lower for kw in WEIGHT_PLATE_KEYWORDS):
@@ -2748,6 +2860,38 @@ def evaluate_listing_with_ai(
     if not result["resale_price_est"] and result["new_price"] and result["new_price"] > 0:
         result["resale_price_est"] = result["new_price"] * resale_rate
     
+    # OPTIMIZATION: Early exit for obvious unprofitable listings
+    # SAFETY: Only if resale_price_est is HIGH CONFIDENCE
+    if current_price and result.get("resale_price_est"):
+        # Check if resale_price_est is high confidence
+        high_confidence_resale = False
+        
+        # High confidence source 1: Market data with ≥10 samples
+        market_source = result.get("market_source") or ""
+        if market_source.startswith("auction_demand"):
+            if result.get("market_sample_size", 0) >= 10:
+                high_confidence_resale = True
+        
+        # High confidence source 2: Web-based pricing (median or single)
+        if result.get("price_source") in [PRICE_SOURCE_WEB_MEDIAN, PRICE_SOURCE_WEB_SINGLE]:
+            if result.get("new_price"):  # new_price exists, resale derived deterministically
+                high_confidence_resale = True
+        
+        # Early exit only if high confidence AND obviously unprofitable
+        if high_confidence_resale and current_price >= result["resale_price_est"] * 0.90:
+            result["recommended_strategy"] = "skip"
+            result["strategy_reason"] = "Current price too high (≥90% of resale, high confidence)"
+            result["expected_profit"] = calculate_profit(result["resale_price_est"], current_price)
+            result["deal_score"] = 0.0
+            
+            # Skip expensive AI estimation, use query baseline for new_price if missing
+            if not result["new_price"]:
+                result["new_price"] = _get_new_price_estimate(query_analysis)
+                result["price_source"] = PRICE_SOURCE_QUERY_BASELINE
+            
+            print(f"   ⏭️ Early exit: obvious skip (current={current_price:.2f}, resale={result['resale_price_est']:.2f})")
+            return result
+    
     # v9.0 FIX: If we have resale_price but no new_price, estimate new_price
     # This ensures data consistency: prefer rough but realistic values over NULL/0
     if result["resale_price_est"] and not result["new_price"]:
@@ -2943,6 +3087,43 @@ def evaluate_listing_with_ai(
         else:
             # ai_estimate, query_baseline, buy_now_fallback
             result["market_sample_size"] = 0
+    
+    # OPTIMIZATION: Calculate price confidence (observability only, no DB writes)
+    def get_price_confidence(price_source: str, market_sample_size: int, market_source: Optional[str]) -> float:
+        """Calculate confidence score for price estimate (0.0-1.0)."""
+        if price_source == PRICE_SOURCE_WEB_MEDIAN:
+            return 0.85
+        elif price_source == PRICE_SOURCE_WEB_SINGLE:
+            return 0.70
+        elif market_source and market_source.startswith("auction_demand"):
+            if market_sample_size >= 10:
+                return 0.95
+            elif market_sample_size >= 5:
+                return 0.80
+            elif market_sample_size >= 2:
+                return 0.60
+            else:
+                return 0.50
+        elif price_source == PRICE_SOURCE_AI_ESTIMATE:
+            return 0.50
+        elif price_source == PRICE_SOURCE_QUERY_BASELINE:
+            return 0.30
+        elif price_source == PRICE_SOURCE_BUY_NOW_FALLBACK:
+            return 0.40
+        elif price_source == PRICE_SOURCE_BUNDLE_AGGREGATE:
+            return 0.65
+        else:
+            return 0.50
+    
+    price_confidence = get_price_confidence(
+        result["price_source"],
+        result.get("market_sample_size", 0),
+        result.get("market_source")
+    )
+    
+    # OBSERVABILITY: Append confidence to strategy_reason (no behavior change)
+    if price_confidence < 0.60:
+        result["strategy_reason"] += f" [conf: {price_confidence:.2f}]"
     
     # Build AI notes
     notes = []

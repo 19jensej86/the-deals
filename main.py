@@ -385,10 +385,10 @@ def run_v10_pipeline(
         vision_analyzer_func = vision_analyzer_adapter
     
     logger.step_ai_details(
-        ai_purpose="Inseratstitel sind zu komplex für Regex: mehrsprachig, unstrukturiert, viele Sonderfälle. KI versteht Kontext ohne Halluzinationen.",
-        input_summary=f"{total_listings} Inseratstitel (OHNE Suchanfrage-Information)",
-        expected_output="Strukturierte Produktdaten: Brand, Model, Specs (nur explizit erwähnt), Bundle-Typ, Confidence",
-        fallback="Bei niedriger Confidence: Detail-Scraping → Vision → Skip",
+        ai_purpose="Listing titles are too complex for regex: multilingual, unstructured, many edge cases. AI understands context without hallucinations.",
+        input_summary=f"{total_listings} listing titles (WITHOUT search query information)",
+        expected_output="Structured product data: Brand, Model, Specs (only explicitly mentioned), Bundle type, Confidence",
+        fallback="On low confidence: Detail scraping → Vision → Skip",
     )
     
     logger.step_progress(f"Processing {total_listings} listings through query-agnostic pipeline...")
@@ -566,7 +566,7 @@ def run_v10_pipeline(
     )
     
     logger.step_success(f"Market prices calculated", count=len(market_prices))
-    logger.step_logic(f"Marktpreise stammen von vergangenen Ricardo-Auktionen mit Geboten (kostenlos - keine KI-Kosten)")
+    logger.step_logic(f"Market prices are from past Ricardo auctions with bids (free - no AI costs)")
     
     # Web search for NEW prices
     logger.step_progress(f"Fetching new prices for {len(unique_queries)} unique products via web search...")
