@@ -52,7 +52,6 @@ from db_pg_v2 import (
     save_evaluation,  # Bridge function: old format → new schema
     cleanup_old_listings,
     clear_listings,
-    record_price_if_changed,
     clean_price_cache as clear_expired_market_data,
     update_listing_details,
     # Run management
@@ -68,6 +67,7 @@ from db_pg_v2 import (
     export_bundles_csv,
     export_products_json,
     export_run_stats,
+    resolve_product,  # Map variant_key → product_id
 )
 from scrapers.browser_ctx import (
     ensure_chrome_closed,
@@ -598,6 +598,14 @@ def run_v10_pipeline(
                         price_map_by_final_search_name[final_search_name] = info
                         break
                 break
+    
+    # =========================================================================
+    # LIVE-MARKET-FIRST PRICING (No historical learning available)
+    # =========================================================================
+    # NOTE: Ricardo only exposes ACTIVE listings, not ended auctions.
+    # Therefore, live-market pricing from current auctions is the only truth source.
+    # No historical data (price_history) or learned estimates (products.resale_estimate).
+    # =========================================================================
     
     web_found = sum(1 for v in variant_info_by_key.values() if v.get("new_price"))
     web_success_rate = (web_found / len(unique_queries) * 100) if unique_queries else 0

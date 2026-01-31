@@ -363,6 +363,11 @@ def update_product_prices(
         """, (reference_price, resale_estimate, product_id))
 
 
+# REMOVED: get_product_resale_estimate, get_product_resale_batch
+# Reason: products.resale_estimate will remain NULL (no historical data available)
+# Live-market pricing from active listings is the only truth source
+
+
 # ==============================================================================
 # LISTING MANAGEMENT
 # ==============================================================================
@@ -776,53 +781,11 @@ def clean_price_cache(conn) -> int:
 
 
 # ==============================================================================
-# PRICE HISTORY
+# PRICE HISTORY (DISABLED - No access to ended auctions)
 # ==============================================================================
-
-def record_price_if_changed(conn, listing_id: int, new_price: float, bids_count: int = 0) -> bool:
-    """
-    Records price to history only if it changed.
-    Returns: True if price changed, False if same
-    """
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT price FROM price_history 
-            WHERE listing_id = %s 
-            ORDER BY observed_at DESC LIMIT 1
-        """, (listing_id,))
-        
-        result = cur.fetchone()
-        last_price = float(result[0]) if result else None
-    
-    if last_price is None or abs(float(new_price) - last_price) > 0.01:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO price_history (listing_id, price, bids_count, observed_at)
-                VALUES (%s, %s, %s, NOW())
-            """, (listing_id, new_price, bids_count))
-        
-        if last_price:
-            change_pct = ((float(new_price) - last_price) / last_price) * 100
-            print(f"📉 Price change: {last_price:.0f} → {new_price:.0f} CHF ({change_pct:+.1f}%)")
-        return True
-    
-    return False
-
-
-def get_price_history(conn, listing_id: int) -> List[Dict]:
-    """Gets all price history for a listing."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT price, bids_count, observed_at
-            FROM price_history
-            WHERE listing_id = %s
-            ORDER BY observed_at ASC
-        """, (listing_id,))
-        
-        return [
-            {"price": float(row[0]), "bids_count": row[1], "observed_at": row[2]}
-            for row in cur.fetchall()
-        ]
+# NOTE: Ricardo only exposes ACTIVE listings, not ended auctions.
+# Therefore, price_history table will remain empty and historical learning is not possible.
+# Live-market-first pricing is the only viable approach.
 
 
 # ==============================================================================

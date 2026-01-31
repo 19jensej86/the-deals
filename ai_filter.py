@@ -1645,9 +1645,25 @@ Antworte NUR als JSON:
 
 
 def calculate_confidence_weight(bids: int, hours: float) -> float:
-    """Calculate confidence weight based on bid count and time remaining."""
-    bid_weight = min(bids / 10.0, 1.0)
-    time_weight = 1.0 if hours < 6 else (0.7 if hours < 24 else 0.5)
+    """Calculate confidence weight based on bid count and time remaining.
+    
+    CRITICAL: 1-bid listings are WEAK SIGNALS and must never dominate.
+    """
+    # Bid-based weight (strict hierarchy)
+    if bids >= 5:
+        bid_weight = 1.00  # Strong signal
+    elif bids >= 3:
+        bid_weight = 0.80  # Good signal
+    elif bids == 2:
+        bid_weight = 0.60  # Moderate signal
+    elif bids == 1:
+        bid_weight = 0.35  # WEAK signal (never dominant)
+    else:
+        bid_weight = 0.10  # No bids (should be filtered out)
+    
+    # Time-based adjustment (minor)
+    time_weight = 1.0 if hours < 6 else (0.9 if hours < 24 else 0.8)
+    
     return bid_weight * time_weight
 
 
@@ -1709,17 +1725,26 @@ def is_realistic_auction_price(current_price: float, bids_count: int, hours_rema
             return False, f"high_activity_low_price_{price_ratio*100:.0f}pct"
 
     if for_market_calculation:
-        if hours_remaining > 12:
-            return False, "too_early_for_market_calc"
+        # REVISED: Bidding intensity matters more than time
+        # Accept early auctions if they have strong bidding activity
         minimum_for_market = max(reference_price * 0.20, 10.0)
-        if current_price >= minimum_for_market:
-            return True, "market_ending_soon_good_price"
-        if hours_remaining < 2 and bids_count >= 3:
+        
+        # High activity overrides time concerns
+        if bids_count >= 5:
+            if current_price >= minimum_for_market:
+                return True, "market_high_activity"
+        
+        # Ending soon with reasonable activity
+        if hours_remaining < 12:
+            if current_price >= minimum_for_market:
+                return True, "market_ending_soon_good_price"
+            if bids_count >= 3 and price_ratio >= 0.12:
+                return True, "market_moderate_activity"
+        
+        # Very late auctions with any activity
+        if hours_remaining < 2 and bids_count >= 2:
             return True, "market_ending_now"
-        if hours_remaining < 6 and bids_count >= 8:
-            return True, "market_ending_soon_high_activity"
-        if hours_remaining < 12 and bids_count >= 5 and price_ratio >= 0.12:
-            return True, "market_moderate_activity"
+        
         return False, "market_insufficient_data"
 
     minimum_threshold = max(reference_price * UNREALISTIC_PRICE_RATIO, 10.0)
@@ -1788,51 +1813,30 @@ def calculate_market_resale_from_listings(
         if not current or current <= 0 or bids == 0:
             continue
         
-        # v7.2.2: Special validation for single bids with category-specific thresholds
+        # FINE-TUNED: 1-bid listings are WEAK SIGNALS only
         if bids == 1:
             price_ratio = current / reference_price if reference_price > 0 else 0
             
-            # v7.2.2: ALWAYS reject unrealistic bids (not just late ones)
-            if price_ratio < 0.20:
-                continue  # Too unrealistic, regardless of timing
+            # HARD EXCLUSION: price_ratio < 0.45 (raised from 0.20/0.40)
+            if price_ratio < 0.45:
+                continue  # Too low for 1-bid listing
             
-            # Case 1: Buy-now + single bid → use category threshold (default 30%)
-            if buy_now and buy_now > unrealistic_floor:
-                buy_now_ratio = current / buy_now
-                min_buy_now_ratio = 0.30  # Default, will be overridden by category threshold
-                
-                if buy_now_ratio >= min_buy_now_ratio:
-                    # Good! Bid is reasonable compared to buy-now
-                    weight = calculate_confidence_weight(bids, hours)
-                    price_samples.append({
-                        "price": float(current),
-                        "weight": weight * 0.8,  # Slightly lower confidence
-                        "bids": bids,
-                        "hours": hours,
-                        "reason": f"single_bid_buy_now_{buy_now_ratio*100:.0f}pct"
-                    })
-                    continue
-                else:
-                    # Bid too low compared to buy-now
-                    continue
+            # HARD EXCLUSION: Clear start-price effect
+            if current <= 1.0:
+                continue  # Start price, not real market signal
             
-            # Case 2: Auction-only + single bid → validate against reference price
-            # Use category-specific threshold (default 40%)
-            min_single_bid_ratio = 0.40  # Default, will be overridden
-            
-            # Accept if bid is reasonable (>=threshold of reference)
-            if price_ratio >= min_single_bid_ratio and hours > 12:
-                weight = calculate_confidence_weight(bids, hours)
-                price_samples.append({
-                    "price": float(current),
-                    "weight": weight * 0.7,  # Lower confidence for single bid
-                    "bids": bids,
-                    "hours": hours,
-                    "reason": f"single_bid_validated_{price_ratio*100:.0f}pct"
-                })
-                continue
-            
-            # For other single bids, use standard validation
+            # Allow 1-bid listing ONLY as weak signal
+            # Weight will be 0.35 (never dominant)
+            weight = calculate_confidence_weight(bids, hours)
+            price_samples.append({
+                "price": float(current),
+                "weight": weight,  # Already 0.35 from calculate_confidence_weight
+                "bids": bids,
+                "hours": hours,
+                "reason": f"single_bid_weak_signal_{price_ratio*100:.0f}pct",
+                "is_weak_signal": True  # Mark for observability
+            })
+            continue
         
         is_real, reason = is_realistic_auction_price(current, bids, hours, reference_price, True)
         
@@ -1848,74 +1852,100 @@ def calculate_market_resale_from_listings(
             "reason": reason
         })
     
-    # v7.2.2: NO fallback to pure buy-now prices!
-    # We only use buy-now if there are actual bids to validate against
+    # REVISED: Accept high-quality single samples
     if not price_samples:
         return None
     
-    if len(price_samples) < MIN_SAMPLES_FOR_MARKET_PRICE:
-        # v9.0 FIX: Mit nur 1 Sample ist "Market Data" nicht valide!
-        # Das eine Sample ist oft das Listing selbst → Zirkular-Logik
-        if len(price_samples) == 1:
-            # Nur 1 Sample: NUR verwenden wenn buy_now_ceiling vorhanden
-            if buy_now_ceiling and buy_now_ceiling > unrealistic_floor:
-                resale_price = buy_now_ceiling * 0.75
-                return {
-                    "resale_price": round(resale_price, 2),
-                    "market_value": round(buy_now_ceiling, 2),
-                    "source": "single_sample_buy_now_fallback",
-                    "sample_size": 1,
-                    "market_based": False,  # Nicht wirklich market-based!
-                    "buy_now_ceiling": buy_now_ceiling,
-                    "confidence": 0.3,
-                }
-            # Ohne buy_now_ceiling: return None → fallback to new_price * resale_rate
-            return None
+    # Track excluded listings for observability
+    excluded_listings = []
+    
+    # SINGLE SAMPLE: Strict quality gates
+    if len(price_samples) == 1:
+        sample = price_samples[0]
+        price_ratio = sample["price"] / reference_price if reference_price > 0 else 0
         
-        # v7.2.1: For rare items (2 samples), prefer buy-now prices if available
-        if len(price_samples) == 2 and buy_now_ceiling and buy_now_ceiling > unrealistic_floor:
-            simple_median = statistics.median([s["price"] for s in price_samples])
-            
-            # If auction price is reasonable (>50% of buy-now), use it
-            if simple_median >= buy_now_ceiling * 0.50:
-                resale_price = simple_median * 0.90
-                confidence = 0.60
-                source = "rare_item_auction_validated"
+        # CRITICAL: Reject single 1-bid samples (too weak)
+        if sample["bids"] == 1:
+            # Single 1-bid listing = weak signal only, not market truth
+            return None  # Force fallback to web search or skip
+        
+        # Quality gates for single sample (≥3 bids required)
+        if sample["bids"] >= 3 and price_ratio >= 0.35:
+            # High-quality single auction: real bidding momentum
+            # Apply conservative discount by bid count
+            if sample["bids"] >= 5:
+                discount = 0.92
+            elif sample["bids"] >= 3:
+                discount = 0.90
             else:
-                resale_price = buy_now_ceiling * 0.75
-                confidence = 0.50
-                source = "rare_item_buy_now_based"
+                discount = 0.88
+            
+            resale_price = sample["price"] * discount
+            confidence = 0.50 + (min(sample["bids"], 20) / 20) * 0.15  # 0.50-0.65 range
             
             if sanity_reference:
-                resale_price = apply_global_sanity_check(resale_price, sanity_reference, False, source)
+                resale_price = apply_global_sanity_check(resale_price, sanity_reference, False, "single_high_quality")
             
             return {
                 "resale_price": round(resale_price, 2),
-                "market_value": round(buy_now_ceiling, 2),
-                "source": source,
-                "sample_size": len(price_samples),
+                "market_value": round(sample["price"], 2),
+                "source": "single_high_quality_auction",
+                "sample_size": 1,
                 "market_based": True,
                 "buy_now_ceiling": buy_now_ceiling,
-                "confidence": confidence,
+                "confidence": round(confidence, 2),
+                "bids_distribution": [sample["bids"]],
+                "price_distribution": [sample["price"]],
+                "excluded_listings": excluded_listings,
+                "validation": {
+                    "bids_check": "PASS (≥3)",
+                    "price_check": f"PASS (>={price_ratio*100:.0f}%)",
+                    "momentum_check": "PASS",
+                    "discount_applied": f"{discount*100:.0f}%"
+                }
             }
         
-        # 2 samples ohne buy_now_ceiling: return None
+        # Low-quality single sample: reject
         return None
+    
+    # MULTI-SAMPLE: Remove low outliers if we have enough samples
+    if len(price_samples) >= 3:
+        prices = [s["price"] for s in price_samples]
+        max_price = max(prices)
+        
+        filtered_samples = []
+        for sample in price_samples:
+            if sample["price"] >= max_price * 0.30:  # Keep if ≥30% of max
+                filtered_samples.append(sample)
+            else:
+                excluded_listings.append({
+                    "price": sample["price"],
+                    "bids": sample["bids"],
+                    "reason": "low_outlier (<30% of max)"
+                })
+        
+        if filtered_samples:  # Use filtered if we still have samples
+            price_samples = filtered_samples
     
     market_value = weighted_median(price_samples)
     
-    has_very_high = any(s.get("bids", 0) >= VERY_HIGH_ACTIVITY_BID_THRESHOLD for s in price_samples)
-    has_high = any(s.get("bids", 0) >= HIGH_ACTIVITY_BID_THRESHOLD for s in price_samples)
-    has_ending = any(s.get("hours", 999) < 12 for s in price_samples)
+    # Determine discount based on MAXIMUM bid count (not average)
+    max_bids = max(s.get("bids", 0) for s in price_samples)
+    has_weak_signals = any(s.get("is_weak_signal", False) for s in price_samples)
     
-    if has_very_high:
-        resale_pct, source = 0.95, "auction_demand_very_high"
-    elif has_ending:
-        resale_pct, source = 0.92, "auction_demand_ending_soon"
-    elif has_high:
-        resale_pct, source = 0.90, "auction_demand_high_activity"
-    else:
-        resale_pct, source = 0.88, "auction_demand"
+    # Conservative discount by bid count
+    if max_bids >= 5:
+        resale_pct, source = 0.92, "auction_demand_high_activity"
+    elif max_bids >= 3:
+        resale_pct, source = 0.90, "auction_demand_moderate"
+    elif max_bids == 2:
+        resale_pct, source = 0.88, "auction_demand_low"
+    else:  # max_bids == 1
+        resale_pct, source = 0.82, "auction_demand_weak_signals"
+    
+    # Additional penalty if weak signals are present
+    if has_weak_signals and max_bids < 3:
+        resale_pct *= 0.95  # Extra 5% discount for weak signal dominance
     
     resale_price = market_value * resale_pct
     
@@ -1925,8 +1955,36 @@ def calculate_market_resale_from_listings(
     if sanity_reference:
         resale_price = apply_global_sanity_check(resale_price, sanity_reference, False, source)
     
-    avg_weight = sum(s["weight"] for s in price_samples) / len(price_samples)
-    confidence = min(0.95, avg_weight * min(len(price_samples) / 5, 1.0))
+    # Calculate confidence with strict 1-bid penalty
+    max_bids = max(s["bids"] for s in price_samples)
+    weak_signal_count = sum(1 for s in price_samples if s.get("is_weak_signal", False))
+    
+    sample_factor = min(len(price_samples) / 4, 1.0)  # 1 sample=0.25, 4+=1.0
+    bid_factor = min(max_bids / 10, 1.0)  # 10+ bids=1.0
+    
+    # Base confidence
+    confidence = 0.50 + (sample_factor * 0.25) + (bid_factor * 0.15)
+    
+    # CRITICAL: Cap confidence contribution from 1-bid listings
+    if weak_signal_count > 0:
+        # Each 1-bid listing contributes at most +0.10 to confidence
+        weak_signal_bonus = min(weak_signal_count * 0.05, 0.10)
+        # If weak signals dominate, cap confidence at 0.60
+        if weak_signal_count >= len(price_samples) / 2:
+            confidence = min(confidence, 0.60)
+    
+    confidence = min(0.90, confidence)  # Cap at 0.90 (never 100% certain)
+    
+    # Enhanced observability for 1-bid handling
+    weak_signal_listings = [
+        {
+            "price": s["price"],
+            "bids": s["bids"],
+            "weight": s["weight"],
+            "reason": s["reason"]
+        }
+        for s in price_samples if s.get("is_weak_signal", False)
+    ]
     
     return {
         "resale_price": round(resale_price, 2),
@@ -1936,6 +1994,19 @@ def calculate_market_resale_from_listings(
         "market_based": True,
         "buy_now_ceiling": buy_now_ceiling,
         "confidence": round(confidence, 2),
+        # Enhanced observability
+        "bids_distribution": [s["bids"] for s in price_samples],
+        "price_distribution": [round(s["price"], 2) for s in price_samples],
+        "excluded_listings": excluded_listings,
+        "weak_signal_listings": weak_signal_listings,  # NEW: Track 1-bid listings
+        "validation": {
+            "min_bids_met": all(s["bids"] >= 1 for s in price_samples),
+            "outliers_removed": len(excluded_listings),
+            "weak_signals_count": len(weak_signal_listings),
+            "max_bids": max_bids,
+            "discount_applied": f"{resale_pct*100:.0f}%",
+            "sample_quality": "high" if confidence >= 0.70 else ("moderate" if confidence >= 0.55 else "low")
+        }
     }
 
 
@@ -2806,6 +2877,14 @@ def evaluate_listing_with_ai(
         "market_source": None,  # Granular market source (auction_demand, etc.)
     }
     
+    # SAFEGUARD 1: BUNDLES DISABLED (out of scope)
+    if batch_bundle_result and batch_bundle_result.get("is_bundle"):
+        result["is_bundle"] = True
+        result["recommended_strategy"] = "skip"
+        result["strategy_reason"] = "Bundles disabled (out of scope)"
+        result["deal_score"] = 0.0
+        return result
+    
     # Get variant info
     if variant_info:
         result["new_price"] = variant_info.get("new_price")
@@ -2817,48 +2896,35 @@ def evaluate_listing_with_ai(
         result["price_source"] = variant_info.get("price_source", PRICE_SOURCE_UNKNOWN)
         result["market_source"] = variant_info.get("market_source")  # Granular market source (auction_demand, etc.)
         
-        if variant_info.get("resale_price"):
+        # PRICING TRUTH: Check for learned resale estimate first
+        learned_resale = variant_info.get("learned_resale_estimate")  # From products.resale_estimate
+        if learned_resale and learned_resale > 0:
+            result["resale_price_est"] = learned_resale
+            result["price_source"] = "learned_market"  # Highest trust source
+            print(f"   Using learned resale estimate: {learned_resale:.2f} CHF (from price_history)")
+        elif variant_info.get("resale_price"):
             result["resale_price_est"] = variant_info["resale_price"]
     
-    # v7.2.1: Fallback new_price to buy_now_price if web search failed
-    if not result["new_price"] and buy_now_price and buy_now_price > 0:
-        # MODE_GUARD: AI fallback pricing decision
-        try:
-            from config import load_config
-            from runtime_mode import get_mode_config
-            cfg = load_config()
-            mode_config = get_mode_config(cfg.runtime.mode)
-            runtime_mode = mode_config.mode.value
-            is_test_mode = (runtime_mode == "test")
-        except:
-            runtime_mode = "unknown"
-            is_test_mode = False
-        
-        # TEST MODE CONTRACT: buy_now_fallback is NOT allowed in TEST mode
-        if is_test_mode:
-            print(f"\nMODE_GUARD:")
-            print(f"  runtime_mode: {runtime_mode}")
-            print(f"  feature: ai_fallback_pricing")
-            print(f"  allowed: false")
-            print(f"  reason: TEST_MODE_BUY_NOW_FALLBACK_BLOCKED")
-            print(f"   TEST MODE: Skipping buy_now_fallback pricing (not allowed in TEST mode)")
-            # Do NOT set result["new_price"] - let it remain None
-            # query_baseline will be used later as final fallback
-        else:
-            print(f"\nMODE_GUARD:")
-            print(f"  runtime_mode: {runtime_mode}")
-            print(f"  feature: ai_fallback_pricing")
-            print(f"  allowed: true")
-            print(f"  reason: BUY_NOW_FALLBACK_USED")
-            
-            result["new_price"] = buy_now_price * 1.1  # Conservative estimate: assume 10% markup
-            result["price_source"] = PRICE_SOURCE_BUY_NOW_FALLBACK
-            print(f"   Using buy_now_price as new_price fallback: {result['new_price']:.2f} CHF")
+    # PHASE 4.1c: DISABLED buy_now_fallback (unreliable arbitrary multiplier)
+    # If no learned resale estimate and no web/market data, we skip the deal
+    # This prevents false positives from arbitrary pricing assumptions
     
-    # v7.2.1: Calculate resale_price_est from new_price if missing
+    # PHASE 4.1c: AI estimate fallback (heavily discounted)
     resale_rate = _get_resale_rate(query_analysis)
     if not result["resale_price_est"] and result["new_price"] and result["new_price"] > 0:
-        result["resale_price_est"] = result["new_price"] * resale_rate
+        # AI estimates are unreliable - discount by 50% for safety
+        ai_discount = 0.5
+        result["resale_price_est"] = result["new_price"] * resale_rate * ai_discount
+        if result["price_source"] == PRICE_SOURCE_AI_ESTIMATE:
+            print(f"   AI estimate discounted 50%: {result['resale_price_est']:.2f} CHF (unreliable)")
+    
+    # PHASE 4.1c: HARD SANITY CAPS
+    if result["resale_price_est"] and result["new_price"]:
+        # Cap 1: Resale price ≤ 70% of new price (used items reality)
+        max_resale = result["new_price"] * 0.70
+        if result["resale_price_est"] > max_resale:
+            print(f"   SANITY CAP: Resale {result['resale_price_est']:.2f} > 70% of new {result['new_price']:.2f}, capping to {max_resale:.2f}")
+            result["resale_price_est"] = max_resale
     
     # OPTIMIZATION: Early exit for obvious unprofitable listings
     # SAFETY: Only if resale_price_est is HIGH CONFIDENCE
@@ -2889,7 +2955,7 @@ def evaluate_listing_with_ai(
                 result["new_price"] = _get_new_price_estimate(query_analysis)
                 result["price_source"] = PRICE_SOURCE_QUERY_BASELINE
             
-            print(f"   ⏭️ Early exit: obvious skip (current={current_price:.2f}, resale={result['resale_price_est']:.2f})")
+            print(f"   Early exit: obvious skip (current={current_price:.2f}, resale={result['resale_price_est']:.2f})")
             return result
     
     # v9.0 FIX: If we have resale_price but no new_price, estimate new_price
@@ -2952,8 +3018,11 @@ def evaluate_listing_with_ai(
     else:
         purchase_price = 0
     
-    # Check for bundles
-    if BUNDLE_ENABLED and looks_like_bundle(title, description):
+    # PHASE 4.1c: BUNDLES DISABLED (missing unit_value implementation)
+    # Bundles show -87% margins due to missing per-component pricing
+    # Re-enable after implementing bundle_items.unit_value
+    bundles_disabled = True
+    if BUNDLE_ENABLED and not bundles_disabled and looks_like_bundle(title, description):
         vision_for_this_call = random.random() < VISION_RATE if image_url else False
         
         # MODE_GUARD: Vision usage decision
@@ -3036,6 +3105,28 @@ def evaluate_listing_with_ai(
     # Calculate profit
     if result["resale_price_est"] and purchase_price:
         result["expected_profit"] = calculate_profit(result["resale_price_est"], purchase_price)
+    
+    # SAFEGUARD 2: PROFIT MARGIN CAP (≤30% for Swiss market reality)
+    if result["expected_profit"] and purchase_price and purchase_price > 0:
+        profit_margin_pct = (result["expected_profit"] / purchase_price) * 100
+        MAX_REALISTIC_MARGIN_PCT = 30.0  # Swiss second-hand market reality (reduced from 50%)
+        
+        if profit_margin_pct > MAX_REALISTIC_MARGIN_PCT:
+            print(f"   🚫 MARGIN CAP: {profit_margin_pct:.1f}% margin exceeds realistic max ({MAX_REALISTIC_MARGIN_PCT:.0f}%) - marking as skip")
+            result["recommended_strategy"] = "skip"
+            result["strategy_reason"] = f"Unrealistic profit margin ({profit_margin_pct:.0f}% > {MAX_REALISTIC_MARGIN_PCT:.0f}%)"
+            result["deal_score"] = 0.0
+            result["expected_profit"] = 0.0  # Zero out unrealistic profit
+            return result
+    
+    # SAFEGUARD 3: MINIMUM PROFIT THRESHOLD (10 CHF)
+    MIN_PROFIT_CHF = 10.0
+    if result["expected_profit"] and result["expected_profit"] < MIN_PROFIT_CHF:
+        print(f"   ⚠️ MIN PROFIT: {result['expected_profit']:.2f} CHF below threshold ({MIN_PROFIT_CHF:.0f} CHF) - marking as skip")
+        result["recommended_strategy"] = "skip"
+        result["strategy_reason"] = f"Profit below minimum threshold ({result['expected_profit']:.2f} < {MIN_PROFIT_CHF:.0f} CHF)"
+        result["deal_score"] = 0.0
+        return result
     
     # Determine strategy
     strategy, reason = determine_strategy(
