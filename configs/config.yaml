@@ -62,35 +62,37 @@ cache:
   enabled: true
   clear_on_start: false
   persist: true
-  variant_cache_days: 30
-  component_cache_days: 30
-  cluster_cache_days: 7
-  web_price_cache_days: 60
+  variant_cache_days: 7 # Conservative: 7 days for variant info
+  component_cache_days: 7 # Conservative: 7 days for components
+  cluster_cache_days: 3 # Conservative: 3 days for clusters
+  web_price_cache_days: 3 # Conservative: 3 days for web prices (market changes fast)
 
 profit:
   ricardo_fee_percent: 0.10
-  shipping_cost_chf: 0.0
-  min_profit_threshold: 10.0 # v7.2.1: Lowered from 20.0 to capture more deals
+  shipping_cost_chf: 10.0 # Realistic default shipping cost
+  min_profit_threshold: 10.0 # Minimum 10 CHF profit required
 
 bundle:
-  enabled: true
+  enabled: false # DISABLED - bundles out of scope
   discount_percent: 0.10
   min_component_value: 10.0
-  use_vision_for_unclear: true
+  use_vision_for_unclear: false
 
 search:
-  # TEST QUERIES - Controlled set for testing
-  # ==========================================
-  # These queries test key scenarios:
-  # 1. Accessory detection (Apple Watch Armband)
-  # 2. High-confidence product (AirPods Pro 2)
-  # 3. Bundle logic (Hantelscheiben Set)
-  # 4. Standard product (iPhone 12 Mini)
+  # PROD QUERIES - High-quality liquid products (NO bundles/sets)
+  # ==============================================================
+  # Selection criteria:
+  # - Single products only (no bundles, no sets, no accessories-only)
+  # - Liquid Swiss second-hand market (many listings, real demand)
+  # - Clear product identification (model numbers, generations)
+  # - Realistic profit potential (15-25% margins typical)
   queries:
-    - "Apple Watch Ultra Armband original"
-    - "Apple AirPods Pro 2. Generation"
-    - "Olympic Hantelscheiben Set 4x5kg"
-    - "iPhone 12 Mini 128GB"
+    - "Apple iPhone 12 mini 128GB" # High liquidity, clear model, stable pricing
+    - "Apple AirPods Pro 2" # Very liquid, high demand, good margins
+    - "Samsung Galaxy Watch 4" # Popular wearable, clear generation
+    - "Sony WH-1000XM4" # Premium headphones, well-defined model
+    - "Apple iPad 9th Gen" # Mainstream tablet, clear generation
+    - "Garmin Fenix 6 Pro" # Premium fitness watch, stable resale
 
 # =================================================
 # AI Configuration - v7.0 CLAUDE

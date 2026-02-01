@@ -6,6 +6,11 @@ Extracts structured product data from MULTIPLE listings in ONE AI call.
 OPTIMIZATION: 79% cost reduction vs individual calls
 - Old: 31 listings × $0.003 = $0.096
 - New: 1 batch call = $0.020
+
+STABILIZATION: Safe batch size to prevent token overflow
+- Max batch size: 15 listings (conservative for 4000 token limit)
+- Auto-splitting for larger batches
+- Retry logic for parse failures
 """
 
 import json
@@ -16,6 +21,11 @@ from models.product_spec import ProductSpec
 from models.extracted_product import ExtractedProduct
 from models.bundle_types import BundleType
 from extraction.ai_prompt import SYSTEM_PROMPT
+
+# STABILIZATION: Safe batch size to prevent token overflow
+# Token budget: ~150 tokens/listing prompt + ~120 tokens/listing response
+# 15 listings: ~2750 prompt + ~1800 response = ~4550 tokens (10% buffer)
+SAFE_BATCH_SIZE = 15
 
 
 # AI Client initialization
@@ -75,7 +85,18 @@ def _call_claude_batch(prompt: str, max_tokens: int = 4000, config=None) -> Opti
                 {"role": "user", "content": SYSTEM_PROMPT + "\n\n" + prompt}
             ]
         )
-        return response.content[0].text
+        
+        response_text = response.content[0].text
+        
+        # OBSERVABILITY: Log token usage and response preview
+        usage = getattr(response, 'usage', None)
+        if usage:
+            print(f"   📊 Tokens: input={usage.input_tokens}, output={usage.output_tokens}, total={usage.input_tokens + usage.output_tokens}")
+        
+        preview = response_text[:150] if len(response_text) > 150 else response_text
+        print(f"   📝 Response preview: {preview}...")
+        
+        return response_text
     except Exception as e:
         error_str = str(e)
         
@@ -137,6 +158,44 @@ def _call_openai_batch(prompt: str, max_tokens: int = 4000) -> Optional[str]:
         return None
 
 
+def extract_products_batch_safe(
+    listings: List[Dict[str, Any]],
+    config=None
+) -> Dict[str, ExtractedProduct]:
+    """
+    SAFE wrapper: Automatically splits large batches to prevent token overflow.
+    
+    Args:
+        listings: List of dicts with keys: listing_id, title, description (optional)
+        config: Configuration object (required for Claude)
+    
+    Returns:
+        Dict mapping listing_id → ExtractedProduct
+    """
+    if not listings:
+        return {}
+    
+    # If batch is safe size, process directly
+    if len(listings) <= SAFE_BATCH_SIZE:
+        return extract_products_batch(listings, config)
+    
+    # Split into safe batches
+    print(f"   📦 Splitting {len(listings)} listings into batches of {SAFE_BATCH_SIZE}...")
+    results = {}
+    batch_count = (len(listings) + SAFE_BATCH_SIZE - 1) // SAFE_BATCH_SIZE
+    
+    for i in range(0, len(listings), SAFE_BATCH_SIZE):
+        batch_num = (i // SAFE_BATCH_SIZE) + 1
+        batch = listings[i:i + SAFE_BATCH_SIZE]
+        print(f"   🔄 Processing batch {batch_num}/{batch_count} ({len(batch)} listings)...")
+        
+        batch_results = extract_products_batch(batch, config)
+        results.update(batch_results)
+    
+    print(f"   ✅ All batches complete: {len(results)}/{len(listings)} extracted")
+    return results
+
+
 def extract_products_batch(
     listings: List[Dict[str, Any]],
     config=None
@@ -148,6 +207,8 @@ def extract_products_batch(
     - Old: N listings × $0.003 = $0.003N
     - New: 1 call = ~$0.020 (regardless of N)
     - Savings: ~79% for N=31
+    
+    STABILIZATION: Should be called via extract_products_batch_safe() for large batches.
     
     Args:
         listings: List of dicts with keys: listing_id, title, description (optional)
@@ -175,12 +236,15 @@ def extract_products_batch(
    Description: {desc if desc else "(none)"}
 """)
     
-    batch_prompt = f"""Extract product information from these {len(listings)} listings.
+    batch_prompt = f"""TASK: Extract product data as JSON array ONLY.
+
+INPUT: {len(listings)} listings
+OUTPUT: JSON array (no explanations, no text, ONLY JSON)
 
 LISTINGS:
 {"".join(listings_text)}
 
-For EACH listing, extract:
+EXTRACT for each listing:
 - brand: Brand name (or null)
 - model: Model name/number (or null)
 - product_type: Type of product (e.g., "Smartwatch", "Headphones")
@@ -191,13 +255,15 @@ For EACH listing, extract:
 - bundle_type: "single_product", "homogeneous_bundle", "heterogeneous_bundle", or "unknown"
 - needs_detail: true if title is unclear and needs detail page scraping
 
-CRITICAL RULES:
+RULES:
 1. NEVER invent information not in the title/description
 2. If uncertain, use null and set confidence < 0.7
 3. Accessories ONLY (no main product) → is_accessory_only: true
 4. Bundle = multiple items in one listing
 
-Respond ONLY as JSON array (one object per listing, in same order):
+CRITICAL: Your response must be EXACTLY this format (nothing else):
+START your response with [ and END with ]
+DO NOT include any text before or after the JSON array.
 [
   {{
     "listing_id": "...",
@@ -242,6 +308,9 @@ Respond ONLY as JSON array (one object per listing, in same order):
     try:
         json_match = re.search(r'\[[\s\S]*\]', raw_response)
         if not json_match:
+            # OBSERVABILITY: Log actual response for debugging
+            preview = raw_response[:300] if len(raw_response) > 300 else raw_response
+            print(f"   ⚠️ No JSON array found. Response preview: {preview}")
             raise ValueError("No JSON array found in response")
         
         data_array = json.loads(json_match.group(0))

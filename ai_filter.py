@@ -2909,6 +2909,37 @@ def evaluate_listing_with_ai(
     # If no learned resale estimate and no web/market data, we skip the deal
     # This prevents false positives from arbitrary pricing assumptions
     
+    # SAFETY FALLBACK: Use current_bid as resale floor when market pricing fails
+    # This ensures live bid data is used even when variant_key grouping fails
+    if not result["resale_price_est"] and current_price and bids_count and bids_count > 0:
+        # Current bid is guaranteed minimum resale price
+        # Apply conservative multiplier based on time remaining and bid count
+        hours = hours_remaining if hours_remaining else 999
+        
+        if hours < 1:
+            multiplier = 1.05  # Ending very soon, minimal rise expected
+        elif hours < 24:
+            multiplier = 1.10  # Ending soon, moderate rise
+        elif hours < 72:
+            multiplier = 1.15  # Mid-stage, more room to grow
+        else:
+            multiplier = 1.20  # Early stage, significant room to grow
+        
+        # Bid count confidence boost
+        if bids_count >= 50:
+            multiplier += 0.10  # Very hot item
+        elif bids_count >= 20:
+            multiplier += 0.05  # Hot item
+        elif bids_count >= 10:
+            multiplier += 0.03  # Competitive
+        
+        floor_resale = current_price * multiplier
+        result["resale_price_est"] = floor_resale
+        result["price_source"] = "current_bid_floor"
+        result["prediction_confidence"] = min(0.75, 0.50 + (bids_count / 100))
+        
+        print(f"   Using current bid as floor: {current_price:.2f} × {multiplier:.2f} = {floor_resale:.2f} CHF ({bids_count} bids, {hours:.1f}h remaining)")
+    
     # PHASE 4.1c: AI estimate fallback (heavily discounted)
     resale_rate = _get_resale_rate(query_analysis)
     if not result["resale_price_est"] and result["new_price"] and result["new_price"] > 0:

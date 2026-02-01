@@ -1,54 +1,5 @@
 {
-  "export_time": "2026-01-30T14:53:35.373404",
-  "total_bundles": 2,
-  "bundles": [
-    {
-      "bundle_id": 29,
-      "expected_profit": "-518.72",
-      "deal_score": "2.8",
-      "strategy": "skip",
-      "strategy_reason": "Profit -519 CHF below minimum (20)",
-      "total_cost": "590.00",
-      "total_value": "79.20",
-      "listing_id": 18,
-      "title": "Tunturi Olympisches Gewichtsset 140 kg (Originalverpackt)",
-      "url": "https://www.ricardo.ch/de/a/tunturi-olympisches-gewichtsset-140-kg-(originalverpackt)-1275806520/",
-      "image_url": "https://img.ricardostatic.ch/images/f3f8330d-2f23-4c3d-9a4f-f8736424251c/t_265x200/tunturi-olympisches-gewichtsset-140-kg-(originalverpackt)",
-      "end_time": "2026-02-04 15:15:00+01:00",
-      "location": null,
-      "seller_rating": null,
-      "user_action": null,
-      "user_notes": null,
-      "user_tags": null,
-      "item_count": 2,
-      "hours_remaining": "120.3568417750000000",
-      "profit_margin_pct": "-87.91864406779661016900",
-      "run_id": "845a4896-efd1-429d-ac76-f0b2cbf1c1ab",
-      "evaluated_at": "2026-01-30 14:52:37.602880+01:00"
-    },
-    {
-      "bundle_id": 30,
-      "expected_profit": "-11.38",
-      "deal_score": "2.6",
-      "strategy": "skip",
-      "strategy_reason": "Profit -11 CHF below minimum (20)",
-      "total_cost": "53.30",
-      "total_value": "46.58",
-      "listing_id": 29,
-      "title": "iPhone 12 mini black mit Apple Hülle in OVP",
-      "url": "https://www.ricardo.ch/de/a/iphone-12-mini-black-mit-apple-huelle-in-ovp-1309444284/",
-      "image_url": "https://img.ricardostatic.ch/images/8f2b8519-6621-4235-933e-c8b46a19bf8b/t_265x200/iphone-12-mini-black-mit-apple-huelle-in-ovp",
-      "end_time": "2026-02-01 19:37:00+01:00",
-      "location": null,
-      "seller_rating": null,
-      "user_action": null,
-      "user_notes": null,
-      "user_tags": null,
-      "item_count": 2,
-      "hours_remaining": "52.7235084416666667",
-      "profit_margin_pct": "-21.35084427767354596600",
-      "run_id": "845a4896-efd1-429d-ac76-f0b2cbf1c1ab",
-      "evaluated_at": "2026-01-30 14:52:48.700816+01:00"
-    }
-  ]
+  "export_time": "2026-02-01T09:32:11.246541",
+  "total_bundles": 0,
+  "bundles": []
 }

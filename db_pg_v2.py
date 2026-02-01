@@ -471,6 +471,29 @@ def update_listing_details(conn, listing_id: int, **details):
         """, values)
 
 
+def update_listing_variant_key(conn, listing_id: int, variant_key: str):
+    """
+    Updates listing with variant_key for market pricing grouping.
+    
+    CRITICAL: This enables live auction pricing by allowing market_prices
+    to group listings by variant_key and calculate resale from actual bids.
+    
+    Args:
+        conn: Database connection
+        listing_id: Listing ID to update
+        variant_key: Product variant identifier (e.g., 'apple_iphone_12_mini_128gb')
+    """
+    if not variant_key:
+        return
+    
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE listings 
+            SET variant_key = %s, last_seen = NOW()
+            WHERE id = %s
+        """, (variant_key, listing_id))
+
+
 # ==============================================================================
 # DEAL MANAGEMENT (Single Products)
 # ==============================================================================
@@ -1468,9 +1491,8 @@ def save_evaluation(conn, data: Dict[str, Any]) -> Dict[str, int]:
     # ---------------------------------------------------------------------------
     # 4. Record price history if applicable
     # ---------------------------------------------------------------------------
-    current_price = data.get("current_price_ricardo")
-    if current_price and listing_id:
-        record_price_if_changed(conn, listing_id, current_price, data.get("bids_count", 0))
+    # NOTE: Historical price tracking removed (price_history out of scope)
+    # Ricardo only exposes active listings, not ended auctions
     
     # Print save confirmation
     strategy_icon = {

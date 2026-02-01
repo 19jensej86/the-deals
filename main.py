@@ -54,6 +54,7 @@ from db_pg_v2 import (
     clear_listings,
     clean_price_cache as clear_expired_market_data,
     update_listing_details,
+    update_listing_variant_key,  # New import
     # Run management
     start_run,
     finish_run,
@@ -453,6 +454,13 @@ def run_v10_pipeline(
                 # CRITICAL: Store detail data if available
                 if hasattr(extracted, 'detail_data') and extracted.detail_data:
                     listing["_detail_data"] = extracted.detail_data
+                
+                # FIX: Persist variant_key to database for market pricing grouping
+                # This enables live auction pricing by allowing calculate_market_resale_from_listings
+                # to group listings by variant_key and use actual bid data
+                listing_id = listing.get("id")
+                if listing_id and identity.product_key:
+                    update_listing_variant_key(conn, listing_id, identity.product_key)
             else:
                 listing["variant_key"] = None
                 listing["_cleaned_title"] = None
@@ -567,6 +575,21 @@ def run_v10_pipeline(
     
     logger.step_success(f"Market prices calculated", count=len(market_prices))
     logger.step_logic(f"Market prices are from past Ricardo auctions with bids (free - no AI costs)")
+    
+    # OBSERVABILITY: Warn if bids exist but market pricing returned 0 results
+    total_bids = sum(l.get("bids_count", 0) for l in all_listings_flat)
+    listings_with_bids = sum(1 for l in all_listings_flat if l.get("bids_count", 0) > 0)
+    
+    if total_bids > 0 and len(market_prices) == 0:
+        print(f"\n   🚨 WARNING: LIVE BID DATA IGNORED")
+        print(f"      Total bids collected: {total_bids}")
+        print(f"      Listings with bids: {listings_with_bids}")
+        print(f"      Market prices calculated: 0")
+        print(f"      → Live auction signals are being wasted!")
+        print(f"      → Check variant_key assignment and persistence")
+        print(f"      → System will fall back to AI estimates (less reliable)")
+    elif len(market_prices) > 0:
+        print(f"   ✅ Market pricing active: {len(market_prices)} variants from {listings_with_bids} listings with {total_bids} total bids")
     
     # Web search for NEW prices
     logger.step_progress(f"Fetching new prices for {len(unique_queries)} unique products via web search...")

@@ -9,7 +9,7 @@ CRITICAL: Query-agnostic, transparent escalation, cost tracking.
 from typing import List, Dict, Any, Optional
 from models.extracted_product import ExtractedProduct
 from extraction.ai_extractor import extract_product_with_ai
-from extraction.ai_extractor_batch import extract_products_batch
+from extraction.ai_extractor_batch import extract_products_batch_safe
 from pipeline.decision_gates import decide_next_step, should_skip
 from logging_utils.listing_logger import ListingProcessingLog
 from logging_utils.run_logger import RunLogger
@@ -236,9 +236,9 @@ def process_batch(
     print(f"🚀 PROCESSING {len(listings)} LISTINGS (BATCH MODE)")
     print(f"{'='*60}\n")
     
-    # OPTIMIZATION: Batch extraction (1 AI call for all)
-    print(f"🧠 Batch extracting {len(listings)} products in 1 AI call...")
-    extraction_results = extract_products_batch(listings, config=config)
+    # OPTIMIZATION: Batch extraction with automatic splitting for large batches
+    print(f"🧠 Batch extracting {len(listings)} products...")
+    extraction_results = extract_products_batch_safe(listings, config=config)
     print(f"   ✅ Extracted {len(extraction_results)} products")
     
     # Log batch AI cost
