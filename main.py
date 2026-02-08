@@ -445,6 +445,17 @@ def run_v10_pipeline(
                 from models.product_identity import ProductIdentity
                 identity = ProductIdentity.from_product_spec(first_product)
                 
+                # PHASE 4.3: DEFENSIVE VALIDATION - Detect identity corruption
+                # Check if extracted listing_id matches current listing_id
+                if extracted.listing_id != listing_id:
+                    print(f"   🚨 IDENTITY MISMATCH DETECTED!")
+                    print(f"      Listing ID: {listing_id}")
+                    print(f"      Extracted ID: {extracted.listing_id}")
+                    print(f"      Title: {listing.get('title', '')[:80]}")
+                    print(f"      Extracted Product: {first_product.brand} {first_product.model}")
+                    print(f"      → SKIPPING to prevent corruption")
+                    continue
+                
                 listing["variant_key"] = identity.product_key
                 listing["_cleaned_title"] = identity.websearch_base
                 # FIX 3: Canonical identity for soft market aggregation (normalized generations, no color/condition)
@@ -466,8 +477,35 @@ def run_v10_pipeline(
                 if hasattr(extracted, 'detail_data') and extracted.detail_data:
                     listing["_detail_data"] = extracted.detail_data
             else:
-                listing["variant_key"] = None
+                # CROSS-RUN FIX: If extraction failed/skipped, try to fetch identity_key from DB
+                # This enables soft market pricing even when extraction confidence varies across runs
+                source_id = listing.get("listing_id")
+                platform = listing.get("platform", "ricardo")
+                db_identity_key = None
+                db_variant_key = None
+                
+                if source_id:
+                    print(f"   🔍 DB FETCH QUERY: platform='{platform}', source_id='{source_id}'")
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT identity_key, variant_key, source_id, title
+                            FROM listings 
+                            WHERE platform = %s AND source_id = %s
+                            LIMIT 1
+                        """, (platform, source_id))
+                        row = cur.fetchone()
+                        if row:
+                            db_identity_key = row[0]
+                            db_variant_key = row[1]
+                            db_source_id = row[2]
+                            db_title = row[3]
+                            print(f"   🔄 DB FETCH: Retrieved identity_key='{db_identity_key}', source_id='{db_source_id}', title='{db_title[:60]}...'")
+                        else:
+                            print(f"   ❌ DB FETCH: No row found for source_id='{source_id}'")
+                
+                listing["variant_key"] = db_variant_key
                 listing["_cleaned_title"] = None
+                listing["_identity_key"] = db_identity_key  # Use DB value if available
                 listing["_products"] = []
                 listing["_is_bundle"] = False
                 listing["_final_search_name"] = None
@@ -762,9 +800,11 @@ def run_v10_pipeline(
             # Canonical key normalizes generations, excludes color/condition for better aggregation
             all_listings_for_variant = []
             identity_key = listing.get("_identity_key")  # Canonical normalized identity
+            print(f"   🔑 IDENTITY_KEY: '{identity_key}' for listing {listing.get('listing_id')}")
             if identity_key:
                 # Fetch persisted listings from DB
                 persisted = get_listings_by_search_identity(conn, run_id, identity_key)
+                print(f"   🔍 SOFT MARKET QUERY: identity_key='{identity_key}', persisted={len(persisted) if persisted else 0}")
                 if persisted:
                     all_listings_for_variant.extend(persisted)
                 
@@ -774,6 +814,7 @@ def run_v10_pipeline(
                     if l.get("_identity_key") == identity_key and l.get("current_bid")
                 ]
                 all_listings_for_variant.extend(same_run_listings)
+                print(f"   📊 SOFT MARKET DATA: total_listings={len(all_listings_for_variant)}, same_run={len(same_run_listings)}")
             
             # Use identity_key as search_identity for soft market
             search_identity = identity_key
@@ -945,6 +986,8 @@ def run_v10_pipeline(
                 "bundle_type_v10": listing.get("_bundle_type").value if listing.get("_bundle_type") else None,
                 # FIX 6: Populate ai_cost_usd field
                 "ai_cost_usd": ai_result.get("ai_cost_usd", 0.0),
+                # PHASE 4.3: Persist canonical identity key for cross-run aggregation
+                "_identity_key": listing.get("_identity_key"),
             }
             
             # CRITICAL: Add detail data if available
@@ -1044,7 +1087,7 @@ def run_v10_pipeline(
                     SELECT 
                         COUNT(*) as total,
                         COUNT(variant_key) as with_variant_key,
-                        ROUND(COUNT(variant_key)::numeric / COUNT(*) * 100, 1) as pct
+                        ROUND(COUNT(variant_key)::numeric / NULLIF(COUNT(*), 0) * 100, 1) as pct
                     FROM listings 
                     WHERE run_id = %s
                 """, (run_id,))
@@ -1056,14 +1099,16 @@ def run_v10_pipeline(
                     print(f"   With variant_key: {with_vk} ({pct}%)")
                     
                     # Expected coverage: ~65-70% (excluding bundles, accessories, failed extractions)
-                    if pct < 50:
+                    if pct is not None and pct < 50:
                         print(f"   ⚠️ WARNING: Low variant_key coverage ({pct}% < 50%)")
                         print(f"   → Expected: 65-70% for typical runs")
                         print(f"   → Check variant_key persistence in save_evaluation()")
-                    elif pct >= 65:
+                    elif pct is not None and pct >= 65:
                         print(f"   ✅ Good coverage ({pct}% >= 65%)")
-                    else:
+                    elif pct is not None:
                         print(f"   ℹ️ Acceptable coverage ({pct}%), could be improved")
+                    else:
+                        print(f"   ℹ️ No listings for this run (cross-run data preserved)")
     
     return all_deals_for_detail
 

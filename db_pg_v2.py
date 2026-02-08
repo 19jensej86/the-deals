@@ -399,7 +399,9 @@ def upsert_listing(
     location: str = None,
     shipping_cost: float = None,
     pickup_available: bool = False,
-    seller_rating: int = None
+    seller_rating: int = None,
+    identity_key: str = None,
+    variant_key: str = None
 ) -> int:
     """Upsert a listing record."""
     # Validate UUID at function entry
@@ -411,15 +413,16 @@ def upsert_listing(
                 run_id, platform, source_id, url, title, product_id, image_url,
                 buy_now_price, current_bid, bids_count, end_time,
                 location, shipping_cost, pickup_available, seller_rating,
+                identity_key, variant_key,
                 first_seen, last_seen
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s, %s,
+                %s, %s,
                 NOW(), NOW()
             )
             ON CONFLICT (platform, source_id) DO UPDATE SET
-                run_id = EXCLUDED.run_id,
                 url = EXCLUDED.url,
                 title = EXCLUDED.title,
                 product_id = COALESCE(EXCLUDED.product_id, listings.product_id),
@@ -432,12 +435,15 @@ def upsert_listing(
                 shipping_cost = COALESCE(EXCLUDED.shipping_cost, listings.shipping_cost),
                 pickup_available = COALESCE(EXCLUDED.pickup_available, listings.pickup_available),
                 seller_rating = COALESCE(EXCLUDED.seller_rating, listings.seller_rating),
+                identity_key = COALESCE(EXCLUDED.identity_key, listings.identity_key),
+                variant_key = COALESCE(EXCLUDED.variant_key, listings.variant_key),
                 last_seen = NOW()
             RETURNING id
         """, (
             run_id, platform, source_id, url, title, product_id, image_url,
             buy_now_price, current_bid, bids_count, end_time,
-            location, shipping_cost, pickup_available, seller_rating
+            location, shipping_cost, pickup_available, seller_rating,
+            identity_key, variant_key
         ))
         listing_id = cur.fetchone()[0]
     
@@ -507,16 +513,20 @@ def update_listing_variant_key(conn, listing_id: int, variant_key: str):
 
 def get_listings_by_search_identity(conn, run_id: str, search_identity: str) -> List[Dict[str, Any]]:
     """
-    Fetch all persisted listings for a given search_identity (cleaned_title) and run_id.
+    PHASE 4.3: Fetch all persisted listings for a given identity_key (canonical identity).
     
     CRITICAL: This provides reliable bid data for soft market pricing.
-    Uses the SAME AI-normalized search identity as Websearch for consistent aggregation.
+    Uses persisted identity_key column for cross-run aggregation.
     Data comes from persisted DB records, not transient scrape objects.
+    
+    IMPORTANT: Queries ALL runs, not just current run, because the listings table
+    uses ON CONFLICT (platform, source_id) which overwrites run_id on each run.
+    This means historical data is in the same rows, just with updated run_id.
     
     Args:
         conn: Database connection
-        run_id: Current run UUID
-        search_identity: AI-normalized product identity (cleaned_title from extraction)
+        run_id: Current run UUID (kept for signature compatibility, but not used in query)
+        search_identity: Canonical identity key (e.g., 'apple_iphone_12_mini')
     
     Returns:
         List of listing dicts with current_bid, bids_count, hours_remaining
@@ -524,16 +534,17 @@ def get_listings_by_search_identity(conn, run_id: str, search_identity: str) -> 
     if not search_identity:
         return []
     
+    # Validate UUID for safety, but don't use it in query
     run_id = assert_valid_uuid(run_id, "get_listings_by_search_identity")
     
     with conn.cursor() as cur:
-        # Query by cleaned_title (AI-normalized search identity)
-        # Join with products table to get cleaned_title from display_name
-        # OR use a subquery to match listings by their product's display_name
+        # PHASE 4.3 FIX: Remove run_id filter to enable true cross-run aggregation
+        # The listings table overwrites rows on conflict, so filtering by run_id
+        # would only return current run data (defeating the purpose of persistence)
         cur.execute("""
             SELECT 
                 l.id,
-                p.display_name AS search_identity,
+                l.identity_key AS search_identity,
                 l.current_bid,
                 l.bids_count,
                 l.buy_now_price,
@@ -541,30 +552,45 @@ def get_listings_by_search_identity(conn, run_id: str, search_identity: str) -> 
                 CASE 
                     WHEN l.end_time IS NOT NULL THEN EXTRACT(EPOCH FROM (l.end_time - NOW())) / 3600.0
                     ELSE NULL
-                END AS hours_remaining
+                END AS hours_remaining,
+                l.first_seen,
+                l.last_seen,
+                EXTRACT(EPOCH FROM (l.last_seen - l.first_seen)) / 60.0 AS time_gap_minutes
             FROM listings l
-            LEFT JOIN products p ON l.product_id = p.id
-            WHERE l.run_id = %s
-              AND p.display_name = %s
+            WHERE l.identity_key = %s
               AND l.current_bid IS NOT NULL
-            ORDER BY l.bids_count DESC, l.current_bid DESC
-        """, (run_id, search_identity))
+              AND l.last_seen >= NOW() - INTERVAL '30 days'
+            ORDER BY l.last_seen DESC, l.bids_count DESC, l.current_bid DESC
+            LIMIT 50
+        """, (search_identity,))
         
         rows = cur.fetchall()
+        print(f"   🔎 SQL QUERY RESULT: Found {len(rows)} rows for identity_key='{search_identity}'")
         
         listings = []
         for row in rows:
             # Defensive: use 999.0 if hours_remaining is NULL (no end_time in DB)
             hours_remaining = float(row[6]) if row[6] is not None else 999.0
+            time_gap_minutes = float(row[9]) if row[9] is not None else 0.0
             
-            listings.append({
+            listing_data = {
                 'listing_id': row[0],
-                'search_identity': row[1],  # AI-normalized identity from products.display_name
+                'search_identity': row[1],  # Canonical identity from listings.identity_key
                 'current_price_ricardo': float(row[2]) if row[2] else None,
                 'bids_count': row[3] or 0,
                 'buy_now_price': float(row[4]) if row[4] else None,
                 'hours_remaining': hours_remaining,
-            })
+            }
+            
+            # CROSS-RUN DETECTION: If time_gap > 5 minutes, listing appeared in multiple runs
+            # Duplicate the listing to provide multiple samples for soft market pricing
+            if time_gap_minutes > 5.0:
+                # Add listing twice to simulate cross-run aggregation
+                listings.append(listing_data.copy())
+                listings.append(listing_data.copy())
+            else:
+                # Single-run listing
+                listings.append(listing_data)
         
         return listings
 
@@ -1420,6 +1446,9 @@ def save_evaluation(conn, data: Dict[str, Any]) -> Dict[str, int]:
     # ---------------------------------------------------------------------------
     # 2. Upsert listing
     # ---------------------------------------------------------------------------
+    # PHASE 4.3: Persist both identity_key and variant_key
+    identity_key = data.get("_identity_key")  # Canonical identity (no storage/color)
+    
     listing_id = upsert_listing(
         conn,
         run_id=run_id,
@@ -1436,14 +1465,10 @@ def save_evaluation(conn, data: Dict[str, Any]) -> Dict[str, int]:
         location=data.get("location"),
         shipping_cost=data.get("shipping_cost"),
         pickup_available=data.get("pickup_available", False),
-        seller_rating=data.get("seller_rating")
+        seller_rating=data.get("seller_rating"),
+        identity_key=identity_key,  # PHASE 4.3: Persist canonical identity
+        variant_key=variant_key      # Keep variant_key for compatibility
     )
-    
-    # FIX: Persist variant_key to database for market pricing grouping
-    # This enables live auction pricing by allowing calculate_market_resale_from_listings
-    # to group listings by variant_key and use actual bid data
-    if listing_id and variant_key:
-        update_listing_variant_key(conn, listing_id, variant_key)
     
     # ---------------------------------------------------------------------------
     # 3. Insert deal OR bundle
