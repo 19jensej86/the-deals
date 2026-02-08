@@ -1,86 +1,76 @@
 {
-  "export_time": "2026-02-01T09:32:11.251115",
-  "total_products": 17,
+  "export_time": "2026-02-01T23:23:50.341716",
+  "total_products": 18,
   "products": [
     {
       "id": 4,
-      "base_product_key": "airpods_pro_2",
-      "variant_key": "airpods_pro_2",
-      "display_name": "AirPods Pro 2",
+      "base_product_key": "airpods_2_pro",
+      "variant_key": "airpods_2_pro",
+      "display_name": "AirPods 2 Pro",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.327373+01:00",
-      "updated_at": "2026-02-01 09:31:57.327373+01:00"
+      "created_at": "2026-02-01 23:23:35.512791+01:00",
+      "updated_at": "2026-02-01 23:23:35.512791+01:00"
     },
     {
       "id": 3,
-      "base_product_key": "apple_airpods_2nd",
-      "variant_key": "apple_airpods_2nd_generation",
-      "display_name": "Apple AirPods 2nd Generation",
+      "base_product_key": "apple_airpods_2",
+      "variant_key": "apple_airpods_2",
+      "display_name": "Apple AirPods 2",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.323991+01:00",
-      "updated_at": "2026-02-01 09:31:57.323991+01:00"
+      "created_at": "2026-02-01 23:23:35.484561+01:00",
+      "updated_at": "2026-02-01 23:23:35.484561+01:00"
+    },
+    {
+      "id": 6,
+      "base_product_key": "apple_airpods_pro",
+      "variant_key": "apple_airpods_pro",
+      "display_name": "Apple AirPods Pro",
+      "brand": null,
+      "category": null,
+      "created_at": "2026-02-01 23:23:35.532520+01:00",
+      "updated_at": "2026-02-01 23:23:35.532520+01:00"
     },
     {
       "id": 5,
       "base_product_key": "apple_airpods_pro",
-      "variant_key": "apple_airpods_pro_2",
-      "display_name": "Apple Airpods Pro 2",
+      "variant_key": "apple_airpods_pro_2nd_generation",
+      "display_name": "Apple AirPods Pro (2nd generation)",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.341164+01:00",
-      "updated_at": "2026-02-01 09:31:57.341164+01:00"
+      "created_at": "2026-02-01 23:23:35.522172+01:00",
+      "updated_at": "2026-02-01 23:23:35.522172+01:00"
     },
     {
       "id": 2,
       "base_product_key": "apple_airpods_pro",
-      "variant_key": "apple_airpods_pro_2nd_generation",
-      "display_name": "Apple AirPods Pro 2nd Generation",
+      "variant_key": "apple_airpods_pro_2",
+      "display_name": "Apple AirPods Pro 2",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.309603+01:00",
-      "updated_at": "2026-02-01 09:31:57.309603+01:00"
+      "created_at": "2026-02-01 23:23:35.468974+01:00",
+      "updated_at": "2026-02-01 23:23:35.468974+01:00"
     },
     {
-      "id": 10,
+      "id": 12,
       "base_product_key": "apple_ipad_9th",
       "variant_key": "apple_ipad_9th_gen",
       "display_name": "Apple iPad (9th Gen)",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.412864+01:00",
-      "updated_at": "2026-02-01 09:31:57.412864+01:00"
+      "created_at": "2026-02-01 23:23:35.639212+01:00",
+      "updated_at": "2026-02-01 23:23:35.639212+01:00"
     },
     {
       "id": 14,
-      "base_product_key": "apple_ipad_9th",
-      "variant_key": "apple_ipad_9th_generation",
-      "display_name": "Apple iPad (9th generation)",
-      "brand": null,
-      "category": null,
-      "created_at": "2026-02-01 09:31:57.437979+01:00",
-      "updated_at": "2026-02-01 09:31:57.437979+01:00"
-    },
-    {
-      "id": 12,
       "base_product_key": "apple_ipad_pro",
       "variant_key": "apple_ipad_pro_129_5th_gen",
-      "display_name": "Apple iPad Pro 12.9 (5th Gen)",
+      "display_name": "Apple iPad Pro 12.9 5th Gen",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.421657+01:00",
-      "updated_at": "2026-02-01 09:31:57.421657+01:00"
-    },
-    {
-      "id": 13,
-      "base_product_key": "apple_ipad_pro",
-      "variant_key": "apple_ipad_pro_129_6th_generation",
-      "display_name": "Apple iPad Pro 12.9 (6th Generation)",
-      "brand": null,
-      "category": null,
-      "created_at": "2026-02-01 09:31:57.434295+01:00",
-      "updated_at": "2026-02-01 09:31:57.434295+01:00"
+      "created_at": "2026-02-01 23:23:35.657644+01:00",
+      "updated_at": "2026-02-01 23:23:35.657644+01:00"
     },
     {
       "id": 11,
@@ -89,8 +79,18 @@
       "display_name": "Apple iPad Pro 12.9 6th Gen",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.416119+01:00",
-      "updated_at": "2026-02-01 09:31:57.416119+01:00"
+      "created_at": "2026-02-01 23:23:35.627076+01:00",
+      "updated_at": "2026-02-01 23:23:35.627076+01:00"
+    },
+    {
+      "id": 13,
+      "base_product_key": "apple_ipad_pro",
+      "variant_key": "apple_ipad_pro_129_wifi_5th_gen",
+      "display_name": "Apple iPad Pro 12.9 Wifi 5th Gen",
+      "brand": null,
+      "category": null,
+      "created_at": "2026-02-01 23:23:35.651848+01:00",
+      "updated_at": "2026-02-01 23:23:35.651848+01:00"
     },
     {
       "id": 1,
@@ -99,78 +99,88 @@
       "display_name": "Apple iPhone 12 Mini",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.267884+01:00",
-      "updated_at": "2026-02-01 09:31:57.267884+01:00"
+      "created_at": "2026-02-01 23:23:35.406016+01:00",
+      "updated_at": "2026-02-01 23:23:35.406016+01:00"
     },
     {
-      "id": 15,
+      "id": 17,
       "base_product_key": "garmin_fenix_6",
       "variant_key": "garmin_fenix_6_pro",
       "display_name": "Garmin Fenix 6 Pro",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.448563+01:00",
-      "updated_at": "2026-02-01 09:31:57.448563+01:00"
+      "created_at": "2026-02-01 23:23:35.697394+01:00",
+      "updated_at": "2026-02-01 23:23:35.697394+01:00"
     },
     {
-      "id": 17,
+      "id": 16,
+      "base_product_key": "garmin_fenix_6",
+      "variant_key": "garmin_fenix_6_pro_sapphire",
+      "display_name": "Garmin Fenix 6 Pro Sapphire",
+      "brand": null,
+      "category": null,
+      "created_at": "2026-02-01 23:23:35.689179+01:00",
+      "updated_at": "2026-02-01 23:23:35.689179+01:00"
+    },
+    {
+      "id": 18,
       "base_product_key": "garmin_fenix_6",
       "variant_key": "garmin_fenix_6_pro_solar",
       "display_name": "Garmin Fenix 6 Pro Solar",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.467064+01:00",
-      "updated_at": "2026-02-01 09:31:57.467064+01:00"
+      "created_at": "2026-02-01 23:23:35.703099+01:00",
+      "updated_at": "2026-02-01 23:23:35.703099+01:00"
     },
     {
-      "id": 16,
+      "id": 15,
       "base_product_key": "garmin_fenix_7",
       "variant_key": "garmin_fenix_7_pro_sapphire_solar",
       "display_name": "Garmin Fenix 7 Pro Sapphire Solar",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.460995+01:00",
-      "updated_at": "2026-02-01 09:31:57.460995+01:00"
+      "created_at": "2026-02-01 23:23:35.675771+01:00",
+      "updated_at": "2026-02-01 23:23:35.675771+01:00"
     },
     {
-      "id": 6,
+      "id": 7,
       "base_product_key": "samsung_galaxy_watch",
       "variant_key": "samsung_galaxy_watch_4",
       "display_name": "Samsung Galaxy Watch 4",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.350280+01:00",
-      "updated_at": "2026-02-01 09:31:57.350280+01:00"
+      "created_at": "2026-02-01 23:23:35.544704+01:00",
+      "updated_at": "2026-02-01 23:23:35.544704+01:00"
     },
     {
-      "id": 9,
+      "id": 10,
       "base_product_key": "sony_headphones",
       "variant_key": "sony_headphones",
       "display_name": "Sony Headphones",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.399536+01:00",
-      "updated_at": "2026-02-01 09:31:57.399536+01:00"
+      "created_at": "2026-02-01 23:23:35.606975+01:00",
+      "updated_at": "2026-02-01 23:23:35.606975+01:00"
     },
     {
-      "id": 7,
+      "id": 8,
       "base_product_key": "sony_wh1000xm4",
       "variant_key": "sony_wh1000xm4",
       "display_name": "Sony WH-1000XM4",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.381546+01:00",
-      "updated_at": "2026-02-01 09:31:57.381546+01:00"
+      "created_at": "2026-02-01 23:23:35.576198+01:00",
+      "updated_at": "2026-02-01 23:23:35.576198+01:00"
     },
     {
-      "id": 8,
+      "id": 9,
       "base_product_key": "sony_wh1000xm5",
       "variant_key": "sony_wh1000xm5",
       "display_name": "Sony WH-1000XM5",
       "brand": null,
       "category": null,
-      "created_at": "2026-02-01 09:31:57.388714+01:00",
-      "updated_at": "2026-02-01 09:31:57.388714+01:00"
+      "created_at": "2026-02-01 23:23:35.592289+01:00",
+      "updated_at": "2026-02-01 23:23:35.592289+01:00"
     }
   ]
 }

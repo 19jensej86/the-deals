@@ -55,6 +55,7 @@ from db_pg_v2 import (
     clean_price_cache as clear_expired_market_data,
     update_listing_details,
     update_listing_variant_key,  # New import
+    get_listings_by_search_identity,  # For soft market pricing (AI-normalized identity)
     # Run management
     start_run,
     finish_run,
@@ -83,6 +84,11 @@ from utils_text import (
     normalize_whitespace,
     detect_category,
 )
+
+# FIX 1: Safe price formatter to prevent None formatting crash
+def fmt_price(price: Optional[float]) -> str:
+    """Format price safely, handling None values."""
+    return f"{price:.2f}" if price is not None else "N/A"
 
 from query_analyzer import (
     analyze_queries,
@@ -206,6 +212,9 @@ def run_v10_pipeline(
     run_id = assert_valid_uuid(run_id, context="run_v10_pipeline()")
     
     logger = get_logger()
+    
+    # Validation state (cannot attach to psycopg2 connection object)
+    validation_checks = {}
     
     all_deals_for_detail = []
     
@@ -438,6 +447,8 @@ def run_v10_pipeline(
                 
                 listing["variant_key"] = identity.product_key
                 listing["_cleaned_title"] = identity.websearch_base
+                # FIX 3: Canonical identity for soft market aggregation (normalized generations, no color/condition)
+                listing["_identity_key"] = identity.get_canonical_identity_key()
                 listing["_products"] = extracted.products
                 listing["_is_bundle"] = extracted.bundle_type != BundleType.SINGLE_PRODUCT
                 listing["_bundle_type"] = extracted.bundle_type
@@ -454,13 +465,6 @@ def run_v10_pipeline(
                 # CRITICAL: Store detail data if available
                 if hasattr(extracted, 'detail_data') and extracted.detail_data:
                     listing["_detail_data"] = extracted.detail_data
-                
-                # FIX: Persist variant_key to database for market pricing grouping
-                # This enables live auction pricing by allowing calculate_market_resale_from_listings
-                # to group listings by variant_key and use actual bid data
-                listing_id = listing.get("id")
-                if listing_id and identity.product_key:
-                    update_listing_variant_key(conn, listing_id, identity.product_key)
             else:
                 listing["variant_key"] = None
                 listing["_cleaned_title"] = None
@@ -499,6 +503,9 @@ def run_v10_pipeline(
     product_key_to_query = {}
     final_search_name_to_product_key = {}  # CRITICAL: Map final_search_name -> product_key for price lookup
     
+    # FIX 5: Dedup by canonical identity_key before websearch (1 call per identity)
+    identity_to_query = {}  # canonical_identity -> query
+    
     for extracted in extracted_products:
         if not extracted.products or not extracted.can_price:
             continue
@@ -506,14 +513,19 @@ def run_v10_pipeline(
         for product in extracted.products:
             query = generate_websearch_query(product)
             identity = ProductIdentity.from_product_spec(product)
+            canonical_key = identity.get_canonical_identity_key()
             final_search_name = product.final_search_name or identity.websearch_base
+            
+            # Only add if not already present (dedup by canonical identity)
+            if canonical_key not in identity_to_query:
+                identity_to_query[canonical_key] = query.primary_query
             
             websearch_queries.append(query.primary_query)
             product_key_to_query[identity.product_key] = query
             final_search_name_to_product_key[final_search_name] = identity.product_key
     
-    # Deduplicate queries
-    unique_queries = list(set(websearch_queries))
+    # Use deduplicated identity-based queries
+    unique_queries = list(identity_to_query.values())
     
     logger.step_result(
         summary=f"Generated {len(unique_queries)} unique websearch queries",
@@ -590,6 +602,15 @@ def run_v10_pipeline(
         print(f"      → System will fall back to AI estimates (less reliable)")
     elif len(market_prices) > 0:
         print(f"   ✅ Market pricing active: {len(market_prices)} variants from {listings_with_bids} listings with {total_bids} total bids")
+    
+    # VALIDATION: Check variant_key coverage after deal evaluation
+    # This will be checked later after save_evaluation() has persisted variant_keys
+    # Store for post-evaluation validation
+    validation_checks['expected_variant_key_coverage'] = {
+        'total_listings': len(all_listings_flat),
+        'listings_with_bids': listings_with_bids,
+        'total_bids': total_bids,
+    }
     
     # Web search for NEW prices
     logger.step_progress(f"Fetching new prices for {len(unique_queries)} unique products via web search...")
@@ -737,6 +758,26 @@ def run_v10_pipeline(
                     "pricing_method": get_pricing_method(bundle_type).value if hasattr(bundle_type, 'value') else "unknown",
                 }
             
+            # FIX 3 & 4: Soft market using canonical identity_key + same-run listings
+            # Canonical key normalizes generations, excludes color/condition for better aggregation
+            all_listings_for_variant = []
+            identity_key = listing.get("_identity_key")  # Canonical normalized identity
+            if identity_key:
+                # Fetch persisted listings from DB
+                persisted = get_listings_by_search_identity(conn, run_id, identity_key)
+                if persisted:
+                    all_listings_for_variant.extend(persisted)
+                
+                # FIX 4: Include same-run listings (enables soft market within same run)
+                same_run_listings = [
+                    l for l in all_listings_flat 
+                    if l.get("_identity_key") == identity_key and l.get("current_bid")
+                ]
+                all_listings_for_variant.extend(same_run_listings)
+            
+            # Use identity_key as search_identity for soft market
+            search_identity = identity_key
+            
             # Evaluate (OBJECTIVE B: pass variant_info_by_key for bundle component pricing)
             ai_result = evaluate_listing_with_ai(
                 title=title,
@@ -756,6 +797,8 @@ def run_v10_pipeline(
                 batch_bundle_result=batch_bundle_result,
                 variant_info_by_key=variant_info_by_key,
                 quantity=quantity,
+                all_listings_for_variant=all_listings_for_variant,
+                search_identity=search_identity,  # AI-normalized identity for Soft Market
             )
             
             # Log result with comprehensive details for analysis
@@ -771,7 +814,7 @@ def run_v10_pipeline(
             # Enhanced logging for perfect analysis
             print(f"   {strategy_icon} {title}")
             print(f"      💰 Profit: {profit or 0:.2f} CHF | 📊 Score: {score:.1f}/10 | 🏷️ Source: {price_source}")
-            print(f"      💵 New: {new_price:.2f} CHF | 🔄 Resale: {resale_price:.2f} CHF | 📦 Bundle: {'Yes' if is_bundle else 'No'}")
+            print(f"      💵 New: {fmt_price(new_price)} CHF | 🔄 Resale: {fmt_price(resale_price)} CHF | 📦 Bundle: {'Yes' if is_bundle else 'No'}")
             if variant_info and variant_info.get("shop_name"):
                 print(f"      🏪 Shops: {variant_info.get('shop_name')}")
             if is_bundle and ai_result.get("bundle_components"):
@@ -830,7 +873,7 @@ def run_v10_pipeline(
                     if not ai_result.get("resale_price_est"):
                         ai_result["resale_price_est"] = round(baseline_new * baseline_resale_rate * quantity, 2)
                     
-                    print(f"      Applied baseline: new={ai_result['new_price']:.2f}, resale={ai_result['resale_price_est']:.2f} CHF")
+                    print(f"      Applied baseline: new={fmt_price(ai_result['new_price'])}, resale={fmt_price(ai_result['resale_price_est'])} CHF")
             
             # CRITICAL: Normalize bundle_components to JSON string if it's a dict/list
             import json
@@ -989,6 +1032,38 @@ def run_v10_pipeline(
     print("="*60)
     run_logger_v10.print_cost_breakdown()
     print("="*60)
+    
+    # VALIDATION: Check variant_key coverage in database
+    if validation_checks:
+        checks = validation_checks.get('expected_variant_key_coverage', {})
+        expected_total = checks.get('total_listings', 0)
+        
+        if expected_total > 0:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total,
+                        COUNT(variant_key) as with_variant_key,
+                        ROUND(COUNT(variant_key)::numeric / COUNT(*) * 100, 1) as pct
+                    FROM listings 
+                    WHERE run_id = %s
+                """, (run_id,))
+                row = cur.fetchone()
+                if row:
+                    total, with_vk, pct = row
+                    print(f"\n📊 VARIANT_KEY COVERAGE VALIDATION:")
+                    print(f"   Total listings: {total}")
+                    print(f"   With variant_key: {with_vk} ({pct}%)")
+                    
+                    # Expected coverage: ~65-70% (excluding bundles, accessories, failed extractions)
+                    if pct < 50:
+                        print(f"   ⚠️ WARNING: Low variant_key coverage ({pct}% < 50%)")
+                        print(f"   → Expected: 65-70% for typical runs")
+                        print(f"   → Check variant_key persistence in save_evaluation()")
+                    elif pct >= 65:
+                        print(f"   ✅ Good coverage ({pct}% >= 65%)")
+                    else:
+                        print(f"   ℹ️ Acceptable coverage ({pct}%), could be improved")
     
     return all_deals_for_detail
 
@@ -1611,10 +1686,21 @@ def run_once():
                         logger.step_end(f"Detail scraping complete - {detail_success_count}/{len(top_deals)} successful")
                     except Exception as e:
                         logger.step_error(f"Detail scraping failed: {e}")
-            
-            # ------------------------------------------------------------------
-            # FALLBACK: If v10 not available, show error
-            # ------------------------------------------------------------------
+        
+        # ------------------------------------------------------------------
+        # FALLBACK: If v10 not available, show error
+        # ------------------------------------------------------------------
+        if not use_v10_pipeline:
+            print("❌ v10 Pipeline not available. Please ensure models/ and pipeline/ modules are installed.")
+            print("   Required modules: models.bundle_types, models.product_spec, pipeline.pipeline_runner")
+            return
+        
+        # ------------------------------------------------------------------
+        # 8) DETAIL SCRAPING SUMMARY
+        # ------------------------------------------------------------------
+        if detail_pages_enabled and all_deals_for_detail:
+            detail_scraped_count = len([d for d in all_deals_for_detail if d.get('detail_scraped')])
+            print(f"\n✅ Detail pages scraped: {detail_scraped_count} total (across all queries)")
             if not use_v10_pipeline:
                 print("❌ v10 Pipeline not available. Please ensure models/ and pipeline/ modules are installed.")
                 print("   Required modules: models.bundle_types, models.product_spec, pipeline.pipeline_runner")

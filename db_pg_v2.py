@@ -271,7 +271,11 @@ def get_or_create_product(
     category: str = None
 ) -> int:
     """
-    Gets existing product or creates new one. Returns product_id.
+    PHASE 4.2: Gets existing product or creates new one. Returns product_id.
+    
+    CRITICAL: base_product_key should be canonical_identity_key for 1:1 mapping.
+    Rule: 1 canonical_identity_key = exactly 1 product
+    
     Uses normalized keys for consistency.
     """
     norm_base = normalize_variant_key(base_product_key)
@@ -281,7 +285,14 @@ def get_or_create_product(
         raise ValueError(f"Invalid product keys after normalization: base={base_product_key}, variant={variant_key}")
     
     with conn.cursor() as cur:
-        # Try to find by canonical variant_key
+        # PHASE 4.2: Find by base_product_key FIRST (canonical identity)
+        # This ensures 1 canonical_identity_key = 1 product
+        cur.execute("SELECT id FROM products WHERE base_product_key = %s", (norm_base,))
+        row = cur.fetchone()
+        if row:
+            return row[0]
+        
+        # Fallback: Try to find by variant_key (for backwards compatibility)
         cur.execute("SELECT id FROM products WHERE variant_key = %s", (norm_variant,))
         row = cur.fetchone()
         if row:
@@ -492,6 +503,70 @@ def update_listing_variant_key(conn, listing_id: int, variant_key: str):
             SET variant_key = %s, last_seen = NOW()
             WHERE id = %s
         """, (variant_key, listing_id))
+
+
+def get_listings_by_search_identity(conn, run_id: str, search_identity: str) -> List[Dict[str, Any]]:
+    """
+    Fetch all persisted listings for a given search_identity (cleaned_title) and run_id.
+    
+    CRITICAL: This provides reliable bid data for soft market pricing.
+    Uses the SAME AI-normalized search identity as Websearch for consistent aggregation.
+    Data comes from persisted DB records, not transient scrape objects.
+    
+    Args:
+        conn: Database connection
+        run_id: Current run UUID
+        search_identity: AI-normalized product identity (cleaned_title from extraction)
+    
+    Returns:
+        List of listing dicts with current_bid, bids_count, hours_remaining
+    """
+    if not search_identity:
+        return []
+    
+    run_id = assert_valid_uuid(run_id, "get_listings_by_search_identity")
+    
+    with conn.cursor() as cur:
+        # Query by cleaned_title (AI-normalized search identity)
+        # Join with products table to get cleaned_title from display_name
+        # OR use a subquery to match listings by their product's display_name
+        cur.execute("""
+            SELECT 
+                l.id,
+                p.display_name AS search_identity,
+                l.current_bid,
+                l.bids_count,
+                l.buy_now_price,
+                l.end_time,
+                CASE 
+                    WHEN l.end_time IS NOT NULL THEN EXTRACT(EPOCH FROM (l.end_time - NOW())) / 3600.0
+                    ELSE NULL
+                END AS hours_remaining
+            FROM listings l
+            LEFT JOIN products p ON l.product_id = p.id
+            WHERE l.run_id = %s
+              AND p.display_name = %s
+              AND l.current_bid IS NOT NULL
+            ORDER BY l.bids_count DESC, l.current_bid DESC
+        """, (run_id, search_identity))
+        
+        rows = cur.fetchall()
+        
+        listings = []
+        for row in rows:
+            # Defensive: use 999.0 if hours_remaining is NULL (no end_time in DB)
+            hours_remaining = float(row[6]) if row[6] is not None else 999.0
+            
+            listings.append({
+                'listing_id': row[0],
+                'search_identity': row[1],  # AI-normalized identity from products.display_name
+                'current_price_ricardo': float(row[2]) if row[2] else None,
+                'bids_count': row[3] or 0,
+                'buy_now_price': float(row[4]) if row[4] else None,
+                'hours_remaining': hours_remaining,
+            })
+        
+        return listings
 
 
 # ==============================================================================
@@ -1322,16 +1397,20 @@ def save_evaluation(conn, data: Dict[str, Any]) -> Dict[str, int]:
         product_id = resolve_product(conn, variant_key)
         
         if not product_id:
-            # Create new product
-            # Generate base_product_key by removing storage/color specifics
-            base_key = variant_key.split("_")[0:3]  # e.g., "apple_iphone_12" from "apple_iphone_12_128gb_green"
-            base_product_key = "_".join(base_key) if len(base_key) >= 2 else variant_key
+            # PHASE 4.2: Use canonical_identity_key as base_product_key
+            # This ensures 1 canonical identity = 1 product
+            canonical_identity = data.get("_identity_key")
+            
+            # Fallback to heuristic if canonical identity not available
+            if not canonical_identity:
+                base_key = variant_key.split("_")[0:3]
+                canonical_identity = "_".join(base_key) if len(base_key) >= 2 else variant_key
             
             display_name = data.get("cleaned_title") or data.get("title") or variant_key
             
             product_id = get_or_create_product(
                 conn,
-                base_product_key=base_product_key,
+                base_product_key=canonical_identity,  # PHASE 4.2: canonical identity
                 variant_key=variant_key,
                 display_name=display_name,
                 brand=None,  # Could extract from variant_key
@@ -1359,6 +1438,12 @@ def save_evaluation(conn, data: Dict[str, Any]) -> Dict[str, int]:
         pickup_available=data.get("pickup_available", False),
         seller_rating=data.get("seller_rating")
     )
+    
+    # FIX: Persist variant_key to database for market pricing grouping
+    # This enables live auction pricing by allowing calculate_market_resale_from_listings
+    # to group listings by variant_key and use actual bid data
+    if listing_id and variant_key:
+        update_listing_variant_key(conn, listing_id, variant_key)
     
     # ---------------------------------------------------------------------------
     # 3. Insert deal OR bundle

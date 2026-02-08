@@ -80,6 +80,38 @@ class ProductIdentity:
         return False
     
     @staticmethod
+    def normalize_generation(text: str) -> str:
+        """
+        SAFE: Normalize generation expressions WITHOUT corrupting model numbers.
+        
+        ONLY matches generation patterns like:
+        - "2nd generation" -> "gen_2"
+        - "(2. Generation)" -> "gen_2"
+        - "Second Generation" -> "gen_2"
+        
+        MUST NOT match standalone numbers in model names:
+        - "iPhone 12" stays "iPhone 12" (NOT "iPhone 1")
+        - "WH-1000XM4" stays "WH-1000XM4" (NOT "WH-100XM4")
+        """
+        text_lower = text.lower()
+        
+        # Pattern 1: "(2nd generation)" or "2nd gen" -> "gen_2"
+        text_lower = re.sub(r'\(?([0-9]+)(?:st|nd|rd|th)\s+gen(?:eration)?\)?', r'gen_\1', text_lower)
+        
+        # Pattern 2: "(2. Generation)" -> "gen_2"
+        text_lower = re.sub(r'\(?([0-9]+)\.\s+generation\)?', r'gen_\1', text_lower)
+        
+        # Pattern 3: "second generation" -> "gen_2"
+        gen_words = {
+            "first": "1", "second": "2", "third": "3", 
+            "fourth": "4", "fifth": "5"
+        }
+        for word, num in gen_words.items():
+            text_lower = re.sub(r'\b' + word + r'\s+gen(?:eration)?\b', f'gen_{num}', text_lower)
+        
+        return text_lower
+    
+    @staticmethod
     def _canonicalize_spec_value(key: str, value) -> str:
         """
         Canonicalizes spec value with proper unit casing.
@@ -198,3 +230,114 @@ class ProductIdentity:
             specs_normalized=specs_norm,
             websearch_base=websearch_base
         )
+    
+    @staticmethod
+    def infer_brand(model_or_type: str) -> str:
+        """
+        PHASE 4.2: Infer brand from model name using deterministic rules.
+        
+        Examples:
+        - "iphone 12" -> "apple"
+        - "galaxy watch" -> "samsung"
+        - "pixel 7" -> "google"
+        """
+        text_lower = model_or_type.lower()
+        
+        # Deterministic brand inference rules
+        BRAND_RULES = {
+            "apple": ["iphone", "ipad", "airpods", "macbook", "apple watch", "imac"],
+            "samsung": ["galaxy"],
+            "google": ["pixel"],
+            "sony": ["playstation", "wh-1000"],
+            "garmin": ["fenix", "forerunner", "vivoactive"],
+            "bose": ["quietcomfort", "soundlink"],
+        }
+        
+        for brand, keywords in BRAND_RULES.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return brand
+        
+        return None
+    
+    def get_canonical_identity_key(self) -> str:
+        """
+        PHASE 4.2: Generate canonical identity key - SINGLE SOURCE OF TRUTH.
+        
+        Format: brand_model_tier_generation (underscore-separated)
+        
+        Rules:
+        - Include: brand (inferred if missing), model, tier (mini/pro/max), generation
+        - Exclude: storage, color, condition, marketing terms
+        - Normalize: generations to gen_X format
+        
+        Examples:
+        - "Apple iPhone 12 mini 128GB" -> "apple_iphone_12_mini"
+        - "iPhone 12 Pro Max" -> "apple_iphone_12_pro_max"
+        - "AirPods Pro (2nd Generation)" -> "apple_airpods_pro_gen_2"
+        """
+        # Start with websearch_base (brand + model/type)
+        original = self.websearch_base.lower()
+        base = original
+        
+        # Extract numeric tokens from original for corruption detection
+        original_numbers = set(re.findall(r'\b\d+\b', original))
+        
+        # Normalize generations
+        base = self.normalize_generation(base)
+        
+        # Remove color terms (not price-relevant)
+        color_terms = ["schwarz", "weiss", "rot", "blau", "grün", "gelb", "grau", 
+                       "black", "white", "red", "blue", "green", "yellow", "gray", "grey",
+                       "silber", "silver", "gold", "rosa", "pink"]
+        for color in color_terms:
+            base = re.sub(r'\b' + color + r'\b', '', base)
+        
+        # Remove condition terms
+        condition_terms = ["neu", "new", "gebraucht", "used", "wie neu", "ovp"]
+        for cond in condition_terms:
+            base = re.sub(r'\b' + cond + r'\b', '', base)
+        
+        # Remove marketing noise
+        noise = ["top", "super", "mega", "original", "!!!"]
+        for n in noise:
+            base = base.replace(n, '')
+        
+        # Clean up whitespace
+        base = ' '.join(base.split())
+        
+        # SAFETY GUARD: Verify no numeric corruption occurred
+        result_numbers = set(re.findall(r'\b\d+\b', base))
+        
+        # Check if any original numbers were corrupted (shortened or changed)
+        for orig_num in original_numbers:
+            # Skip if this was a generation number (now converted to gen_X)
+            if f'gen_{orig_num}' in base:
+                continue
+            
+            # Check if the number is still present
+            if orig_num not in result_numbers:
+                # CORRUPTION DETECTED - fallback to safe identity
+                print(f"   🚨 IDENTITY CORRUPTION DETECTED!")
+                print(f"      Original: {original}")
+                print(f"      Corrupted: {base}")
+                print(f"      Missing number: {orig_num}")
+                print(f"      Fallback: using websearch_base as-is")
+                return original.replace(' ', '_').strip()
+        
+        # PHASE 4.2: Infer brand if missing
+        if not self.brand_normalized:
+            inferred_brand = self.infer_brand(base)
+            if inferred_brand:
+                # Prepend brand if not already present
+                if not base.startswith(inferred_brand):
+                    base = f"{inferred_brand} {base}"
+        
+        # Convert to underscore-separated format (canonical format)
+        canonical = base.replace(' ', '_').replace('-', '_')
+        
+        # Remove duplicate underscores
+        while '__' in canonical:
+            canonical = canonical.replace('__', '_')
+        
+        return canonical.strip('_')

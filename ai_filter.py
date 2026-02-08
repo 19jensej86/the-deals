@@ -1772,6 +1772,213 @@ def apply_global_sanity_check(resale_price: float, reference_price: float, is_bu
     return resale_price
 
 
+def calculate_soft_market_price(
+    search_identity: str,
+    listings: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Calculate soft market price from current bids as a conservative ceiling.
+    
+    CRITICAL CONSTRAINTS:
+    - Requires ≥2 listings with bids
+    - Uses median(current_bid × time_adjustment)
+    - Acts as CEILING ONLY (never increases resale)
+    - Conservative time adjustments
+    - Aggregates by AI-normalized search_identity (same as Websearch)
+    
+    Args:
+        search_identity: AI-normalized product identity (same as Websearch uses)
+        listings: All listings for this search identity
+    
+    Returns:
+        Dict with soft_market_price, confidence, sample_count, or None if insufficient data
+    """
+    if not search_identity:
+        return None
+    
+    valid_samples = []
+    missing_hours_count = 0
+    
+    for listing in listings:
+        # Match by search_identity (AI-normalized, not variant_key)
+        if listing.get("search_identity") != search_identity:
+            continue
+        
+        current_bid = listing.get("current_price_ricardo")
+        bids_count = listing.get("bids_count") or 0
+        hours_remaining = listing.get("hours_remaining")
+        
+        # Defensive: handle missing hours_remaining
+        if hours_remaining is None or hours_remaining >= 999:
+            hours_remaining = 999
+            missing_hours_count += 1
+        
+        # Require actual bids (not just starting price)
+        if not current_bid or current_bid <= 0 or bids_count == 0:
+            continue
+        
+        # Time adjustment: conservative multipliers for auction rise
+        if hours_remaining < 6:
+            time_factor = 1.00  # Ending very soon, minimal rise expected
+        elif hours_remaining < 24:
+            time_factor = 1.05  # Ending soon, small rise
+        else:
+            time_factor = 1.10  # Early/mid stage, moderate rise
+        
+        adjusted_bid = current_bid * time_factor
+        valid_samples.append(adjusted_bid)
+    
+    # Log if hours_remaining was unavailable for some listings
+    if missing_hours_count > 0 and len(valid_samples) > 0:
+        print(f"   ⚠️ SOFT MARKET: hours_remaining unavailable for {missing_hours_count} listing(s) – proceeding with conservative time adjustment (1.10x)")
+    
+    # Require at least 2 samples for soft market pricing
+    if len(valid_samples) < 2:
+        return None
+    
+    # Calculate median (robust to outliers)
+    valid_samples.sort()
+    median_idx = len(valid_samples) // 2
+    if len(valid_samples) % 2 == 0:
+        soft_price = (valid_samples[median_idx-1] + valid_samples[median_idx]) / 2
+    else:
+        soft_price = valid_samples[median_idx]
+    
+    # Confidence based on sample size
+    if len(valid_samples) >= 5:
+        confidence = 0.70
+    elif len(valid_samples) >= 3:
+        confidence = 0.60
+    else:
+        confidence = 0.50
+    
+    return {
+        'soft_market_price': soft_price,
+        'confidence': confidence,
+        'sample_count': len(valid_samples),
+        'samples': valid_samples,  # For observability
+    }
+
+
+def apply_soft_market_cap(
+    result: Dict[str, Any],
+    soft_market_data: Dict[str, Any],
+    search_identity: str,
+) -> Dict[str, Any]:
+    """
+    Apply soft market cap to deal evaluation (CEILING ONLY).
+    
+    CRITICAL CONSTRAINTS:
+    - NEVER increases resale price
+    - NEVER increases profit
+    - NEVER creates new BUY deals
+    - Only downgrades (BUY→WATCH, WATCH→SKIP)
+    - Reduces confidence when cap is applied
+    - Penalizes score based on cap severity
+    
+    Args:
+        result: Deal evaluation result
+        soft_market_data: Soft market price data
+        search_identity: AI-normalized product identity (same as Websearch)
+    
+    Returns:
+        Modified result (or unchanged if cap not needed)
+    """
+    if not soft_market_data:
+        return result
+    
+    soft_price = soft_market_data['soft_market_price']
+    soft_confidence = soft_market_data['confidence']
+    sample_count = soft_market_data['sample_count']
+    
+    original_resale = result.get('resale_price_est')
+    if not original_resale or original_resale <= 0:
+        return result
+    
+    # Safety factor: allow 10% above soft price (conservative buffer)
+    safety_factor = 1.10
+    soft_cap = soft_price * safety_factor
+    
+    # CRITICAL: Only apply if current estimate EXCEEDS soft cap
+    if original_resale <= soft_cap:
+        return result  # No change needed
+    
+    # Calculate cap impact
+    cap_reduction_pct = (original_resale - soft_cap) / original_resale * 100
+    
+    # Apply cap (CEILING ONLY)
+    result['resale_price_est'] = soft_cap
+    result['market_value'] = soft_cap
+    
+    # Recalculate profit (will be lower or negative)
+    purchase_price = result.get('predicted_final_price') or result.get('buy_now_price') or 0
+    if purchase_price > 0:
+        # Inline profit calculation to avoid circular import
+        result['expected_profit'] = round(soft_cap * (1 - 0.10) - purchase_price - 10.0, 2)
+    
+    # Reduce confidence (system is less certain)
+    if result.get('prediction_confidence'):
+        result['prediction_confidence'] *= 0.70
+    
+    # Penalize score based on cap severity
+    if cap_reduction_pct > 50:
+        score_penalty = 2.0  # Severe cap
+    elif cap_reduction_pct > 30:
+        score_penalty = 1.5  # Significant cap
+    elif cap_reduction_pct > 15:
+        score_penalty = 1.0  # Moderate cap
+    else:
+        score_penalty = 0.5  # Minor cap
+    
+    result['deal_score'] = max(1.0, result.get('deal_score', 5.0) - score_penalty)
+    
+    # Add metadata for observability
+    result['soft_market_cap_applied'] = True
+    result['soft_market_price'] = soft_price
+    result['soft_market_confidence'] = soft_confidence
+    result['soft_market_samples'] = sample_count
+    result['cap_reduction_pct'] = cap_reduction_pct
+    result['original_resale_before_cap'] = original_resale
+    
+    # Update price source to reflect soft market influence
+    original_source = result.get('price_source', 'unknown')
+    result['price_source_original'] = original_source
+    result['price_source'] = f"{original_source}_soft_capped"
+    
+    # CRITICAL: Strategy must NEVER upgrade
+    # Only allow downgrades: BUY→WATCH, WATCH→SKIP
+    current_strategy = result.get('recommended_strategy', 'skip')
+    
+    # Calculate avg_bid for structured info
+    samples = soft_market_data.get('samples', [])
+    avg_bid = sum(samples) / len(samples) if samples else 0
+    
+    # Structured soft market info for strategy_reason (with search_identity for observability)
+    soft_market_info = f" | soft_market_cap: applied | identity={search_identity} | soft_market_price: {soft_price:.2f} | samples: {sample_count} | avg_bid: {avg_bid:.2f}"
+    
+    # If profit is now below minimum, force SKIP
+    if result.get('expected_profit', 0) < 10.0:
+        result['recommended_strategy'] = 'skip'
+        result['strategy_reason'] = f"Below min profit after soft market cap ({result.get('expected_profit', 0):.2f} CHF){soft_market_info}"
+    # If margin is now unrealistic, force SKIP
+    elif purchase_price > 0:
+        profit_margin_pct = (result.get('expected_profit', 0) / purchase_price) * 100
+        if profit_margin_pct > 30:
+            result['recommended_strategy'] = 'skip'
+            result['strategy_reason'] = f"Unrealistic margin after soft market cap ({profit_margin_pct:.1f}% > 30%){soft_market_info}"
+    # Downgrade BUY to WATCH (more conservative)
+    elif current_strategy == 'buy_now':
+        result['recommended_strategy'] = 'watch'
+        result['strategy_reason'] = f"Downgraded to WATCH due to soft market cap (conf: {result.get('prediction_confidence', 0):.2f}){soft_market_info}"
+    else:
+        # Append soft market info to existing strategy_reason
+        existing_reason = result.get('strategy_reason', '')
+        if existing_reason and not existing_reason.endswith(soft_market_info):
+            result['strategy_reason'] = existing_reason + soft_market_info
+    
+    return result
+
+
 def calculate_market_resale_from_listings(
     variant_key: str,
     listings: List[Dict[str, Any]],
@@ -1781,7 +1988,12 @@ def calculate_market_resale_from_listings(
     ua: str = None,
     variant_new_price: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Calculate market resale price from auction listings."""
+    """
+    PHASE 4.2: Calculate market resale price from auction listings.
+    
+    Note: variant_key parameter is now used as identity_key for aggregation.
+    This allows cross-variant aggregation (e.g., 128GB + 256GB together).
+    """
     if not variant_key:
         return None
     
@@ -1795,8 +2007,10 @@ def calculate_market_resale_from_listings(
     price_samples = []
     buy_now_ceiling = None
     
+    # PHASE 4.2: Filter by identity_key instead of variant_key for cross-variant aggregation
     for listing in listings:
-        if listing.get("variant_key") != variant_key:
+        listing_identity = listing.get("_identity_key")
+        if not listing_identity or listing_identity != variant_key:
             continue
         
         current = listing.get("current_price_ricardo")
@@ -2011,7 +2225,14 @@ def calculate_market_resale_from_listings(
 
 
 def calculate_all_market_resale_prices(listings: List[Dict[str, Any]], variant_new_prices: Optional[Dict[str, float]] = None, unrealistic_floor: float = 10.0, typical_multiplier: float = 5.0, context=None, ua: str = None, query_analysis: Optional[Dict] = None) -> Dict[str, Dict[str, Any]]:
-    variant_keys = set(l.get("variant_key") for l in listings if l.get("variant_key"))
+    """
+    PHASE 4.2: Aggregate market prices by canonical_identity_key.
+    
+    This allows listings with different storage/color to aggregate together.
+    Example: iPhone 12 mini 128GB + iPhone 12 mini 256GB → same market price pool
+    """
+    # PHASE 4.2: Group by canonical_identity_key instead of variant_key
+    identity_keys = set(l.get("_identity_key") for l in listings if l.get("_identity_key"))
     variant_new_prices = variant_new_prices or {}
     reference_price = _get_new_price_estimate(query_analysis)
     
@@ -2019,12 +2240,17 @@ def calculate_all_market_resale_prices(listings: List[Dict[str, Any]], variant_n
         unrealistic_floor = _get_min_realistic_price(query_analysis)
     
     results = {}
-    for vk in variant_keys:
-        variant_new = variant_new_prices.get(vk)
-        market_data = calculate_market_resale_from_listings(vk, listings, reference_price, unrealistic_floor, context, ua, variant_new)
+    for identity_key in identity_keys:
+        # Use first variant_key for new price lookup (backwards compatibility)
+        matching_listings = [l for l in listings if l.get("_identity_key") == identity_key]
+        first_variant_key = matching_listings[0].get("variant_key") if matching_listings else None
+        variant_new = variant_new_prices.get(first_variant_key) if first_variant_key else None
+        
+        # Calculate market data using canonical identity (aggregates across variants)
+        market_data = calculate_market_resale_from_listings(identity_key, listings, reference_price, unrealistic_floor, context, ua, variant_new)
         if market_data:
-            results[vk] = market_data
-            print(f"   📊 Market: {vk} = {market_data['resale_price']} CHF ({market_data['source']})")
+            results[identity_key] = market_data
+            print(f"   📊 Market: {identity_key} = {market_data['resale_price']} CHF ({market_data['source']}, {len(matching_listings)} variants)")
     
     return results
 # ==============================================================================
@@ -2154,7 +2380,8 @@ def fetch_variant_info_batch(variant_keys: List[str], car_model: str = DEFAULT_C
         for vk in need_new_price:
             web_result = web_results.get(vk)
 
-            if web_result and web_result.get("new_price"):
+            # FIX 2: Websearch success = numeric price returned (not None)
+            if web_result and web_result.get("new_price") is not None and web_result.get("new_price") > 0:
                 new_price = web_result["new_price"]
                 price_source = web_result.get("price_source", PRICE_SOURCE_WEB_SINGLE)
                 
@@ -2819,7 +3046,6 @@ def calculate_deal_score(expected_profit: float, purchase_price: float, resale_p
     # Clamp score to 0-10 range
     return max(0.0, min(10.0, score))
 
-
 # MAIN EVALUATION FUNCTION
 # ==============================================================================
 
@@ -2841,6 +3067,8 @@ def evaluate_listing_with_ai(
     batch_bundle_result: Optional[Dict] = None,
     variant_info_by_key: Optional[Dict[str, Dict]] = None,
     quantity: int = 1,
+    all_listings_for_variant: Optional[List[Dict[str, Any]]] = None,
+    search_identity: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     v7.0: Main evaluation function with Claude-based AI.
@@ -3027,6 +3255,53 @@ def evaluate_listing_with_ai(
         unit_resale = result["resale_price_est"]
         result["resale_price_est"] = round(unit_resale * quantity, 2)
     
+    # SOFT MARKET PRICING: Apply conservative market reality cap
+    # Uses AI-normalized search_identity (same as Websearch) for consistent aggregation
+    # Only applies if hard market pricing is unavailable and we have ≥2 listings with bids
+    if search_identity and all_listings_for_variant and not result.get("market_based_resale"):
+        soft_market_data = calculate_soft_market_price(search_identity, all_listings_for_variant)
+        if soft_market_data:
+            # Apply soft market cap (CEILING ONLY - never increases profit)
+            result = apply_soft_market_cap(result, soft_market_data, search_identity)
+            
+            # Observability logging
+            if result.get('soft_market_cap_applied'):
+                # Calculate avg_bid for logging
+                samples = soft_market_data.get('samples', [])
+                avg_bid = sum(samples) / len(samples) if samples else 0
+                
+                print(f"   🟡 SOFT MARKET CAP APPLIED")
+                print(f"      identity={search_identity}")
+                print(f"      soft_price={result.get('soft_market_price', 0):.2f}")
+                print(f"      samples={result.get('soft_market_samples', 0)}")
+                print(f"      avg_bid={avg_bid:.2f}")
+                print(f"      original_resale={result.get('original_resale_before_cap', 0):.2f}")
+        else:
+            # Guard log: soft market skipped
+            listings_with_bids = sum(1 for l in all_listings_for_variant if l.get('bids_count', 0) > 0)
+            if listings_with_bids > 0:
+                print(f"   ⚪ SOFT MARKET SKIPPED: reason=insufficient_bid_samples (need ≥2, have {listings_with_bids})")
+                print(f"      identity={search_identity}")
+    elif search_identity and not result.get("market_based_resale"):
+        # Guard log: no search identity listings available
+        if all_listings_for_variant is None:
+            print(f"   ⚪ SOFT MARKET SKIPPED: reason=no_listings_fetched")
+            print(f"      identity={search_identity}")
+        elif len(all_listings_for_variant) == 0:
+            print(f"   ⚪ SOFT MARKET SKIPPED: reason=no_persisted_listings_for_identity")
+            print(f"      identity={search_identity}")
+    
+    # CRITICAL: Preserve soft market marker before strategy determination
+    # Bug fix: determine_strategy() overwrites strategy_reason, losing soft market marker
+    soft_market_marker = ""
+    if result.get('soft_market_cap_applied'):
+        # Extract soft market marker from current strategy_reason
+        current_reason = result.get('strategy_reason', '')
+        if ' | soft_market_cap:' in current_reason:
+            marker_start = current_reason.find(' | soft_market_cap:')
+            soft_market_marker = current_reason[marker_start:]
+            print(f"   💾 SOFT MARKET MARKER PRESERVED: {soft_market_marker[:80]}...")
+    
     # Determine effective purchase price
     is_auction = current_price is not None and buy_now_price is None
     has_buy_now = buy_now_price is not None
@@ -3114,51 +3389,6 @@ def evaluate_listing_with_ai(
                 result["new_price"] = bundle_new
                 result["price_source"] = PRICE_SOURCE_BUNDLE_AGGREGATE
     
-    # FIX #1: QUERY BASELINE FALLBACK - Final safety net to prevent NULL/0 resale prices
-    # If ALL price sources failed (web, AI, market, buy_now, bundle), use query baseline
-    # This ensures data quality: prefer rough but realistic values over NULL/0
-    if not result["resale_price_est"] or result["resale_price_est"] <= 0:
-        baseline_new = _get_new_price_estimate(query_analysis)
-        baseline_resale_rate = _get_resale_rate(query_analysis)
-        
-        # Apply quantity for single products (bundles already handled)
-        if not result.get("is_bundle"):
-            result["new_price"] = round(baseline_new, 2)
-            result["resale_price_est"] = round(baseline_new * baseline_resale_rate * quantity, 2)
-        else:
-            # For bundles, use baseline without quantity multiplication
-            result["new_price"] = round(baseline_new, 2)
-            result["resale_price_est"] = round(baseline_new * baseline_resale_rate, 2)
-        
-        result["price_source"] = PRICE_SOURCE_QUERY_BASELINE
-        print(f"   ⚠️ Query baseline fallback: new={result['new_price']:.2f}, resale={result['resale_price_est']:.2f} CHF")
-    
-    # Calculate profit
-    if result["resale_price_est"] and purchase_price:
-        result["expected_profit"] = calculate_profit(result["resale_price_est"], purchase_price)
-    
-    # SAFEGUARD 2: PROFIT MARGIN CAP (≤30% for Swiss market reality)
-    if result["expected_profit"] and purchase_price and purchase_price > 0:
-        profit_margin_pct = (result["expected_profit"] / purchase_price) * 100
-        MAX_REALISTIC_MARGIN_PCT = 30.0  # Swiss second-hand market reality (reduced from 50%)
-        
-        if profit_margin_pct > MAX_REALISTIC_MARGIN_PCT:
-            print(f"   🚫 MARGIN CAP: {profit_margin_pct:.1f}% margin exceeds realistic max ({MAX_REALISTIC_MARGIN_PCT:.0f}%) - marking as skip")
-            result["recommended_strategy"] = "skip"
-            result["strategy_reason"] = f"Unrealistic profit margin ({profit_margin_pct:.0f}% > {MAX_REALISTIC_MARGIN_PCT:.0f}%)"
-            result["deal_score"] = 0.0
-            result["expected_profit"] = 0.0  # Zero out unrealistic profit
-            return result
-    
-    # SAFEGUARD 3: MINIMUM PROFIT THRESHOLD (10 CHF)
-    MIN_PROFIT_CHF = 10.0
-    if result["expected_profit"] and result["expected_profit"] < MIN_PROFIT_CHF:
-        print(f"   ⚠️ MIN PROFIT: {result['expected_profit']:.2f} CHF below threshold ({MIN_PROFIT_CHF:.0f} CHF) - marking as skip")
-        result["recommended_strategy"] = "skip"
-        result["strategy_reason"] = f"Profit below minimum threshold ({result['expected_profit']:.2f} < {MIN_PROFIT_CHF:.0f} CHF)"
-        result["deal_score"] = 0.0
-        return result
-    
     # Determine strategy
     strategy, reason = determine_strategy(
         expected_profit=result["expected_profit"],
@@ -3170,6 +3400,12 @@ def evaluate_listing_with_ai(
     )
     result["recommended_strategy"] = strategy
     result["strategy_reason"] = reason
+    
+    # CRITICAL: Re-append soft market marker after strategy determination
+    # This ensures soft market effects are persisted to DB
+    if soft_market_marker:
+        result["strategy_reason"] = result["strategy_reason"] + soft_market_marker
+        print(f"   ✅ SOFT MARKET MARKER RESTORED: strategy_reason now contains soft_market_cap marker")
     
     # Calculate deal score
     result["deal_score"] = calculate_deal_score(
@@ -3242,7 +3478,6 @@ def evaluate_listing_with_ai(
         result.get("market_sample_size", 0),
         result.get("market_source")
     )
-    
     # OBSERVABILITY: Append confidence to strategy_reason (no behavior change)
     if price_confidence < 0.60:
         result["strategy_reason"] += f" [conf: {price_confidence:.2f}]"
@@ -3250,13 +3485,26 @@ def evaluate_listing_with_ai(
     # Build AI notes
     notes = []
     if result["market_based_resale"]:
-        notes.append(f"📈 Market ({result['market_sample_size']} samples)")
+        notes.append(f" Market ({result['market_sample_size']} samples)")
     if result["is_bundle"]:
-        notes.append(f"📦 Bundle ({len(result.get('bundle_components', []))} items)")
+        notes.append(f" Bundle ({len(result.get('bundle_components', []))} items)")
     if result["price_source"].startswith("web_"):
-        notes.append(f"🌐 Web price ({result['price_source']})")
+        notes.append(f" Web price ({result['price_source']})")
     notes.append(f"Strategy: {strategy}")
     result["ai_notes"] = " | ".join(notes)
+    
+    # DEFENSIVE ASSERTION: Verify soft market marker persistence
+    # This ensures the persistence bug is caught if it reoccurs
+    if result.get('soft_market_cap_applied'):
+        final_reason = result.get('strategy_reason', '')
+        if 'soft_market_cap' not in final_reason:
+            print(f"   ASSERT FAILED: soft_market applied but strategy_reason missing marker!")
+            print(f"      strategy_reason: {final_reason}")
+            print(f"      This indicates a persistence bug - marker was lost before DB write")
+            # Force marker back in as emergency fallback
+            if soft_market_marker:
+                result['strategy_reason'] = final_reason + soft_market_marker
+                print(f"      Emergency fix applied: marker restored")
     
     return result
 

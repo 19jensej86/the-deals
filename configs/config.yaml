@@ -87,12 +87,10 @@ search:
   # - Clear product identification (model numbers, generations)
   # - Realistic profit potential (15-25% margins typical)
   queries:
-    - "Apple iPhone 12 mini 128GB" # High liquidity, clear model, stable pricing
-    - "Apple AirPods Pro 2" # Very liquid, high demand, good margins
-    - "Samsung Galaxy Watch 4" # Popular wearable, clear generation
-    - "Sony WH-1000XM4" # Premium headphones, well-defined model
-    - "Apple iPad 9th Gen" # Mainstream tablet, clear generation
-    - "Garmin Fenix 6 Pro" # Premium fitness watch, stable resale
+    - "Bosch Schlagbohrmaschine"
+    - "LEGO Star Wars Millennium Falcon"
+    - "Nike Air Zoom Pegasus 39"
+    - "Canon EOS R6 Mark II"
 
 # =================================================
 # AI Configuration - v7.0 CLAUDE
