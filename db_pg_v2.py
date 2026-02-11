@@ -1417,6 +1417,14 @@ def save_evaluation(conn, data: Dict[str, Any]) -> Dict[str, int]:
     # ---------------------------------------------------------------------------
     product_id = None
     variant_key = data.get("variant_key")
+    identity_key = data.get("_identity_key")
+    
+    # CRITICAL FIX: Ensure variant_key is never NULL
+    # If variant_key is missing but identity_key exists, use identity_key as variant_key
+    # This ensures variant_key persistence even when extraction fails
+    if not variant_key and identity_key:
+        variant_key = identity_key
+        print(f"   🔧 DB PERSIST FIX: Using identity_key as variant_key ('{variant_key}')")
     
     if variant_key:
         # Try to resolve existing product
@@ -1448,6 +1456,15 @@ def save_evaluation(conn, data: Dict[str, Any]) -> Dict[str, int]:
     # ---------------------------------------------------------------------------
     # PHASE 4.3: Persist both identity_key and variant_key
     identity_key = data.get("_identity_key")  # Canonical identity (no storage/color)
+    
+    # PHASE 1 VALIDATION: Ensure identity_key is NEVER NULL
+    # This is critical for cross-run aggregation and soft market pricing
+    if not identity_key or identity_key == 'None':
+        raise ValueError(
+            f"❌ SIGNAL INTEGRITY ERROR: identity_key is NULL for listing '{source_id}'\n"
+            f"   Title: {title[:100]}\n"
+            f"   This breaks cross-run aggregation. Check fallback logic in main.py."
+        )
     
     listing_id = upsert_listing(
         conn,

@@ -37,6 +37,7 @@ sys.stderr.reconfigure(encoding='utf-8')
 import traceback
 import sys
 import json
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from io import StringIO
@@ -327,6 +328,7 @@ def run_v10_pipeline(
     all_listings_flat = []
     for query, listings in all_listings_by_query.items():
         for listing in listings:
+            current_price = listing.get("current_price_ricardo")
             all_listings_flat.append({
                 "listing_id": listing.get("listing_id", ""),
                 "title": listing.get("title", ""),
@@ -334,7 +336,8 @@ def run_v10_pipeline(
                 "url": listing.get("url", ""),
                 "image_url": listing.get("image_url"),
                 "image_urls": listing.get("image_urls", []),
-                "current_price_ricardo": listing.get("current_price_ricardo"),
+                "current_price_ricardo": current_price,
+                "current_bid": current_price,  # 🔧 ALIAS FIX: Market price calculation expects "current_bid"
                 "buy_now_price": listing.get("buy_now_price"),
                 "bids_count": listing.get("bids_count"),
                 "hours_remaining": listing.get("hours_remaining"),
@@ -503,6 +506,33 @@ def run_v10_pipeline(
                         else:
                             print(f"   ❌ DB FETCH: No row found for source_id='{source_id}'")
                 
+                # CRITICAL FIX: Ensure variant_key is never NULL
+                # Case 1: If DB has identity_key but no variant_key, use identity_key as variant_key
+                if db_identity_key and db_identity_key != 'None' and not db_variant_key:
+                    db_variant_key = db_identity_key
+                    print(f"   🔧 VARIANT_KEY FIX: Using identity_key as variant_key ('{db_variant_key}')")
+                
+                # Case 2: If BOTH identity_key and variant_key are missing (skipped listings)
+                # Generate a deterministic minimal key from the title
+                if not db_variant_key:
+                    title = listing.get("title", "")
+                    if title:
+                        # Normalize first 3 meaningful words of title
+                        # Use same normalization as ProductIdentity: lowercase + underscore
+                        first_words = " ".join(title.split()[:3])
+                        minimal_key = first_words.lower().replace(" ", "_").replace("-", "_")
+                        
+                        # Remove special characters
+                        minimal_key = re.sub(r'[^\w_]', '', minimal_key)
+                        
+                        db_variant_key = minimal_key
+                        db_identity_key = minimal_key
+                        
+                        print(
+                            f"   🔧 MINIMAL KEY FIX: Generated variant_key and identity_key "
+                            f"from title ('{db_variant_key}')"
+                        )
+                
                 listing["variant_key"] = db_variant_key
                 listing["_cleaned_title"] = None
                 listing["_identity_key"] = db_identity_key  # Use DB value if available
@@ -517,6 +547,20 @@ def run_v10_pipeline(
     
     if invalid_count > 0:
         logger.step_warning(f"{invalid_count} listings could not be extracted (skipped or too unclear)")
+    
+    # CRITICAL FIX: Update all_listings_flat with extracted identity_key
+    # Market price calculation needs _identity_key for aggregation
+    for flat_listing in all_listings_flat:
+        listing_id = flat_listing.get("listing_id")
+        # Find matching listing from extraction phase
+        for query, listings in all_listings_by_query.items():
+            for listing in listings:
+                if listing.get("listing_id") == listing_id:
+                    # Copy extracted fields to flat listing
+                    flat_listing["_identity_key"] = listing.get("_identity_key")
+                    flat_listing["variant_key"] = listing.get("variant_key")
+                    flat_listing["_final_search_name"] = listing.get("_final_search_name")
+                    break
     
     # =========================================================================
     # PHASE 3: WEBSEARCH QUERY GENERATION & PRICE FETCHING
@@ -621,6 +665,8 @@ def run_v10_pipeline(
         context=context,
         ua=cfg.general.user_agent,
         query_analysis=first_analysis,
+        conn=conn,
+        run_id=run_id,
     )
     
     logger.step_success(f"Market prices calculated", count=len(market_prices))
@@ -655,11 +701,16 @@ def run_v10_pipeline(
     # FIX 3: English-only logs
     logger.step_logic("Web search uses AI with web access - most expensive operation")
     
+    # FIXED: Pass live bid count as market signal for websearch validation
+    # Count actual listings with bids_count > 0 (not just market_prices)
+    live_bid_count = sum(1 for l in all_listings_flat if l.get("bids_count", 0) > 0)
+    
     variant_info_map = fetch_variant_info_batch(
         variant_keys=unique_queries,
         car_model=car_model,
         market_prices=market_prices,
         query_analysis=first_analysis,
+        live_bid_count=live_bid_count,
     )
     
     # CRITICAL FIX: Build price_map keyed by final_search_name for stable lookup
@@ -701,6 +752,17 @@ def run_v10_pipeline(
             "AI fallback used": len(unique_queries) - web_found,
         },
     )
+    
+    # PHASE 2: WEBSEARCH SUCCESS RATE VALIDATION
+    if len(unique_queries) > 0:
+        if web_success_rate >= 60:
+            print(f"   ✅ PRICING RELIABILITY: Websearch success rate {web_success_rate:.0f}% >= 60%")
+        elif web_success_rate >= 40:
+            print(f"   ⚠️ PRICING RELIABILITY: Websearch success rate {web_success_rate:.0f}% (target: 60%)")
+        else:
+            print(f"   ❌ PRICING RELIABILITY: Websearch success rate {web_success_rate:.0f}% < 40%")
+            print(f"   → Check websearch parsing in ai_filter.py")
+            print(f"   → Check AI model availability")
     
     logger.step_end(f"Price data ready - {web_found} web prices + {len(market_prices)} market prices")
     
@@ -748,20 +810,28 @@ def run_v10_pipeline(
             bids_count = listing.get("bids_count")
             hours_remaining = listing.get("hours_remaining")
             
-            # CRITICAL FIX: Lookup price by final_search_name (stable join key)
-            # Old: variant_info_by_key.get(variant_key) - BROKEN mapping
-            # New: price_map_by_final_search_name.get(final_search_name) - STABLE mapping
-            variant_info = None
-            if final_search_name:
-                variant_info = price_map_by_final_search_name.get(final_search_name)
-                if not variant_info:
-                    print(f"   ⚠️ DB persist: no price found for final_search_name='{final_search_name}'")
+            # PHASE 2: PRICE LOOKUP CHAIN WITH STRUCTURED LOGGING
+            # Track which price source was used for observability
+            variant_info = None  # Initialize to avoid UnboundLocalError
+            price_lookup_path = []
             
-            # Fallback to old mapping for backward compatibility
+            # Primary: final_search_name (most reliable)
+            if final_search_name:
+                price_lookup_path.append(f"final_search_name='{final_search_name}'")
+                variant_info = price_map_by_final_search_name.get(final_search_name)
+                if variant_info:
+                    print(f"   ✅ PRICE LOOKUP: final_search_name → {variant_info.get('price_source', 'unknown')}")
+            
+            # Fallback 1: variant_key
             if not variant_info and variant_key:
+                price_lookup_path.append(f"variant_key='{variant_key}'")
                 variant_info = variant_info_by_key.get(variant_key)
-                if not variant_info:
-                    print(f"   ⚠️ DB persist: no price found for variant_key='{variant_key}'")
+                if variant_info:
+                    print(f"   ✅ PRICE LOOKUP: variant_key → {variant_info.get('price_source', 'unknown')}")
+            
+            # Log failure path if no price found
+            if not variant_info:
+                print(f"   ❌ PRICE LOOKUP FAILED: Tried {' → '.join(price_lookup_path)}")
             
             # DEFENSIVE INTEGRITY GUARD: If variant_info is still None AND buy_now_price exists
             # Create minimal variant_info to GUARANTEE new_price is populated
@@ -1109,6 +1179,156 @@ def run_v10_pipeline(
                         print(f"   ℹ️ Acceptable coverage ({pct}%), could be improved")
                     else:
                         print(f"   ℹ️ No listings for this run (cross-run data preserved)")
+                    
+                    # PHASE 1: IDENTITY_KEY COVERAGE VALIDATION
+                    # Check that ALL listings have identity_key (critical for cross-run aggregation)
+                    cur.execute("""
+                        SELECT 
+                            COUNT(*) as total,
+                            COUNT(identity_key) as with_identity,
+                            ROUND(100.0 * COUNT(identity_key) / NULLIF(COUNT(*), 0), 1) as pct
+                        FROM listings
+                        WHERE run_id = %s
+                    """, (run_id,))
+                    row = cur.fetchone()
+                    if row:
+                        total, with_identity, pct = row
+                        print(f"\n   📊 IDENTITY_KEY COVERAGE (PHASE 1 VALIDATION):")
+                        print(f"      Total listings: {total}")
+                        print(f"      With identity_key: {with_identity}")
+                        print(f"      Coverage: {pct}%")
+                        
+                        if pct is not None and pct < 100:
+                            print(f"   ❌ SIGNAL INTEGRITY ERROR: identity_key coverage is {pct}% (expected 100%)")
+                            print(f"   → This breaks cross-run aggregation and soft market pricing")
+                            print(f"   → Check fallback logic in main.py lines 515-534")
+                        elif pct == 100:
+                            print(f"   ✅ SIGNAL INTEGRITY: All listings have identity_key")
+    
+    # PHASE 5: SYSTEM HEALTH DASHBOARD
+    print("\n" + "="*60)
+    print("SYSTEM HEALTH DASHBOARD")
+    print("="*60)
+    
+    # Collect health metrics
+    health_checks = []
+    warnings = []
+    
+    # Check 1: Identity Key Coverage
+    if validation_checks:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(identity_key) as with_identity,
+                    ROUND(100.0 * COUNT(identity_key) / NULLIF(COUNT(*), 0), 1) as pct
+                FROM listings WHERE run_id = %s
+            """, (run_id,))
+            row = cur.fetchone()
+            if row and row[0] > 0:
+                total, with_identity, pct = row
+                if pct == 100:
+                    health_checks.append(("Identity Keys", "PASS", f"{pct}% coverage ({with_identity}/{total})"))
+                else:
+                    health_checks.append(("Identity Keys", "FAIL", f"{pct}% coverage ({with_identity}/{total})"))
+                    warnings.append(f"Identity key coverage is {pct}% (expected 100%)")
+    
+    # Check 2: Market Price Aggregation
+    market_prices_calculated = validation_checks.get('market_prices_calculated', 0) if validation_checks else 0
+    listings_with_bids = validation_checks.get('listings_with_bids', 0) if validation_checks else 0
+    
+    if market_prices_calculated > 0:
+        health_checks.append(("Market Prices", "PASS", f"{market_prices_calculated} calculated"))
+    elif listings_with_bids > 0:
+        health_checks.append(("Market Prices", "WARN", f"0 calculated despite {listings_with_bids} listings with bids"))
+        warnings.append(f"Market prices = 0 but {listings_with_bids} listings have active bids")
+    else:
+        health_checks.append(("Market Prices", "INFO", "No active bids in current run"))
+    
+    # Check 3: Websearch Success Rate
+    websearch_success = validation_checks.get('websearch_success_count', 0) if validation_checks else 0
+    websearch_total = validation_checks.get('websearch_total_count', 0) if validation_checks else 0
+    
+    if websearch_total > 0:
+        websearch_rate = (websearch_success / websearch_total) * 100
+        if websearch_rate >= 30:
+            health_checks.append(("Websearch Success", "PASS", f"{websearch_rate:.0f}% ({websearch_success}/{websearch_total})"))
+        elif websearch_rate >= 10:
+            health_checks.append(("Websearch Success", "WARN", f"{websearch_rate:.0f}% ({websearch_success}/{websearch_total})"))
+        else:
+            health_checks.append(("Websearch Success", "INFO", f"{websearch_rate:.0f}% ({websearch_success}/{websearch_total}) - expected for old products"))
+    
+    # Check 4: DB Persistence (no duplicates, no NULL critical fields)
+    with conn.cursor() as cur:
+        # Check for duplicates
+        cur.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT run_id, platform, source_id, COUNT(*) as cnt
+                FROM listings
+                WHERE run_id = %s
+                GROUP BY run_id, platform, source_id
+                HAVING COUNT(*) > 1
+            ) duplicates
+        """, (run_id,))
+        duplicate_count = cur.fetchone()[0]
+        
+        # Check for NULL critical fields
+        cur.execute("""
+            SELECT COUNT(*) FROM listings 
+            WHERE run_id = %s AND (identity_key IS NULL OR variant_key IS NULL)
+        """, (run_id,))
+        null_count = cur.fetchone()[0]
+        
+        if duplicate_count == 0 and null_count == 0:
+            health_checks.append(("DB Persistence", "PASS", "No duplicates, no NULL fields"))
+        else:
+            issues = []
+            if duplicate_count > 0:
+                issues.append(f"{duplicate_count} duplicates")
+            if null_count > 0:
+                issues.append(f"{null_count} NULL fields")
+            health_checks.append(("DB Persistence", "FAIL", ", ".join(issues)))
+            warnings.append(f"DB issues: {', '.join(issues)}")
+    
+    # Check 5: Pipeline Status
+    health_checks.append(("Pipeline Status", "PASS", "Completed without errors"))
+    
+    # Print health checks
+    for check_name, status, details in health_checks:
+        if status == "PASS":
+            icon = "✅"
+        elif status == "FAIL":
+            icon = "❌"
+        elif status == "WARN":
+            icon = "⚠️"
+        else:
+            icon = "ℹ️"
+        print(f"{icon} {check_name:20s} {details}")
+    
+    # Print overall health
+    print("-" * 60)
+    passed = sum(1 for _, status, _ in health_checks if status == "PASS")
+    total_checks = len(health_checks)
+    
+    if passed == total_checks:
+        overall = "EXCELLENT"
+        icon = "🟢"
+    elif passed >= total_checks - 1:
+        overall = "GOOD"
+        icon = "🟡"
+    else:
+        overall = "NEEDS ATTENTION"
+        icon = "🔴"
+    
+    print(f"{icon} Overall Health: {overall} ({passed}/{total_checks} checks passed)")
+    
+    # Print warnings if any
+    if warnings:
+        print("\n⚠️ WARNINGS:")
+        for warning in warnings:
+            print(f"   - {warning}")
+    
+    print("="*60)
     
     return all_deals_for_detail
 

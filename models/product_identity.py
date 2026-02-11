@@ -16,20 +16,64 @@ from models.product_spec import ProductSpec
 @dataclass
 class ProductIdentity:
     """
-    Stable product identity for deduplication.
+    Two-Level Identity Model for Product Deduplication and Market Aggregation.
+    ===========================================================================
+    
+    This class generates TWO distinct identity keys:
+    
+    1. product_key (persisted as variant_key in DB):
+       - Exact SKU-level identity
+       - Includes brand + model + ALL price-relevant specs
+       - Used for: deduplication, component pricing, bundles
+       - Example: "apple_iphone_12_mini_128GB" or "bosch_psb_550_re_18V"
+    
+    2. canonical_identity_key (persisted as identity_key in DB):
+       - Market-level identity
+       - Includes brand + model + market-defining specs ONLY
+       - Excludes variant-level specs (storage, screen size, color, condition)
+       - Used for: market aggregation, soft market pricing, competitive analysis
+       - Example: "apple_iphone_12_mini" or "bosch_psb_550_re_18V"
+    
+    Market-Defining vs Variant-Level Specs:
+    ----------------------------------------
+    Market-defining specs = specs that change buyer use-case or market segment
+      - voltage (18V vs 12V tools = different markets)
+      - power_w (550W vs 750W = different tiers)
+      - weight_kg (20kg vs 40kg plates = different products)
+      - capacity_l (5L vs 10L = different use cases)
+    
+    Variant-level specs = specs that differentiate SKUs within same market
+      - storage_gb (128GB vs 256GB iPhone = same market, different SKUs)
+      - screen_size_inch (6.1" vs 6.7" = same model family)
+      - color (Black vs White = same product)
+    
+    Why Both Keys Are Needed:
+    -------------------------
+    - variant_key: "What exact product is this?" (for pricing, deduplication)
+    - identity_key: "What market does this compete in?" (for aggregation)
+    
+    Example:
+    --------
+    iPhone 12 mini 128GB Black:
+      variant_key = "apple_iphone_12_mini_128GB"  (exact SKU)
+      identity_key = "apple_iphone_12_mini"       (market group)
+    
+    Bosch PSB 550 RE 18V:
+      variant_key = "bosch_psb_550_re_18V"  (exact SKU)
+      identity_key = "bosch_psb_550_re_18V" (market group - voltage is market-defining)
     
     RULE: Generated from ProductSpec, NOT from Query or Domain.
     RULE: Specs included because EXPLICITLY mentioned, not category-based.
     """
     
     # === IDENTIFICATION ===
-    product_key: str                        # Stable hash for deduplication
-    # Format: "{brand}_{model}_{specs}" or "{product_type}_{specs}"
+    product_key: str                        # Exact SKU identity (variant_key in DB)
+    # Format: "{brand}_{model}_{all_specs}"
     # Examples:
     # "garmin_forerunner_970"
     # "hantelscheibe_40kg"
-    # "iphone_12_mini_64gb"
-    # "reifen_winter_18zoll"
+    # "iphone_12_mini_128GB"
+    # "bosch_psb_550_re_18V"
     # "tasche"  # If no Brand/Model/Specs
     
     # === COMPONENTS ===
@@ -234,110 +278,91 @@ class ProductIdentity:
     @staticmethod
     def infer_brand(model_or_type: str) -> str:
         """
-        PHASE 4.2: Infer brand from model name using deterministic rules.
+        DEPRECATED: Brand inference removed - AI extraction handles this.
         
-        Examples:
-        - "iphone 12" -> "apple"
-        - "galaxy watch" -> "samsung"
-        - "pixel 7" -> "google"
+        The AI (Claude/GPT) already knows:
+        - iPhone → Apple
+        - Galaxy → Samsung
+        - Pixel → Google
+        - Fenix → Garmin
+        
+        If AI didn't extract brand, it's not clear enough from the listing.
+        No fallback needed - trust AI judgment.
         """
-        text_lower = model_or_type.lower()
-        
-        # Deterministic brand inference rules
-        BRAND_RULES = {
-            "apple": ["iphone", "ipad", "airpods", "macbook", "apple watch", "imac"],
-            "samsung": ["galaxy"],
-            "google": ["pixel"],
-            "sony": ["playstation", "wh-1000"],
-            "garmin": ["fenix", "forerunner", "vivoactive"],
-            "bose": ["quietcomfort", "soundlink"],
-        }
-        
-        for brand, keywords in BRAND_RULES.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    return brand
-        
+        # No hardcoded rules - AI handles brand extraction
         return None
     
     def get_canonical_identity_key(self) -> str:
         """
-        PHASE 4.2: Generate canonical identity key - SINGLE SOURCE OF TRUTH.
+        Generate market-level identity key (identity_key in DB).
         
-        Format: brand_model_tier_generation (underscore-separated)
+        This groups variants that compete in the same market for aggregation and
+        soft market pricing.
         
-        Rules:
-        - Include: brand (inferred if missing), model, tier (mini/pro/max), generation
-        - Exclude: storage, color, condition, marketing terms
-        - Normalize: generations to gen_X format
+        Includes:
+        - Brand (AI-extracted only - no fallback inference)
+        - Model
+        - ALL specs from AI extraction (AI already filters to price-relevant)
+        
+        Excludes:
+        - Color (filtered out below)
+        - Condition (filtered out below)
+        - Clothing sizes (already filtered in from_product_spec)
+        - Marketing noise (filtered out below)
         
         Examples:
-        - "Apple iPhone 12 mini 128GB" -> "apple_iphone_12_mini"
-        - "iPhone 12 Pro Max" -> "apple_iphone_12_pro_max"
-        - "AirPods Pro (2nd Generation)" -> "apple_airpods_pro_gen_2"
+        - "Apple iPhone 12 mini 128GB" -> "apple_iphone_12_mini_128GB"
+        - "Bosch PSB 550 RE 18V" -> "bosch_psb_550_re_18V"
+        - "Gym 80 Hantelscheiben 40kg" -> "gym_80_hantelscheiben_40kg"
+        
+        CRITICAL: No hardcoded spec lists. AI extraction determines price relevance.
+        If AI extracted a spec, it's price-relevant for that product category.
         """
-        # Start with websearch_base (brand + model/type)
-        original = self.websearch_base.lower()
-        base = original
+        parts = []
         
-        # Extract numeric tokens from original for corruption detection
-        original_numbers = set(re.findall(r'\b\d+\b', original))
+        # Brand (AI-extracted only - trust AI judgment)
+        if self.brand_normalized:
+            parts.append(self.brand_normalized)
+        # No fallback inference - if AI didn't extract brand, it's not clear enough
         
-        # Normalize generations
-        base = self.normalize_generation(base)
+        # Model (or product type if no model)
+        if self.model_normalized:
+            parts.append(self.model_normalized)
+        else:
+            parts.append(self.type_normalized)
         
-        # Remove color terms (not price-relevant)
+        # ALL specs from AI extraction
+        # AI already filtered to price-relevant specs in extraction prompt
+        # No hardcoded list needed - works for ANY product category
+        for spec_value in self.specs_normalized.values():
+            parts.append(spec_value)
+        
+        # Join parts
+        canonical = "_".join(parts)
+        
+        # Normalize generations (e.g., "2nd generation" -> "gen_2")
+        canonical = self.normalize_generation(canonical)
+        
+        # Remove color terms (not market-defining)
         color_terms = ["schwarz", "weiss", "rot", "blau", "grün", "gelb", "grau", 
                        "black", "white", "red", "blue", "green", "yellow", "gray", "grey",
                        "silber", "silver", "gold", "rosa", "pink"]
         for color in color_terms:
-            base = re.sub(r'\b' + color + r'\b', '', base)
+            canonical = re.sub(r'\b' + color + r'\b', '', canonical, flags=re.IGNORECASE)
         
-        # Remove condition terms
-        condition_terms = ["neu", "new", "gebraucht", "used", "wie neu", "ovp"]
+        # Remove condition terms (not market-defining)
+        condition_terms = ["neu", "new", "gebraucht", "used", "wie_neu", "ovp"]
         for cond in condition_terms:
-            base = re.sub(r'\b' + cond + r'\b', '', base)
+            canonical = re.sub(r'\b' + cond + r'\b', '', canonical, flags=re.IGNORECASE)
         
         # Remove marketing noise
         noise = ["top", "super", "mega", "original", "!!!"]
         for n in noise:
-            base = base.replace(n, '')
+            canonical = canonical.replace(n, '')
         
-        # Clean up whitespace
-        base = ' '.join(base.split())
-        
-        # SAFETY GUARD: Verify no numeric corruption occurred
-        result_numbers = set(re.findall(r'\b\d+\b', base))
-        
-        # Check if any original numbers were corrupted (shortened or changed)
-        for orig_num in original_numbers:
-            # Skip if this was a generation number (now converted to gen_X)
-            if f'gen_{orig_num}' in base:
-                continue
-            
-            # Check if the number is still present
-            if orig_num not in result_numbers:
-                # CORRUPTION DETECTED - fallback to safe identity
-                print(f"   🚨 IDENTITY CORRUPTION DETECTED!")
-                print(f"      Original: {original}")
-                print(f"      Corrupted: {base}")
-                print(f"      Missing number: {orig_num}")
-                print(f"      Fallback: using websearch_base as-is")
-                return original.replace(' ', '_').strip()
-        
-        # PHASE 4.2: Infer brand if missing
-        if not self.brand_normalized:
-            inferred_brand = self.infer_brand(base)
-            if inferred_brand:
-                # Prepend brand if not already present
-                if not base.startswith(inferred_brand):
-                    base = f"{inferred_brand} {base}"
-        
-        # Convert to underscore-separated format (canonical format)
-        canonical = base.replace(' ', '_').replace('-', '_')
-        
-        # Remove duplicate underscores
+        # Clean up: normalize separators and remove duplicates
+        canonical = canonical.replace(' ', '_').replace('-', '_')
         while '__' in canonical:
             canonical = canonical.replace('__', '_')
         
-        return canonical.strip('_')
+        return canonical.strip('_').lower()

@@ -95,6 +95,15 @@ except ImportError:
     def get_cache_stats():
         return DummyCacheStats()
 
+# Import cache helper functions
+from ai_filter_cache_helpers import (
+    get_cached_web_price,
+    set_cached_web_price,
+    get_cached_variant_info,
+    set_cached_variant_info,
+    load_caches as load_cache_helpers
+)
+
 
 # ==============================================================================
 # v7.0: CLIENT INITIALIZATION - Claude PRIMARY, OpenAI fallback
@@ -171,7 +180,11 @@ _web_price_cache: Dict[str, Dict] = {}
 
 RICARDO_FEE_PERCENT = 0.10
 SHIPPING_COST_CHF = 0.0
-MIN_PROFIT_THRESHOLD = 20.0
+
+# PHASE 6: VALIDATION GATE - Minimum Profit Threshold
+# Ensures only deals with sufficient profit are recommended
+# Enforced in determine_strategy() - deals below this threshold are marked as "skip"
+MIN_PROFIT_THRESHOLD = 20.0  # CHF
 
 BUNDLE_ENABLED = True
 BUNDLE_DISCOUNT_PERCENT = 0.10
@@ -578,6 +591,58 @@ def _call_claude_with_retry(
             else:
                 print(f"   ⚠️ Claude error: {e}")
                 return None
+def extract_json_array_from_text(text: str):
+    """Robust JSON array extraction from LLM response text.
+    
+    Handles:
+    - Markdown fences (```json ... ```)
+    - Leading/trailing explanations
+    - Single object instead of array
+    - JSON embedded in text
+    
+    Returns:
+        List of dicts if successful, None if parsing fails
+    """
+    import json
+    import re
+    
+    # 1. Remove markdown fences
+    text = re.sub(r"```(?:json)?", "", text)
+    text = text.replace("```", "").strip()
+    
+    # 2. Try direct parse first
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            return [parsed]
+    except Exception:
+        pass
+    
+    # 3. Extract first JSON array via regex
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    
+    # 4. Extract first JSON object and wrap into array
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return [parsed]
+        except Exception:
+            pass
+    
+    return None
+
+
 def search_web_batch_for_new_prices(
     variant_keys: List[str],
     category: str = "unknown",
@@ -882,22 +947,18 @@ Bei unbekannt: prices=[], conf=0"""
             add_cost(COST_CLAUDE_WEB_SEARCH)
             WEB_SEARCH_COUNT_TODAY += 1
             
-            # Parse JSON array response
-            json_match = re.search(r'\[\s\S]*\]', raw)
-            if not json_match:
-                print(f"   ❌ WEBSEARCH FAILED: No JSON array in response")
-                print(f"   → Falling back to query_baseline (no AI fallback)")
-                continue
+            # Parse JSON array response with robust extraction
+            parsed = extract_json_array_from_text(raw)
             
-            try:
-                parsed = json.loads(json_match.group(0))
-            except json.JSONDecodeError as e:
-                print(f"   ❌ WEBSEARCH FAILED: JSON parse error: {e}")
-                print(f"   Raw JSON (first 500 chars): {json_match.group(0)[:500]}")
+            if parsed is None:
+                print(f"   WEBSEARCH PARSE ERROR")
+                print(f"   Raw preview: {raw[:500]}")
                 print(f"   → Falling back to query_baseline (no AI fallback)")
                 # CRITICAL: Do NOT trigger AI fallback - it will also fail and waste money
                 # Empty results will cause caller to use query_baseline (free, deterministic)
                 continue
+            
+            print(f"   WEBSEARCH PARSE SUCCESS: {len(parsed)} items")
             
             for item in parsed:
                 nr = item.get("nr", 0) - 1  # Convert to 0-indexed
@@ -1101,13 +1162,17 @@ def fetch_variant_info_batch(
     variant_keys: List[str],
     car_model: str = DEFAULT_CAR_MODEL,
     market_prices: Optional[Dict[str, Dict[str, Any]]] = None,
-    query_analysis: Optional[Dict] = None
+    query_analysis: Optional[Dict] = None,
+    live_bid_count: int = 0
 ) -> Dict[str, Dict[str, Any]]:
     """
     Fetch variant info (new price, resale, transport) for multiple variants.
     
     TASK 3: AI FALLBACK REMOVED
     Flow: market_price → live_bid_floor → websearch (if gated) → query_baseline (FINAL)
+    
+    Args:
+        live_bid_count: Count of listings with bids_count > 0 (market signal for websearch validation)
     """
     if not variant_keys:
         return {}
@@ -1147,11 +1212,9 @@ def fetch_variant_info_batch(
 
             # TASK 2: Pass market signal metrics for gating
             market_prices_count = len([v for v in variant_keys if v in market_prices])
-            # Count listings with bids from market_prices data
-            listings_with_bids = sum(
-                market_prices[v].get('sample_size', 0) 
-                for v in variant_keys if v in market_prices
-            )
+            # FIXED: Use live_bid_count from main.py (actual listings with bids_count > 0)
+            # This promotes live bids to valid market signals for websearch validation
+            listings_with_bids = live_bid_count
             
             # v7.3.3: Pass query_analysis for better search term cleaning
             web_results = search_web_batch_for_new_prices(
@@ -1232,19 +1295,49 @@ def calculate_market_resale_from_listings(
     # Filter listings by identity_key
     matching = [l for l in listings if l.get("_identity_key") == identity_key]
     
+    print(f"         🔍 Filtering {len(listings)} listings for identity_key='{identity_key}'")
+    print(f"         Matching listings: {len(matching)}")
+    
     if not matching:
+        print(f"         ❌ No matching listings found")
         return None
     
-    # Collect bid samples
+    # Collect bid samples with smart filtering
+    # Strategy: Accept active auctions (bids_count > 0) with low floor (5 CHF)
+    #           Accept starting bids (bids_count = 0) with high floor (unrealistic_floor)
     samples = []
+    rejected_count = 0
+    ACTIVE_AUCTION_MIN_PRICE = 5.0  # Low floor for auctions with active bids
+    
     for listing in matching:
         bid = listing.get("current_bid")
         bids_count = listing.get("bids_count", 0)
         
-        if bid and bid >= unrealistic_floor and bids_count > 0:
+        if not bid:
+            rejected_count += 1
+            print(f"         ❌ Rejected: bid={bid}, bids_count={bids_count}, reason=no_bid")
+            continue
+        
+        # Accept if: Active auction (bids_count > 0) with reasonable price
+        if bids_count > 0 and bid >= ACTIVE_AUCTION_MIN_PRICE:
             samples.append(bid)
+            print(f"         ✅ Sample: bid={bid} CHF, bids_count={bids_count} (active auction)")
+        # Accept if: Starting bid (bids_count = 0) but high enough to be realistic
+        elif bids_count == 0 and bid >= unrealistic_floor:
+            samples.append(bid)
+            print(f"         ✅ Sample: bid={bid} CHF, bids_count={bids_count} (high starting bid)")
+        else:
+            rejected_count += 1
+            if bids_count > 0:
+                reason = f"below_active_floor (bid={bid} < {ACTIVE_AUCTION_MIN_PRICE})"
+            else:
+                reason = f"below_starting_floor (bid={bid} < {unrealistic_floor})"
+            print(f"         ❌ Rejected: bid={bid}, bids_count={bids_count}, reason={reason}")
+    
+    print(f"         Valid samples: {len(samples)}, Rejected: {rejected_count}")
     
     if len(samples) < 2:
+        print(f"         ❌ Insufficient samples ({len(samples)} < 2 required)")
         return None
     
     # Calculate median
@@ -1265,11 +1358,14 @@ def calculate_all_market_resale_prices(
     typical_multiplier: float = 5.0,
     context=None,
     ua: str = None,
-    query_analysis: Optional[Dict] = None
+    query_analysis: Optional[Dict] = None,
+    conn=None,
+    run_id: str = None
 ) -> Dict[str, Dict[str, Any]]:
     """
     PHASE 4.2: Aggregate market prices by canonical_identity_key.
     
+    Uses cross-run DB data for each identity_key to enable market price aggregation.
     This allows listings with different storage/color to aggregate together.
     Example: iPhone 12 mini 128GB + iPhone 12 mini 256GB → same market price pool
     """
@@ -1281,24 +1377,63 @@ def calculate_all_market_resale_prices(
     if query_analysis:
         unrealistic_floor = _get_min_realistic_price(query_analysis)
     
+    # DEBUG: Market price aggregation diagnostics
+    print(f"\n🔍 MARKET PRICE AGGREGATION DEBUG:")
+    print(f"   Total listings: {len(listings)}")
+    print(f"   Unique identity_keys: {len(identity_keys)}")
+    print(f"   Unrealistic floor: {unrealistic_floor} CHF")
+    print(f"   Identity keys: {list(identity_keys)[:5]}...") if len(identity_keys) > 5 else print(f"   Identity keys: {list(identity_keys)}")
+    
     results = {}
     for identity_key in identity_keys:
+        print(f"\n   🔑 Processing identity_key: '{identity_key}'")
+        
         # Use first variant_key for new price lookup (backwards compatibility)
         matching_listings = [l for l in listings if l.get("_identity_key") == identity_key]
+        print(f"      Current run listings: {len(matching_listings)}")
+        
         first_variant_key = matching_listings[0].get("variant_key") if matching_listings else None
         variant_new = variant_new_prices.get(first_variant_key) if matching_listings else None
         
+        # CROSS-RUN FIX: Fetch persisted DB listings for this identity_key
+        # This enables market price aggregation across runs (same as soft market)
+        if conn and run_id:
+            from db_pg_v2 import get_listings_by_search_identity
+            db_listings = get_listings_by_search_identity(conn, run_id, identity_key)
+            print(f"      DB listings fetched: {len(db_listings)}")
+            
+            # Combine current run + persisted listings
+            all_listings_for_identity = matching_listings + db_listings
+            
+            # 🔍 OBSERVABILITY: Market aggregation sample validation
+            unique_source_ids = len(set(
+                l.get("listing_id") for l in all_listings_for_identity
+                if l.get("listing_id") is not None
+            ))
+            
+            print(f"      📊 MARKET SAMPLE STATS:")
+            print(f"         Raw samples: {len(all_listings_for_identity)}")
+            print(f"         Unique listings: {unique_source_ids}")
+        else:
+            # Fallback: use only current run listings
+            all_listings_for_identity = matching_listings
+            print(f"      ⚠️ No DB connection - using only current run listings")
+        
         # Calculate market data using canonical identity (aggregates across variants)
-        market_data = calculate_market_resale_from_listings(identity_key, listings, reference_price, unrealistic_floor, context, ua, variant_new)
+        market_data = calculate_market_resale_from_listings(identity_key, all_listings_for_identity, reference_price, unrealistic_floor, context, ua, variant_new)
         if market_data:
             results[identity_key] = market_data
-            print(f"   Market: {identity_key} = {market_data['resale_price']} CHF ({market_data['source']}, {len(matching_listings)} variants)")
+            sample_count = market_data.get('sample_size', 0)
+            print(f"      ✅ Market price calculated: {market_data['resale_price']} CHF ({sample_count} samples)")
+        else:
+            print(f"      ❌ No market price calculated (insufficient samples)")
     
     return results
 
 
 def _fetch_variant_info_from_ai_batch(variant_keys: List[str], car_model: str = DEFAULT_CAR_MODEL, market_prices: Optional[Dict[str, Dict[str, Any]]] = None, query_analysis: Optional[Dict] = None) -> Dict[str, Dict[str, Any]]:
     """AI-based variant info estimation (fallback when web search fails)."""
+    # ... (rest of the code remains the same)
     if not variant_keys or is_budget_exceeded():
         return {}
     
@@ -1968,9 +2103,47 @@ def apply_soft_market_cap(
 # ==============================================================================
 
 def calculate_profit(resale_price: float, purchase_price: float) -> float:
+    """
+    Calculate expected profit after fees and shipping.
+    
+    VALIDATION GATE: Ensures positive prices before calculation.
+    """
     if resale_price <= 0 or purchase_price <= 0:
         return 0.0
     return round(resale_price * (1 - RICARDO_FEE_PERCENT) - purchase_price - SHIPPING_COST_CHF, 2)
+
+
+def validate_price_sanity(new_price: Optional[float], resale_price: Optional[float], context: str = "") -> bool:
+    """
+    PHASE 6: VALIDATION GATE - Price Sanity Checks
+    
+    Ensures pricing data is logically consistent:
+    - Resale price must be <= new price (used items can't cost more than new)
+    - Both prices must be positive if present
+    
+    Args:
+        new_price: New/retail price
+        resale_price: Expected resale/used price
+        context: Where this validation is happening (for logging)
+    
+    Returns:
+        True if prices are valid, False otherwise
+    """
+    if new_price is not None and new_price <= 0:
+        print(f"   VALIDATION FAILED ({context}): new_price={new_price} must be positive")
+        return False
+    
+    if resale_price is not None and resale_price <= 0:
+        print(f"   VALIDATION FAILED ({context}): resale_price={resale_price} must be positive")
+        return False
+    
+    # Critical check: Resale can never exceed new price
+    if new_price and resale_price and resale_price > new_price:
+        print(f"   VALIDATION FAILED ({context}): resale_price={resale_price:.2f} > new_price={new_price:.2f}")
+        print(f"      This violates basic economics (used > new). Capping resale to 85% of new.")
+        return False
+    
+    return True
 
 
 def determine_strategy(expected_profit: float, is_auction: bool, has_buy_now: bool, bids_count: int = 0, hours_remaining: float = None, is_bundle: bool = False) -> Tuple[str, str]:
@@ -2187,9 +2360,14 @@ def evaluate_listing_with_ai(
         if result["price_source"] == PRICE_SOURCE_AI_ESTIMATE:
             print(f"   AI estimate discounted 50%: {result['resale_price_est']:.2f} CHF (unreliable)")
     
-    # PHASE 4.1c: HARD SANITY CAPS
+    # PHASE 6: VALIDATION GATE - Price Sanity Checks
     if result["resale_price_est"] and result["new_price"]:
-        # Cap 1: Resale price ≤ 70% of new price (used items reality)
+        # Validate prices are logically consistent
+        if not validate_price_sanity(result["new_price"], result["resale_price_est"], context="deal_evaluation"):
+            # Validation failed - cap resale to 85% of new price
+            result["resale_price_est"] = result["new_price"] * 0.85
+        
+        # Additional cap: Resale price ≤ 70% of new price (used items reality)
         max_resale = result["new_price"] * 0.70
         if result["resale_price_est"] > max_resale:
             print(f"   SANITY CAP: Resale {result['resale_price_est']:.2f} > 70% of new {result['new_price']:.2f}, capping to {max_resale:.2f}")
