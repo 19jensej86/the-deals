@@ -1,14 +1,15 @@
 """
-Config Loader - v7.0 (Claude Edition + Detail Scraping)
-=======================================================
+Config Loader - v8.0 (Stabilized Edition)
+==========================================
 Loads configuration from configs/config.yaml with support for:
-- Database settings (including clear_on_start)
-- Cache settings (enabled, clear_on_start)
-- Profit settings (fees, shipping, threshold)
-- Bundle detection settings
-- AI settings (Claude PRIMARY, OpenAI fallback)
-- Web Search settings
-- Detail page scraping settings (NEW)
+- Database settings (PostgreSQL connection, clear_on_start)
+- Cache settings (enabled, expiry days per type)
+- Profit settings (fees, shipping, min threshold)
+- Bundle detection settings (currently disabled)
+- AI settings (Claude primary, OpenAI fallback)
+- Web Search settings (preferred shops)
+- Detail page scraping settings
+- Runtime mode (testing/prod)
 """
 
 import os

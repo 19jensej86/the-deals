@@ -1,32 +1,30 @@
 """
-DealFinder Main Pipeline - v7.2 (Improved Accessory Filter)
-============================================================
-Changes from v7.1:
-- HARDCODED accessory pre-filter BEFORE AI-generated keywords
-- Query-aware: "Armband" query won't filter armbands
-- Category-aware: Fitness "Set" = bundle, not accessory!
-- Position-aware: "Armband für Garmin" vs "Garmin mit Armband"
-- Better statistics: shows how many filtered by each method
+DealFinder Main Pipeline - v8.0 (Stabilized Edition)
+=====================================================
+v8.0 Changes:
+- 6-phase stabilization complete (signal integrity, pricing, persistence, observability, validation)
+- System health dashboard with automated checks
+- Price sanity validation gates
+- Cross-run market aggregation via identity_key
+- Cleaned up dead code and outdated documentation
 
 Pipeline Steps:
 1. Load config
 2. Connect to database (auto-migrate schema)
-3. Optionally clear DB (testing mode)
-4. Analyze all queries with AI (cached 30 days)
-5. Start browser
-6. For each query:
+3. Analyze all queries with AI (cached 30 days)
+4. Start browser
+5. For each query:
    a. Scrape Ricardo SERP
-   b. PRE-FILTER 1: Hardcoded accessory detection (v7.2!)
-   c. PRE-FILTER 2: AI-generated accessory keywords
-   d. PRE-FILTER 3: Defect keywords
-   e. Cluster listings into variants
-   f. Calculate market resale from auctions with bids
-   g. Fetch variant info (new prices, transport)
-   h. Evaluate each listing (with global sanity checks!)
-   i. Save to database
-7. Scrape detail pages for top deals
-8. Generate HTML report
-9. Show AI cost summary
+   b. Pre-filter: accessories, defects, exclusions
+   c. AI extraction: brand, model, specs
+   d. Identity key generation for cross-run aggregation
+   e. Calculate market resale from auction bids
+   f. Fetch new prices via web search
+   g. Evaluate each listing with validation gates
+   h. Save to database
+6. Scrape detail pages for top deals
+7. System health dashboard
+8. Cost summary
 """
 
 # FIX 1: Configure UTF-8 output for Windows PowerShell (MUST be first)

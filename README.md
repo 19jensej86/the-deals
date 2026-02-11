@@ -1,6 +1,6 @@
 # 🎯 DealFinder - Intelligent Ricardo.ch Deal Scanner
 
-**Version 7.2** - AI-Powered Arbitrage Deal Finder for Swiss Online Marketplace
+**Version 8.0** - AI-Powered Arbitrage Deal Finder for Swiss Online Marketplace
 
 DealFinder automatically scans Ricardo.ch (Swiss auction platform) to identify profitable resale opportunities using AI, web scraping, and market data analysis.
 

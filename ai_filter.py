@@ -1,39 +1,33 @@
 """
-AI Filter & Evaluation - v7.3.5 (Optimized Edition)
-====================================================
-MAJOR CHANGES in v7.3.5:
-- Bundle component web search with caching
-- Cache statistics tracking
-- Optimized logging
+AI Filter & Evaluation - v8.0 (Stabilized Edition)
+===================================================
+v8.0 Changes:
+- Price sanity validation gates (resale <= new price)
+- Minimum profit threshold enforced (20 CHF)
+- Cross-run market aggregation via identity_key
+- Soft market pricing with DB persistence
+- Improved observability and logging
 
-MAJOR CHANGES in v7.0:
+AI Configuration:
+- Claude Haiku: Fast extraction
+- Claude Sonnet: Web search for new prices
+- OpenAI: Automatic fallback
 
-1. CLAUDE PRIMARY - OpenAI fallback
-   - All AI calls use Claude (Haiku for speed, Sonnet for web search)
-   - Automatic fallback to OpenAI if Claude unavailable
+Pricing Priority Chain:
+1. learned_market (from products.resale_estimate)
+2. market_auction (calculated from bid data)
+3. web_single/web_median (from web search)
+4. current_bid_floor (if bids_count > 0)
+5. ai_estimate (discounted 50%)
+6. query_baseline (category-based fallback)
 
-2. REAL WEB SEARCH (THE GAME CHANGER!)
-   - Uses Claude Sonnet + web_search tool
-   - Actually searches Digitec, Galaxus, etc.
-   - 85-90% success rate (vs 16% with GPT memory)
-   - Cached for 60 days
+Validation Gates:
+- Price sanity: resale <= new price
+- Profit threshold: minimum 20 CHF
+- Sample requirements: >= 2 for market pricing
 
-3. All v6.8 features preserved:
-   - Weight-based pricing for fitness equipment
-   - Bundle detection with vision
-   - Market-based pricing from Ricardo auctions
-   - Variant clustering
-   - Deal score calculation
-
-PRICING PHILOSOPHY (unchanged):
-==============================
-1. AUCTION DATA > AI ESTIMATES (always)
-2. More bids = more trust (20+ bids = fully trusted)
-3. Buy-now ceiling is a CEILING, not a floor
-4. Each variant has its own reference price
-5. Used items max 70% of THEIR new price
-6. Premium brands/materials = higher new prices
-7. Fitness equipment = always check visually for quantity
+Bundle Support: DISABLED (bundles_disabled=True)
+- Code preserved for future Phase 3 implementation
 """
 
 import os
