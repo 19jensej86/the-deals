@@ -6,8 +6,39 @@ Determines next steps based on confidence thresholds.
 CRITICAL: Conservative escalation, explicit skip reasons.
 """
 
+import re
 from models.extracted_product import ExtractedProduct
 from models.bundle_types import BundleType
+
+
+# Bundle detection keywords (German + English)
+BUNDLE_KEYWORDS = [
+    "set", "paket", "bundle", "lot", "konvolut", "sammlung",
+    "2x", "3x", "4x", "5x", "6x", "10x", "paar", "stück",
+    "inkl", "inklusive", "mit", "plus", "und", "&",
+]
+
+
+def _looks_like_bundle(title: str, description: str = "") -> bool:
+    """Quick regex check if listing might be a bundle."""
+    text = f"{title} {description}".lower()
+    
+    # Exclude quantity patterns like "2 Stk. à 2.5kg"
+    if re.search(r'\d+\s*stk\.?\s*[àax@]\s*\d+', text):
+        return False
+    
+    # Check for bundle keywords
+    for kw in BUNDLE_KEYWORDS:
+        if kw in text:
+            if kw in ["stück", "stk"] and not re.search(r'\d+\s*(stück|stk)\s+\w+', text):
+                continue
+            return True
+    
+    # Quantity pattern with multiple items
+    if re.search(r'\b(\d+)\s*(x|pcs|pieces?)\b', text):
+        return True
+    
+    return False
 
 
 class ConfidenceThresholds:
@@ -28,7 +59,10 @@ class ConfidenceThresholds:
 
 def decide_next_step(
     extracted: ExtractedProduct,
-    phase: str
+    phase: str,
+    title: str = "",
+    description: str = "",
+    bundle_always_scrape_detail: bool = True
 ) -> str:
     """
     Determines next step based on confidence and phase.
@@ -36,6 +70,9 @@ def decide_next_step(
     Args:
         extracted: Extracted product data
         phase: Current phase ("initial", "after_detail", "after_vision")
+        title: Listing title for bundle pattern detection
+        description: Listing description for bundle pattern detection
+        bundle_always_scrape_detail: If True, always scrape detail for bundles
     
     Returns:
         Next step: "pricing", "detail", "vision", "skip"
@@ -44,6 +81,11 @@ def decide_next_step(
     
     if phase == "initial":
         # After first AI extraction
+        
+        # BUNDLE FEATURE: Always scrape detail for listings that look like bundles
+        # This ensures we get full component info before extraction
+        if bundle_always_scrape_detail and _looks_like_bundle(title, description):
+            return "detail"  # Force detail scraping for potential bundles
         
         # FIX 4: Bundles with empty components MUST have detail scraping
         if extracted.bundle_type != BundleType.SINGLE_PRODUCT:

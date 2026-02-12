@@ -10,7 +10,7 @@ general:
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
   request_timeout_sec: 18
   max_pages_list: 1
-  max_listings_per_query: 8
+  max_listings_per_query: 3 # Reduced for bundle test - only need 1-2 listings
   exclude_terms: ["defekt", "kaputt", "ersatzteil", "bastler", "für bastler"]
   autoclean_days: 30
   car_model: "VW Touran"
@@ -73,10 +73,11 @@ profit:
   min_profit_threshold: 10.0 # Minimum 10 CHF profit required
 
 bundle:
-  enabled: false # DISABLED - bundles out of scope
+  enabled: true # v10: Bundle feature now active
   discount_percent: 0.10
   min_component_value: 10.0
-  use_vision_for_unclear: false
+  use_vision_for_unclear: true # Use vision if component extraction is uncertain
+  always_scrape_detail: true # Always fetch detail page for bundles to get more info
 
 search:
   # PROD QUERIES - High-quality liquid products (NO bundles/sets)
@@ -87,10 +88,7 @@ search:
   # - Clear product identification (model numbers, generations)
   # - Realistic profit potential (15-25% margins typical)
   queries:
-    - "Bosch Schlagbohrmaschine"
-    - "LEGO Star Wars Millennium Falcon"
-    - "Nike Air Zoom Pegasus 39"
-    - "Canon EOS R6 Mark II"
+    - "Squat Rack inkl. Langhantel"
 
 # =================================================
 # AI Configuration - v7.0 CLAUDE

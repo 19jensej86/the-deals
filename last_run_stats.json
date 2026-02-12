@@ -1,8 +1,8 @@
 {
-  "export_time": "2026-02-01T23:23:50.347824",
+  "export_time": "2026-02-12T09:35:51.709085",
   "run_metadata": {
-    "id": "92860930-a82c-4c5f-99a3-d72f616092a5",
-    "started_at": "2026-02-01 23:18:38.612323+01:00",
+    "id": "851e0fbb-25bd-4a0d-8141-90bb4667732b",
+    "started_at": "2026-02-12 09:34:49.051766+01:00",
     "finished_at": null,
     "status": "running",
     "mode": "prod",
@@ -16,20 +16,17 @@
     "error_message": null
   },
   "deal_statistics": {
-    "total_deals": 48,
-    "profitable_deals": 1,
+    "total_deals": 0,
+    "profitable_deals": 0,
     "very_profitable_deals": 0,
-    "avg_profit": "-137.36",
-    "max_profit": "26.75",
-    "min_profit": "-1045.55"
+    "avg_profit": null,
+    "max_profit": null,
+    "min_profit": null
   },
   "bundle_statistics": {
-    "total_bundles": 0,
-    "profitable_bundles": 0,
-    "avg_bundle_profit": null
+    "total_bundles": 1,
+    "profitable_bundles": 1,
+    "avg_bundle_profit": "39.53"
   },
-  "strategy_breakdown": {
-    "skip": 47,
-    "watch": 1
-  }
+  "strategy_breakdown": {}
 }

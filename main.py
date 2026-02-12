@@ -908,21 +908,28 @@ def run_v10_pipeline(
                 quantity=quantity,
                 all_listings_for_variant=all_listings_for_variant,
                 search_identity=search_identity,  # AI-normalized identity for Soft Market
+                conn=conn,  # Database connection for bundle pricing
+                run_id=run_id,  # Run ID for bundle pricing
             )
             
             # Log result with comprehensive details for analysis
-            profit = ai_result.get("expected_profit", 0)
-            score = ai_result.get("deal_score", 0)
-            strategy = ai_result.get("recommended_strategy", 'skip')
-            price_source = ai_result.get("price_source", "unknown")
+            profit = ai_result.get("expected_profit") or 0.0
+            score = ai_result.get("deal_score")
+            strategy = ai_result.get("recommended_strategy") or 'skip'
+            price_source = ai_result.get("price_source") or "unknown"
             is_bundle = ai_result.get("is_bundle", False)
-            new_price = ai_result.get("new_price", 0)
-            resale_price = ai_result.get("resale_price_est", 0)
+            new_price = ai_result.get("new_price") or 0.0
+            resale_price = ai_result.get("resale_price_est") or 0.0
+            
+            # DEFENSIVE: Validate score is numeric before formatting
+            if score is None or not isinstance(score, (int, float)):
+                print(f"   ⚠️ SCORE MISSING: deal_score={score} for '{title[:50]}' - defaulting to 0.0")
+                score = 0.0
             
             strategy_icon = {'buy_now': '🔥', 'bid_now': '🔥', 'bid': '💰', 'watch': '👀', 'skip': '⏭️'}.get(strategy, '❓')
             # Enhanced logging for perfect analysis
             print(f"   {strategy_icon} {title}")
-            print(f"      💰 Profit: {profit or 0:.2f} CHF | 📊 Score: {score:.1f}/10 | 🏷️ Source: {price_source}")
+            print(f"      💰 Profit: {profit:.2f} CHF | 📊 Score: {score:.1f}/10 | 🏷️ Source: {price_source}")
             print(f"      💵 New: {fmt_price(new_price)} CHF | 🔄 Resale: {fmt_price(resale_price)} CHF | 📦 Bundle: {'Yes' if is_bundle else 'No'}")
             if variant_info and variant_info.get("shop_name"):
                 print(f"      🏪 Shops: {variant_info.get('shop_name')}")
@@ -1086,6 +1093,12 @@ def run_v10_pipeline(
             save_evaluation.run_metrics['total'] += 1
             if is_bundle:
                 save_evaluation.run_metrics['bundles'] += 1
+                global_stats['bundles_created'] += 1
+            
+            # Track deals and profitable deals for run statistics
+            global_stats['deals_created'] += 1
+            if profit and profit >= 20:  # Same as MIN_PROFIT_THRESHOLD
+                global_stats['profitable_deals'] += 1
             
             # Track price sources
             ps = data.get('price_source', 'unknown')
@@ -1113,6 +1126,7 @@ def run_v10_pipeline(
                     "url": listing["url"],
                     "expected_profit": profit,
                     "deal_score": ai_result.get("deal_score"),
+                    "recommended_strategy": strategy,  # Fix: include strategy for proper counting
                 })
         
         all_deals_for_detail.extend(deals_this_query)
@@ -1372,18 +1386,29 @@ def save_log_to_file(log_content: str, filename: str = "last_run.log"):
         print(f"\n⚠️ Failed to save log: {e}")
 
 
-def export_listings_to_file(conn, filename: str = "last_run_listings.json"):
-    """Export all listings from database to JSON file."""
+def export_listings_to_file(conn, filename: str = "last_run_listings.json", run_id: str = None):
+    """Export listings from database to JSON file. If run_id provided, only export that run."""
     try:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT 
-                id, run_id, platform, source_id, url, title, image_url, product_id,
-                buy_now_price, current_bid, bids_count, end_time, location,
-                shipping_cost, pickup_available, seller_rating, first_seen, last_seen
-            FROM listings
-            ORDER BY id DESC
-        """)
+        if run_id:
+            cur.execute("""
+                SELECT 
+                    id, run_id, platform, source_id, url, title, image_url, product_id,
+                    buy_now_price, current_bid, bids_count, end_time, location,
+                    shipping_cost, pickup_available, seller_rating, first_seen, last_seen
+                FROM listings
+                WHERE run_id = %s
+                ORDER BY id DESC
+            """, (run_id,))
+        else:
+            cur.execute("""
+                SELECT 
+                    id, run_id, platform, source_id, url, title, image_url, product_id,
+                    buy_now_price, current_bid, bids_count, end_time, location,
+                    shipping_cost, pickup_available, seller_rating, first_seen, last_seen
+                FROM listings
+                ORDER BY id DESC
+            """)
         
         columns = [desc[0] for desc in cur.description]
         rows = cur.fetchall()
@@ -1476,10 +1501,8 @@ def export_analysis_data(listings: list, filename: str = "analysis_data.json"):
     Export comprehensive analysis data for automatic quality assessment.
     This file contains all data needed for Cascade to analyze run quality.
     """
-    from ai_filter import (
-        RUN_COST_USD, WEB_SEARCH_COUNT_TODAY, 
-        _web_price_cache, _variant_cache
-    )
+    from ai_filter import RUN_COST_USD, WEB_SEARCH_COUNT_TODAY
+    from ai_filter_cache_helpers import _web_price_cache, _variant_cache
     
     # Calculate quality metrics
     total = len(listings)
@@ -1821,6 +1844,9 @@ def run_once():
         "skipped_defect": 0,
         "skipped_exclude": 0,
         "sent_to_ai": 0,
+        "bundles_created": 0,
+        "deals_created": 0,
+        "profitable_deals": 0,
     }
 
     try:
@@ -2062,8 +2088,8 @@ def run_once():
             # Export run statistics and metadata
             export_run_stats(conn, "last_run_stats.json")
             
-            # Legacy export (for backwards compatibility)
-            export_listings_to_file(conn, "last_run_listings.json")
+            # Legacy export (for backwards compatibility) - now filtered by run_id
+            export_listings_to_file(conn, "last_run_listings.json", run_id=run_id)
             
             # IMPROVEMENT #4: Post-run invariant checks (TEST MODE ONLY)
             try:
@@ -2085,11 +2111,11 @@ def run_once():
                 finish_run(
                     conn, run_id,
                     listings_found=global_stats.get('total_scraped', 0),
-                    deals_created=0,  # TODO: track from save_evaluation
-                    bundles_created=0,
-                    profitable_deals=0,
+                    deals_created=global_stats.get('deals_created', 0),
+                    bundles_created=global_stats.get('bundles_created', 0),
+                    profitable_deals=global_stats.get('profitable_deals', 0),
                     ai_cost_usd=cost_summary.get('total_usd', 0.0),
-                    websearch_calls=0  # TODO: track from ai_filter
+                    websearch_calls=cost_summary.get('websearch_calls', 0)
                 )
 
     except Exception as e:

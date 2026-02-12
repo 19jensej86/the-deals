@@ -9,6 +9,7 @@ from models.product_spec import ProductSpec
 from models.extracted_product import ExtractedProduct
 from models.product_identity import ProductIdentity
 from models.websearch_query import WebsearchQuery, generate_websearch_query
+from models.bundle_component import BundleComponent, BundleExtractionResult
 
 __all__ = [
     'BundleType',
@@ -19,4 +20,6 @@ __all__ = [
     'ProductIdentity',
     'WebsearchQuery',
     'generate_websearch_query',
+    'BundleComponent',
+    'BundleExtractionResult',
 ]

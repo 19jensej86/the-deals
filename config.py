@@ -66,6 +66,7 @@ class BundleConf:
     discount_percent: float = 0.10
     min_component_value: float = 10.0
     use_vision_for_unclear: bool = True
+    always_scrape_detail: bool = True  # Always fetch detail page for bundles
 
 
 @dataclass
@@ -218,6 +219,7 @@ def load_config() -> Cfg:
             discount_percent=float(bundle.get("discount_percent", 0.10)),
             min_component_value=float(bundle.get("min_component_value", 10.0)),
             use_vision_for_unclear=bundle.get("use_vision_for_unclear", True),
+            always_scrape_detail=bundle.get("always_scrape_detail", True),
         ),
         search=y.get("search", {"queries": []}),
         ai=AIConf(

@@ -1355,10 +1355,19 @@ def export_run_stats(conn, filepath: str = "last_run_stats.json"):
             print(f"   Rows: {strategy_rows}")
             strategies = {}
         
+        # Use run_data for accurate statistics instead of querying deals table
+        # (bundles are stored separately, not in deals table)
         stats = {
             'export_time': datetime.now().isoformat(),
             'run_metadata': run_data,
-            'deal_statistics': deal_stats,
+            'deal_statistics': {
+                'total_deals': run_data.get('deals_created', 0),
+                'profitable_deals': run_data.get('profitable_deals', 0),
+                'very_profitable_deals': deal_stats.get('very_profitable_deals', 0),
+                'avg_profit': deal_stats.get('avg_profit'),
+                'max_profit': deal_stats.get('max_profit'),
+                'min_profit': deal_stats.get('min_profit')
+            },
             'bundle_statistics': bundle_stats,
             'strategy_breakdown': strategies
         }

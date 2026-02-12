@@ -96,7 +96,12 @@ def process_listing(
                  products_found=len(extracted.products))
     
     # === DECISION GATE 1 ===
-    next_step = decide_next_step(extracted, phase="initial")
+    next_step = decide_next_step(
+        extracted, 
+        phase="initial",
+        title=title,
+        description=description
+    )
     
     log.log_step("decision_gate_1",
                  confidence=extracted.overall_confidence,

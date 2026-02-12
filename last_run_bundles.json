@@ -1,5 +1,30 @@
 {
-  "export_time": "2026-02-01T23:23:50.337766",
-  "total_bundles": 0,
-  "bundles": []
+  "export_time": "2026-02-12T09:35:51.691893",
+  "total_bundles": 1,
+  "bundles": [
+    {
+      "bundle_id": 2,
+      "expected_profit": "39.53",
+      "deal_score": "4.8",
+      "strategy": "watch",
+      "strategy_reason": "Watch, 62h remaining",
+      "total_cost": "193.75",
+      "total_value": "259.20",
+      "listing_id": 1013,
+      "title": "Squat Rack inkl. Langhantel, 70 kg Gewichte & Bodenmatten",
+      "url": "https://www.ricardo.ch/de/a/squat-rack-inkl-langhantel-70-kg-gewichte-bodenmatten-1310838858/",
+      "image_url": "https://img.ricardostatic.ch/images/12e469d5-021f-4373-83a9-c6b85f81b9df/t_265x200/squat-rack-inkl-langhantel-70-kg-gewichte-bodenmatten",
+      "end_time": "2026-02-14 23:10:00+01:00",
+      "location": null,
+      "seller_rating": null,
+      "user_action": null,
+      "user_notes": null,
+      "user_tags": null,
+      "item_count": 4,
+      "hours_remaining": "61.5689769388888889",
+      "profit_margin_pct": "20.40258064516129032300",
+      "run_id": "851e0fbb-25bd-4a0d-8141-90bb4667732b",
+      "evaluated_at": "2026-02-12 09:35:46.454291+01:00"
+    }
+  ]
 }

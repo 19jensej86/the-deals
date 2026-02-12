@@ -41,6 +41,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from decimal import Decimal
 
 from dotenv import load_dotenv
+from utils_text import extract_weight_kg
 
 # ==============================================================================
 # PRICE SOURCE CONSTANTS (Schema-Valid Enum)
@@ -180,11 +181,39 @@ SHIPPING_COST_CHF = 0.0
 # Enforced in determine_strategy() - deals below this threshold are marked as "skip"
 MIN_PROFIT_THRESHOLD = 20.0  # CHF
 
-BUNDLE_ENABLED = True
+BUNDLE_ENABLED = False  # Set via config.yaml
 BUNDLE_DISCOUNT_PERCENT = 0.10
 BUNDLE_MIN_COMPONENT_VALUE = 10.0
 MAX_COMPONENT_PRICE = 300.0  # Max realistic price per component (CHF)
-BUNDLE_USE_VISION = True
+BUNDLE_USE_VISION = False  # Set via config.yaml
+BUNDLE_ALWAYS_SCRAPE_DETAIL = True  # Set via config.yaml
+
+# v9.0: Fitness weight pricing constants
+WEIGHT_PLATE_KEYWORDS = [
+    "hantelscheibe", "gewicht", "plate", "scheibe", "bumper",
+    "weight", "kg", "hantel", "langhantel", "kurzhantel",
+]
+
+WEIGHT_PRICING = {
+    "bumper": {"new_price_per_kg": 6.0, "resale_rate": 0.70},
+    "gummi": {"new_price_per_kg": 5.0, "resale_rate": 0.65},
+    "guss": {"new_price_per_kg": 3.0, "resale_rate": 0.60},
+    "calibrated": {"new_price_per_kg": 12.0, "resale_rate": 0.75},
+    "standard": {"new_price_per_kg": 3.5, "resale_rate": 0.60},
+}
+
+def get_weight_type(name: str) -> str:
+    """Detect weight plate type from name for pricing."""
+    name_lower = name.lower() if name else ""
+    if "bumper" in name_lower:
+        return "bumper"
+    if "gummi" in name_lower or "rubber" in name_lower:
+        return "gummi"
+    if "guss" in name_lower or "cast" in name_lower or "eisen" in name_lower:
+        return "guss"
+    if "calibrated" in name_lower or "kalibriert" in name_lower or "competition" in name_lower:
+        return "calibrated"
+    return "standard"
 
 CACHE_ENABLED = True
 VARIANT_CACHE_DAYS = 30
@@ -299,6 +328,14 @@ def _call_claude(
             }]
         
         response = _claude_client.messages.create(**kwargs)
+        
+        # Track cost based on call type
+        if use_web_search:
+            add_cost(COST_CLAUDE_WEB_SEARCH)
+        elif image_url:
+            add_cost(COST_VISION)
+        else:
+            add_cost(COST_CLAUDE_HAIKU)
         
         # Extract text from response (handle multiple content blocks)
         result_parts = []
@@ -1922,6 +1959,175 @@ def calculate_bundle_resale(priced_components: List[Dict[str, Any]], bundle_new_
     return round(bundle_resale, 2)
 
 
+def price_bundle_components_v2(
+    components: List["BundleComponent"],
+    category: Optional[str] = None,
+    query_analysis: Optional[Dict] = None,
+    conn=None,
+    run_id: str = None,
+) -> List["BundleComponent"]:
+    """
+    v8.0: Price bundle components using market data + weight-based fallbacks.
+    
+    Pricing Priority (per component):
+    1. market_auction: Median of concurrent auctions with same identity_key
+    2. web_single: Pre-fetched new price × resale_rate
+    3. weight_based: For fitness weights (CHF/kg × weight)
+    4. ai_estimate: Fallback estimation
+    
+    Args:
+        components: List of BundleComponent objects
+        category: Product category (e.g., "fitness")
+        query_analysis: Query analysis for resale rates
+        conn: Database connection for market data lookup
+        run_id: Current run ID for market data lookup
+    
+    Returns:
+        List of BundleComponent with pricing populated
+    """
+    from models.bundle_component import BundleComponent
+    
+    resale_rate = _get_resale_rate(query_analysis)
+    is_fitness = category == "fitness" if category else False
+    
+    priced = []
+    
+    for comp in components:
+        # Skip invalid components
+        if not comp.product_type or comp.quantity <= 0:
+            print(f"      Skipping invalid component: {comp.display_name}")
+            continue
+        
+        # === PRIORITY 1: Market data lookup ===
+        market_price = None
+        if conn and run_id and comp.identity_key:
+            market_price = _get_market_price_for_component(
+                conn, run_id, comp.identity_key
+            )
+        
+        if market_price:
+            comp.resale_price = market_price["resale_price"]
+            comp.price_source = "market_auction"
+            print(f"      {comp.display_name}: {comp.resale_price:.2f} CHF (market, n={market_price.get('sample_size', 0)})")
+        
+        # === PRIORITY 2: Weight-based pricing for fitness ===
+        elif is_fitness and comp.product_type in ["hantelscheibe", "kurzhantel", "kettlebell"]:
+            weight_kg = comp.specs.get("weight_kg")
+            if weight_kg and weight_kg > 0:
+                material = comp.specs.get("material", "standard")
+                new_price = _calculate_weight_price(weight_kg, material)
+                comp.new_price = new_price
+                comp.resale_price = new_price * 0.60  # Fitness resale rate
+                comp.price_source = "weight_based"
+                print(f"      {comp.display_name}: {comp.resale_price:.2f} CHF ({weight_kg}kg × rate)")
+            else:
+                # Weight plate without weight = skip
+                print(f"      {comp.display_name}: No weight specified, skipping")
+                continue
+        
+        # === PRIORITY 3: AI estimation fallback ===
+        else:
+            est_new = _estimate_component_price(comp.display_name, category or "general", query_analysis)
+            if est_new and est_new > 0:
+                comp.new_price = est_new
+                component_resale_rate = _get_component_resale_rate(comp.display_name, category or "general", resale_rate)
+                comp.resale_price = est_new * component_resale_rate
+                comp.price_source = "ai_estimate"
+                print(f"      {comp.display_name}: {comp.resale_price:.2f} CHF (AI estimate)")
+            else:
+                print(f"      {comp.display_name}: Price unavailable, skipping")
+                continue
+        
+        # Calculate unit_value (resale × quantity)
+        comp.calculate_unit_value()
+        
+        # Validate: Skip if unit_value is unreasonable
+        if comp.unit_value and comp.unit_value > MAX_COMPONENT_PRICE * comp.quantity:
+            print(f"      {comp.display_name}: Value {comp.unit_value:.2f} exceeds max, skipping")
+            continue
+        
+        priced.append(comp)
+    
+    return priced
+
+
+def _get_market_price_for_component(
+    conn, 
+    run_id: str, 
+    identity_key: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Get market price for a component by identity_key.
+    
+    Queries DB for listings with same identity_key and calculates median.
+    """
+    try:
+        from db_pg_v2 import get_listings_by_search_identity
+        
+        db_listings = get_listings_by_search_identity(conn, run_id, identity_key)
+        
+        if len(db_listings) < 2:
+            return None
+        
+        # Collect valid samples (active auctions with bids)
+        samples = []
+        for listing in db_listings:
+            bid = listing.get("current_bid")
+            bids_count = listing.get("bids_count", 0)
+            
+            if bid and bids_count > 0 and bid >= 5.0:
+                samples.append(bid)
+        
+        if len(samples) < 2:
+            return None
+        
+        median_price = statistics.median(samples)
+        
+        return {
+            "resale_price": round(median_price, 2),
+            "sample_size": len(samples),
+            "source": "market_auction",
+        }
+    except Exception as e:
+        print(f"      Market lookup failed for {identity_key}: {e}")
+        return None
+
+
+def _calculate_weight_price(weight_kg: float, material: str) -> float:
+    """
+    Calculate new price for weight plates based on weight and material.
+    
+    Pricing (CHF per kg for NEW):
+    - Bumper plates: 5-7 CHF/kg
+    - Cast iron: 2-3 CHF/kg
+    - Calibrated: 10-15 CHF/kg
+    - Standard: 3-4 CHF/kg
+    """
+    material_lower = material.lower() if material else "standard"
+    
+    # CHF per kg pricing for NEW weights
+    WEIGHT_PRICING = {
+        "bumper": 6.0,
+        "gummi": 6.0,
+        "rubber": 6.0,
+        "gusseisen": 2.5,
+        "cast iron": 2.5,
+        "eisen": 2.5,
+        "calibrated": 12.0,
+        "competition": 12.0,
+        "wettkampf": 12.0,
+        "urethane": 8.0,
+        "chrome": 4.0,
+        "chrom": 4.0,
+        "vinyl": 2.0,
+        "standard": 3.5,
+    }
+    
+    price_per_kg = WEIGHT_PRICING.get(material_lower, 3.5)
+    
+    return round(weight_kg * price_per_kg, 2)
+
+
 def predict_final_auction_price(
     current_price: float,
     bids_count: int,
@@ -1986,10 +2192,24 @@ def calculate_soft_market_price(
     if not search_identity or not all_listings_for_variant:
         return None
     
+    # DEDUPLICATION: Remove duplicate listings by source_id (same listing from DB + current run)
+    seen_source_ids = set()
+    unique_listings = []
+    for listing in all_listings_for_variant:
+        source_id = listing.get("source_id") or listing.get("listing_id")
+        if source_id and source_id in seen_source_ids:
+            continue
+        if source_id:
+            seen_source_ids.add(source_id)
+        unique_listings.append(listing)
+    
+    if len(unique_listings) < len(all_listings_for_variant):
+        print(f"   SOFT MARKET: Deduplicated {len(all_listings_for_variant)} → {len(unique_listings)} unique listings")
+    
     # Filter valid samples with bids
     valid_samples = []
-    print(f"   SOFT MARKET DEBUG: Processing {len(all_listings_for_variant)} listings for identity='{search_identity}'")
-    for idx, listing in enumerate(all_listings_for_variant):
+    print(f"   SOFT MARKET DEBUG: Processing {len(unique_listings)} listings for identity='{search_identity}'")
+    for idx, listing in enumerate(unique_listings):
         bid = listing.get("current_bid") or listing.get("current_price_ricardo")
         bids_count = listing.get("bids_count", 0)
         hours_remaining = listing.get("hours_remaining", 999)
@@ -2223,6 +2443,7 @@ def calculate_deal_score(expected_profit: float, purchase_price: float, resale_p
     # Clamp score to 0-10 range
     return max(0.0, min(10.0, score))
 
+
 # MAIN EVALUATION FUNCTION
 # ==============================================================================
 
@@ -2246,6 +2467,8 @@ def evaluate_listing_with_ai(
     quantity: int = 1,
     all_listings_for_variant: Optional[List[Dict[str, Any]]] = None,
     search_identity: Optional[str] = None,
+    conn=None,
+    run_id: str = None,
 ) -> Dict[str, Any]:
     """
     v7.0: Main evaluation function with Claude-based AI.
@@ -2452,7 +2675,7 @@ def evaluate_listing_with_ai(
                 samples = soft_market_data.get('samples', [])
                 avg_bid = sum(samples) / len(samples) if samples else 0
                 
-                print(f"   🟡 SOFT MARKET CAP APPLIED")
+                print(f"   SOFT MARKET CAP APPLIED")
                 print(f"      identity={search_identity}")
                 print(f"      soft_price={result.get('soft_market_price', 0):.2f}")
                 print(f"      samples={result.get('soft_market_samples', 0)}")
@@ -2462,15 +2685,15 @@ def evaluate_listing_with_ai(
             # Guard log: soft market skipped
             listings_with_bids = sum(1 for l in all_listings_for_variant if l.get('bids_count', 0) > 0)
             if listings_with_bids > 0:
-                print(f"   ⚪ SOFT MARKET SKIPPED: reason=insufficient_bid_samples (need ≥2, have {listings_with_bids})")
+                print(f"   SOFT MARKET SKIPPED: reason=insufficient_bid_samples (need ≥2, have {listings_with_bids})")
                 print(f"      identity={search_identity}")
     elif search_identity and not result.get("market_based_resale"):
         # Guard log: no search identity listings available
         if all_listings_for_variant is None:
-            print(f"   ⚪ SOFT MARKET SKIPPED: reason=no_listings_fetched")
+            print(f"   SOFT MARKET SKIPPED: reason=no_listings_fetched")
             print(f"      identity={search_identity}")
         elif len(all_listings_for_variant) == 0:
-            print(f"   ⚪ SOFT MARKET SKIPPED: reason=no_persisted_listings_for_identity")
+            print(f"   SOFT MARKET SKIPPED: reason=no_persisted_listings_for_identity")
             print(f"      identity={search_identity}")
     
     # CRITICAL: Preserve soft market marker before strategy determination
@@ -2482,7 +2705,7 @@ def evaluate_listing_with_ai(
         if ' | soft_market_cap:' in current_reason:
             marker_start = current_reason.find(' | soft_market_cap:')
             soft_market_marker = current_reason[marker_start:]
-            print(f"   💾 SOFT MARKET MARKER PRESERVED: {soft_market_marker[:80]}...")
+            print(f"   SOFT MARKET MARKER PRESERVED: {soft_market_marker[:80]}...")
     
     # Determine effective purchase price
     is_auction = current_price is not None and buy_now_price is None
@@ -2506,70 +2729,102 @@ def evaluate_listing_with_ai(
     else:
         purchase_price = 0
     
-    # PHASE 4.1c: BUNDLES DISABLED (missing unit_value implementation)
-    # Bundles show -87% margins due to missing per-component pricing
-    # Re-enable after implementing bundle_items.unit_value
-    bundles_disabled = True
-    if BUNDLE_ENABLED and not bundles_disabled and looks_like_bundle(title, description):
-        vision_for_this_call = random.random() < VISION_RATE if image_url else False
+    # PHASE 3 (v8.0): BUNDLE DETECTION & PRICING
+    # Uses new extraction/bundle_extractor.py with German-aware prompts
+    # and price_bundle_components_v2 with market data integration
+    if BUNDLE_ENABLED and looks_like_bundle(title, description):
+        print(f"\n   BUNDLE DETECTION triggered for: {title[:60]}...")
         
-        # MODE_GUARD: Vision usage decision
         try:
-            from config import load_config
-            from runtime_mode import get_mode_config
-            cfg = load_config()
-            mode_config = get_mode_config(cfg.runtime.mode)
-            runtime_mode = mode_config.mode.value
-        except:
-            runtime_mode = "unknown"
-        
-        print(f"\nMODE_GUARD:")
-        print(f"  runtime_mode: {runtime_mode}")
-        print(f"  feature: vision")
-        print(f"  allowed: {str(vision_for_this_call).lower()}")
-        print(f"  reason: {'VISION_ENABLED_RANDOM' if vision_for_this_call else 'VISION_DISABLED_RANDOM'}")
-        
-        bundle_result = detect_bundle_with_ai(
-            title=title,
-            description=description,
-            query=query,
-            image_url=image_url,
-            use_vision=vision_for_this_call,
-            query_analysis=query_analysis,
-            batch_result=batch_bundle_result,
-        )
-        result["vision_used"] = vision_for_this_call
-        
-        if bundle_result.get("is_bundle"):
-            result["is_bundle"] = True
-            result["bundle_components"] = bundle_result.get("components", [])
+            from extraction.bundle_extractor import extract_bundle_components
+            from models.bundle_component import BundleComponent
             
-            # Price components
-            priced = price_bundle_components(
-                components=result["bundle_components"],
-                base_product=base_product or query,
-                context=context,
-                ua=ua,
-                query_analysis=query_analysis,
-                pre_fetched_prices=variant_info_by_key,
+            # Detect category from query_analysis
+            category = _get_category(query_analysis)
+            
+            # COST OPTIMIZATION: Pass v10 products to avoid duplicate AI call
+            v10_products = None
+            if batch_bundle_result and batch_bundle_result.get("products"):
+                v10_products = batch_bundle_result.get("products")
+            
+            # Extract bundle components using German-aware prompts
+            bundle_extraction = extract_bundle_components(
+                title=title,
+                description=description,
+                category=category,
+                image_url=image_url,
+                use_vision=False,  # First pass: no vision
+                call_ai_func=call_ai,
+                v10_products=v10_products,  # Reuse v10 extraction if available
             )
-            result["bundle_components"] = priced
             
-            # GUARD: Require at least 2 priced components
-            # Single-component "bundles" are false positives (e.g., "25x charger" = 1 product type)
-            if len(priced) < 2:
-                print(f"   ⚠️ Bundle has only {len(priced)} valid component(s) — treating as single product")
-                result["is_bundle"] = False
-                # Fall through to normal pricing (query_baseline or other sources)
-            else:
-                # Calculate bundle resale
-                bundle_new = calculate_bundle_new_price(priced)
-                bundle_resale = calculate_bundle_resale(priced, bundle_new)
+            # If extraction confidence is low and vision is enabled, use vision
+            if bundle_extraction.is_bundle and bundle_extraction.confidence < 0.7 and BUNDLE_USE_VISION and image_url:
+                print(f"      Low confidence ({bundle_extraction.confidence:.2f}), trying vision...")
+                vision_extraction = extract_bundle_components(
+                    title=title,
+                    description=description,
+                    category=category,
+                    image_url=image_url,
+                    use_vision=True,
+                    call_ai_func=call_ai,
+                )
+                if vision_extraction.confidence > bundle_extraction.confidence:
+                    bundle_extraction = vision_extraction
+                    print(f"      Vision improved confidence to {vision_extraction.confidence:.2f}")
+            
+            if bundle_extraction.is_bundle and len(bundle_extraction.components) >= 2:
+                print(f"   Bundle detected: {len(bundle_extraction.components)} components")
+                result["is_bundle"] = True
+                result["bundle_extraction_method"] = bundle_extraction.extraction_method
                 
-                result["resale_price_bundle"] = bundle_resale
-                result["resale_price_est"] = bundle_resale
-                result["new_price"] = bundle_new
-                result["price_source"] = PRICE_SOURCE_BUNDLE_AGGREGATE
+                # Price components using market data + weight-based fallbacks
+                priced_components = price_bundle_components_v2(
+                    components=bundle_extraction.components,
+                    category=bundle_extraction.category or category,
+                    query_analysis=query_analysis,
+                    conn=conn,
+                    run_id=run_id,
+                )
+                
+                # Validate: Need at least 2 priced components
+                if not priced_components or len(priced_components) < 2:
+                    component_count = len(priced_components) if priced_components else 0
+                    print(f"   Only {component_count} priced component(s) — treating as single product")
+                    result["is_bundle"] = False
+                else:
+                    # Calculate bundle totals
+                    total_new = sum(c.new_price * c.quantity for c in priced_components if c.new_price)
+                    total_resale = sum(c.unit_value for c in priced_components if c.unit_value)
+                    
+                    # Apply bundle discount (harder to sell as bundle)
+                    bundle_resale = total_resale * (1 - BUNDLE_DISCOUNT_PERCENT)
+                    
+                    # Cap at max percent of new price
+                    if total_new > 0:
+                        max_resale = total_new * MAX_BUNDLE_RESALE_PERCENT_OF_NEW
+                        bundle_resale = min(bundle_resale, max_resale)
+                    
+                    result["resale_price_bundle"] = round(bundle_resale, 2)
+                    result["resale_price_est"] = round(bundle_resale, 2)
+                    result["new_price"] = round(total_new, 2)
+                    result["price_source"] = PRICE_SOURCE_BUNDLE_AGGREGATE
+                    
+                    # Store components for DB persistence
+                    result["bundle_components"] = [c.to_dict() for c in priced_components]
+                    result["bundle_total_weight_kg"] = bundle_extraction.total_weight_kg
+                    
+                    # Recalculate expected profit with bundle pricing
+                    result["expected_profit"] = calculate_profit(bundle_resale, purchase_price)
+                    
+                    print(f"   📊 Bundle pricing: new={total_new:.2f}, resale={bundle_resale:.2f} CHF")
+            else:
+                print(f"   ❌ Not a bundle or insufficient components")
+                
+        except ImportError as e:
+            print(f"   ⚠️ Bundle extraction import failed: {e}")
+        except Exception as e:
+            print(f"   ⚠️ Bundle extraction failed: {e}")
     
     # Determine strategy
     strategy, reason = determine_strategy(
@@ -2979,6 +3234,7 @@ def apply_config(config):
     """Apply configuration from config dict or config object."""
     global RICARDO_FEE_PERCENT, SHIPPING_COST_CHF, MIN_PROFIT_THRESHOLD
     global BUNDLE_ENABLED, BUNDLE_DISCOUNT_PERCENT, BUNDLE_MIN_COMPONENT_VALUE
+    global BUNDLE_USE_VISION, BUNDLE_ALWAYS_SCRAPE_DETAIL
     global CACHE_ENABLED, USE_VISION, VISION_RATE, DEFAULT_CAR_MODEL
     global WEB_SEARCH_ENABLED  # v7.3.2: Toggle expensive web search
     
@@ -3018,6 +3274,12 @@ def apply_config(config):
     val = get_nested("bundle", "min_component_value", None)
     if val is not None:
         BUNDLE_MIN_COMPONENT_VALUE = val
+    val = get_nested("bundle", "use_vision_for_unclear", None)
+    if val is not None:
+        BUNDLE_USE_VISION = val
+    val = get_nested("bundle", "always_scrape_detail", None)
+    if val is not None:
+        BUNDLE_ALWAYS_SCRAPE_DETAIL = val
     val = get_nested("cache", "enabled", None)
     if val is not None:
         CACHE_ENABLED = val
