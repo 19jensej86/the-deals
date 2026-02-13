@@ -5,12 +5,7 @@ from .market_pricing import (
     calculate_market_resale_from_listings,
     calculate_soft_market_price,
     apply_soft_market_cap,
-)
-
-from .web_pricing import (
-    batch_web_price_search,
-    get_web_price_cached,
-    save_web_price_to_cache,
+    predict_final_auction_price,
 )
 
 __all__ = [
@@ -18,7 +13,5 @@ __all__ = [
     'calculate_market_resale_from_listings',
     'calculate_soft_market_price',
     'apply_soft_market_cap',
-    'batch_web_price_search',
-    'get_web_price_cached',
-    'save_web_price_to_cache',
+    'predict_final_auction_price',
 ]

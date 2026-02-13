@@ -44,6 +44,35 @@ from dotenv import load_dotenv
 from utils_text import extract_weight_kg
 
 # ==============================================================================
+# v8.1: MODULAR IMPORTS (extracted modules for cleaner architecture)
+# ==============================================================================
+# Re-export from new modules for backwards compatibility
+from evaluation.strategy import (
+    determine_strategy as _determine_strategy,
+    calculate_deal_score as _calculate_deal_score,
+    set_min_profit_threshold,
+)
+from pricing.market_pricing import (
+    calculate_market_resale_from_listings as _calculate_market_resale_from_listings,
+    calculate_all_market_resale_prices as _calculate_all_market_resale_prices,
+    calculate_soft_market_price as _calculate_soft_market_price,
+    apply_soft_market_cap as _apply_soft_market_cap,
+    predict_final_auction_price as _predict_final_auction_price,
+)
+from bundles.bundle_detector import (
+    looks_like_bundle as _looks_like_bundle,
+    detect_bundle_with_ai as _detect_bundle_with_ai,
+    price_bundle_components_v2 as _price_bundle_components_v2,
+    calculate_bundle_new_price as _calculate_bundle_new_price,
+    calculate_bundle_resale as _calculate_bundle_resale,
+    get_weight_type,
+    set_bundle_config,
+    BUNDLE_KEYWORDS,
+    WEIGHT_PLATE_KEYWORDS,
+    WEIGHT_PRICING,
+)
+
+# ==============================================================================
 # PRICE SOURCE CONSTANTS (Schema-Valid Enum)
 # ==============================================================================
 # These MUST match the CHECK constraint in db_pg.py LISTINGS_V11_SCHEMA
@@ -3469,3 +3498,9 @@ def init_ai_filter(cfg):
             raise RuntimeError("❌ CONFIG ERROR: ai.claude_model_web is empty")
         
         print(f"✅ AI Filter configured: {cfg.ai.claude_model_fast} (fast), {cfg.ai.claude_model_web} (web)")
+    
+    # v8.1: Sync MIN_PROFIT_THRESHOLD to extracted module
+    set_min_profit_threshold(MIN_PROFIT_THRESHOLD)
+    
+    # v8.1: Sync bundle config to extracted module
+    set_bundle_config(MAX_COMPONENT_PRICE, BUNDLE_DISCOUNT_PERCENT, MAX_BUNDLE_RESALE_PERCENT_OF_NEW)
